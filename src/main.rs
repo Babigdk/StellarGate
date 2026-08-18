@@ -4,7 +4,6 @@
 
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use std::future::Future;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, expiry, horizon,
     metrics::{AuthMetrics, WebhookMetrics},
-    retention, webhook, AppState, TaskHealth,
+    retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -38,8 +37,28 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+
+    /* Client-IP trust boundary (issue #330): make the effective strategy
+    visible at boot so an operator can confirm forwarding headers are honored
+    exactly where they intend — only from configured trusted proxies, never
+    from arbitrary callers. */
+    if cfg.trusted_proxy_cidrs.is_empty() {
+        info!(
+            "client IP strategy: no trusted proxies configured — \
+             X-Forwarded-For/X-Real-IP are ignored; the socket peer address is \
+             used for rate limiting and auth attribution"
+        );
+    } else {
+        info!(
+            trusted_proxies = ?cfg.trusted_proxy_cidrs,
+            "client IP strategy: forwarding headers are honored only from \
+             trusted proxies; all other peers are attributed by socket address"
+        );
+    }
+
     let pool = open_pool(&cfg).await?;
     db::migrate(&pool).await?;
+    db::backfill_asset_issuers(&pool, &cfg.accepted_assets).await?;
 
     let state = Arc::new(AppState {
         pool,
@@ -58,28 +77,59 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health = state.task_health.clone();
 
+    /* Declare which background tasks are expected to keep running: `/health`
+    fails while any required task is not running, so a poller or listener that
+    died at startup stops being invisible (issue #315). The poller and stream
+    are only expected once a gateway wallet is configured — without one they
+    idle by design ("the listener stays idle until this is set"). */
+    if state.config.gateway_configured() {
+        health.require("poller");
+        if state.config.listener_mode == ListenerMode::Stream {
+            health.require("stream");
+        }
+    }
+    health.require("sweeper");
+    health.require("retention");
+    health.require("redrive");
+
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        spawn_task(
-            &health,
-            horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
-        )
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "stream", shutdown_rx.clone(), move || {
+            horizon::run_stream_listener(state.clone(), rx.clone())
+        })
     });
-    let poller = spawn_task(
-        &health,
-        horizon::run_poller(state.clone(), shutdown_rx.clone()),
-    );
-    let sweeper = spawn_task(
-        &health,
-        expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
-    );
-    let retention = spawn_task(
-        &health,
-        retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
-    );
-    let redrive = spawn_task(
-        &health,
-        webhook::run_redrive_worker(state.clone(), shutdown_rx),
-    );
+    let poller = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "poller", shutdown_rx.clone(), move || {
+            horizon::run_poller(state.clone(), rx.clone())
+        })
+    };
+    let sweeper = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "sweeper", shutdown_rx.clone(), move || {
+            expiry::run_sweeper(state.clone(), rx.clone())
+        })
+    };
+    let retention = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(
+            health.clone(),
+            "retention",
+            shutdown_rx.clone(),
+            move || retention::run_retention_worker(state.clone(), rx.clone()),
+        )
+    };
+    let redrive = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(health.clone(), "redrive", shutdown_rx.clone(), move || {
+            webhook::run_redrive_worker(state.clone(), rx.clone())
+        })
+    };
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -94,12 +144,12 @@ async fn main() -> Result<()> {
 
     let _ = shutdown_tx.send(true);
     let drain = async {
-        join_task(poller, &health).await;
-        join_task(sweeper, &health).await;
-        join_task(redrive, &health).await;
-        join_task(retention, &health).await;
+        join_task(poller, &health, "poller").await;
+        join_task(sweeper, &health, "sweeper").await;
+        join_task(redrive, &health, "redrive").await;
+        join_task(retention, &health, "retention").await;
         if let Some(handle) = stream {
-            join_task(handle, &health).await;
+            join_task(handle, &health, "stream").await;
         }
     };
     if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
@@ -151,28 +201,14 @@ async fn report_trustlines(state: &Arc<AppState>) {
     }
 }
 
-/// Spawn a background task, keeping [`TaskHealth`] accurate across its
-/// lifetime: counted as started before it runs and as stopped when it returns
-/// normally. A panic is recorded instead by [`join_task`] at shutdown.
-fn spawn_task<F>(health: &TaskHealth, task: F) -> JoinHandle<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let health = health.clone();
-    health.task_started();
-    tokio::spawn(async move {
-        task.await;
-        health.task_stopped();
-    })
-}
-
-/// Await a background task. A `JoinError` means it panicked, which is recorded
-/// so the failure counter — and any alert watching it — fires.
-async fn join_task(handle: JoinHandle<()>, health: &TaskHealth) {
+/// Await a supervisor during shutdown. Panics are caught inside the
+/// supervisor's child spawn, so a `JoinError` here means the supervisor
+/// itself failed — record it so the failure counter still fires.
+async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static str) {
     if let Err(e) = handle.await {
         if e.is_panic() {
-            warn!("background task panicked");
-            health.task_failed();
+            warn!(task = name, "supervisor panicked");
+            health.task_failed(name);
         }
     }
 }

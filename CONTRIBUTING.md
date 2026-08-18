@@ -26,6 +26,12 @@ participating, you're expected to uphold it.
   approach in the issue before writing code — security- and payment-adjacent
   logic gets extra scrutiny in review.
 
+**Work tracking:** this repository uses GitHub Issues as its sole tracker. Ad-
+hoc checklists and TODO files should not be committed to the repository — they
+create ambiguity about where work is tracked and can become stale. Design
+rationale and decision records belong in code comments, issue discussions, or
+`CHANGELOG.md`.
+
 ## Development Setup
 
 ### Prerequisites

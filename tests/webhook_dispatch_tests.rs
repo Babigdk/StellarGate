@@ -41,7 +41,9 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
+        cursor_staleness_multiple: 3,
         payment_ttl_secs: 3600,
+        expiry_batch_size: 500,
         cors_allowed_origins: vec![],
         listener_mode: ListenerMode::Poll,
         // These tests dispatch to a wiremock server on 127.0.0.1, which the
@@ -52,6 +54,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
         request_timeout_secs: 30,
+        trusted_proxy_cidrs: vec![],
     }
 }
 
@@ -86,6 +89,7 @@ async fn create_test_payment(state: &AppState, webhook_url: &str) -> db::Payment
             memo: "MEMOTEST",
             amount: "10",
             asset: "XLM",
+            asset_issuer: None,
             webhook_url: Some(webhook_url),
             ttl_secs: 3600,
         },

@@ -18,11 +18,12 @@ use tracing::{debug, info, warn};
 /// The webhook event emitted when an intent is swept to `expired`.
 const EXPIRED_EVENT: &str = "payment.expired";
 
-/// Run one sweep: expire every overdue pending intent and fire its webhook.
-/// Returns how many intents were expired. Safe to call repeatedly — an intent
-/// is transitioned at most once.
+/// Run one sweep: expire up to `expiry_batch_size` overdue pending intents and
+/// fire each one's webhook. Returns how many intents were expired. Safe to call
+/// repeatedly — an intent is transitioned at most once, and a backlog larger
+/// than the batch drains over several sweeps instead of one long write lock.
 pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let expired = db::expire_overdue(&state.pool).await?;
+    let expired = db::expire_overdue(&state.pool, state.config.expiry_batch_size).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
         webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
@@ -88,7 +89,9 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 5,
             db_busy_timeout_ms: 5000,
@@ -98,6 +101,7 @@ mod tests {
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 
@@ -147,6 +151,7 @@ mod tests {
                 memo: "EXPMEMO",
                 amount: "10",
                 asset: "XLM",
+                asset_issuer: None,
                 webhook_url: Some(&webhook_url),
                 // Already overdue: sweep_once must expire it immediately.
                 ttl_secs: -10,
@@ -227,6 +232,7 @@ mod tests {
                 memo: "EXPMEMOONCE",
                 amount: "10",
                 asset: "XLM",
+                asset_issuer: None,
                 webhook_url: Some(&webhook_url),
                 ttl_secs: -10,
             },

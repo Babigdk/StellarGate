@@ -203,11 +203,12 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
 /// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
 ///
 /// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset). When it matches, returns the verdict for the cumulative total.
+/// or asset — including a credit payment whose issuer does not match the
+/// issuer stored on the intent). When it matches, returns the verdict for the
+/// cumulative total.
 pub fn verify(
     payment: &db::Payment,
     hp: &HorizonPayment,
-    accepted_assets: &[crate::config::AcceptedAsset],
     already_paid_stroops: i64,
 ) -> Option<Verdict> {
     if hp.kind != "payment" {
@@ -228,18 +229,18 @@ pub fn verify(
         return None;
     }
 
-    let asset_matches = accepted_assets.iter().any(|a| {
-        if a.code != payment.asset {
-            return false;
+    /* Match the issuer this intent was priced in — not any allow-list entry
+    that happens to share the code. Two `USDC` issuers used to both settle an
+    intent that stored only the code (issue #222). */
+    let asset_matches = match payment.asset_issuer.as_deref().filter(|s| !s.is_empty()) {
+        None => {
+            payment.asset.eq_ignore_ascii_case("XLM") && hp.asset_type.as_deref() == Some("native")
         }
-        match a.issuer.as_deref() {
-            None => hp.asset_type.as_deref() == Some("native"),
-            Some(issuer) => {
-                hp.asset_code.as_deref() == Some(a.code.as_str())
-                    && hp.asset_issuer.as_deref() == Some(issuer)
-            }
+        Some(issuer) => {
+            hp.asset_code.as_deref() == Some(payment.asset.as_str())
+                && hp.asset_issuer.as_deref() == Some(issuer)
         }
-    });
+    };
     if !asset_matches {
         return None;
     }
@@ -452,6 +453,11 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         }
     }
 
+    /* A completed cycle is on-chain progress even with nothing to settle — the
+    cursor advanced and the poller is alive. This heartbeat is what /ready's
+    cursor-freshness check measures (issue #315). */
+    state.task_health.note_success();
+
     Ok(settled)
 }
 
@@ -483,14 +489,7 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     unrelated traffic never pollutes the ledger. `verify` returns `None` for
     anything that does not satisfy this intent (wrong type/destination/memo/
     asset, or an unparseable amount). */
-    if verify(
-        &payment,
-        hp,
-        &state.config.accepted_assets,
-        already_paid_stroops,
-    )
-    .is_none()
-    {
+    if verify(&payment, hp, already_paid_stroops).is_none() {
         return Ok(false);
     }
 
@@ -599,7 +598,13 @@ async fn settle(
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
     /* Webhook delivery is handled asynchronously by the webhook subsystem
-    (recording here is non-blocking from reconciliation's point of view). */
+    (recording here is non-blocking from reconciliation's point of view).
+
+    Design note: dispatch() still delivers inline so the common case settles and
+    notifies in one pass with no added latency. The redrive worker is a safety net
+    on top of that for the crash case, not a replacement for it — rewriting dispatch
+    to be record-only would be a bigger, riskier change than issue #156 asked for
+    and would break the existing synchronous-delivery test coverage. */
     webhook::dispatch(state, &settled, event, delta).await;
     true
 }
@@ -609,6 +614,9 @@ async fn settle(
 pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
+        // Stay alive until shutdown so the supervisor does not treat a
+        // deliberate idle as an unexpected return and restart us.
+        let _ = shutdown.changed().await;
         return;
     }
 
@@ -677,6 +685,7 @@ fn parse_sse_block(block: &str) -> SseEvent {
 pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
     if !state.config.gateway_configured() {
         warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
+        let _ = shutdown.changed().await;
         return;
     }
 
@@ -806,6 +815,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
             }
+            /* Receiving a payment record means the stream is alive and the
+            cursor moved — the same heartbeat /ready's freshness check uses. */
+            state.task_health.note_success();
             if let Err(e) = reconcile_payment(state, &hp).await {
                 warn!(error = %e, "failed to reconcile streamed payment");
             }
@@ -820,6 +832,10 @@ mod tests {
     use super::*;
 
     fn pending(asset: &str, amount: &str) -> db::Payment {
+        let asset_issuer = match asset {
+            "USDC" => Some("GUSDC".into()),
+            _ => None,
+        };
         db::Payment {
             id: "id-1".into(),
             merchant_id: "m".into(),
@@ -834,6 +850,7 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
             expires_at: "later".into(),
+            asset_issuer,
         }
     }
 
@@ -874,7 +891,7 @@ mod tests {
         let p = pending("XLM", "10.00");
         let hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "10".into(),
@@ -887,7 +904,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("12.5", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "12.5".into(),
@@ -900,7 +917,7 @@ mod tests {
         let p = pending("XLM", "10");
         let hp = native_payment("9.9999999", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Underpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "9.9999999".into(),
@@ -914,14 +931,14 @@ mod tests {
         let p = pending("XLM", "5");
         let hp1 = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert!(matches!(
-            verify(&p, &hp1, &test_assets(), 0),
+            verify(&p, &hp1, 0),
             Some(Verdict::Underpaid { .. })
         ));
 
         // Top-up: 2 XLM arrives; cumulative = 5 = expected — completes exactly.
         let hp2 = native_payment("2.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp2, &test_assets(), 30_000_000),
+            verify(&p, &hp2, 30_000_000),
             Some(Verdict::Completed {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "5".into(),
@@ -936,7 +953,7 @@ mod tests {
         // Top-up of 3 XLM; cumulative = 6 > 5 — overpaid.
         let hp = native_payment("3.0000000", "MEMO1234", "GGATEWAY");
         assert_eq!(
-            verify(&p, &hp, &test_assets(), 30_000_000),
+            verify(&p, &hp, 30_000_000),
             Some(Verdict::Overpaid {
                 tx_hash: "TXHASH".into(),
                 paid_amount: "6".into(),
@@ -948,7 +965,7 @@ mod tests {
     fn wrong_memo_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "OTHER", "GGATEWAY");
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     /// A `memo_id`/`memo_hash`/`memo_return` transaction that happens to
@@ -959,7 +976,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = Some("id".into());
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -967,14 +984,14 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().memo_type = None;
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
     fn wrong_destination_is_ignored() {
         let p = pending("XLM", "10");
         let hp = native_payment("10", "MEMO1234", "GSOMEONEELSE");
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -984,7 +1001,7 @@ mod tests {
         hp.asset_type = Some("credit_alphanum4".into());
         hp.asset_code = Some("USDC".into());
         hp.asset_issuer = Some("GUSDC".into());
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     #[test]
@@ -1007,7 +1024,7 @@ mod tests {
             created_at: None,
         };
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1031,10 +1048,37 @@ mod tests {
             paging_token: Some("1".into()),
             created_at: None,
         };
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
         // Sanity: with the right issuer it would have matched.
         hp.asset_issuer = Some("GUSDC".into());
-        assert!(verify(&p, &hp, &test_assets(), 0).is_some());
+        assert!(verify(&p, &hp, 0).is_some());
+    }
+
+    #[test]
+    fn same_code_from_a_different_issuer_does_not_settle() {
+        /* Intent priced in USDC from issuer A. A Horizon payment of USDC from
+        issuer B must not settle it, even though both share a code (issue #222). */
+        let mut p = pending("USDC", "5");
+        p.asset_issuer = Some("GISSUER_A".into());
+        let mut hp = HorizonPayment {
+            kind: "payment".into(),
+            amount: Some("5.0".into()),
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GISSUER_B".into()),
+            to: Some("GGATEWAY".into()),
+            transaction_hash: Some("TXHASH".into()),
+            transaction: Some(TransactionRef {
+                memo: Some("MEMO1234".into()),
+                memo_type: Some("text".into()),
+                successful: Some(true),
+            }),
+            paging_token: Some("1".into()),
+            created_at: None,
+        };
+        assert_eq!(verify(&p, &hp, 0), None);
+        hp.asset_issuer = Some("GISSUER_A".into());
+        assert!(verify(&p, &hp, 0).is_some());
     }
 
     #[test]
@@ -1042,7 +1086,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10", "MEMO1234", "GGATEWAY");
         hp.kind = "create_account".into();
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     /// A transaction Horizon reports as `successful: false` must never settle an
@@ -1052,11 +1096,11 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = Some(false);
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
         // Sanity: the same record with `successful: true` would have completed.
         hp.transaction.as_mut().unwrap().successful = Some(true);
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }
@@ -1068,7 +1112,7 @@ mod tests {
         let p = pending("XLM", "10");
         let mut hp = native_payment("10.0000000", "MEMO1234", "GGATEWAY");
         hp.transaction.as_mut().unwrap().successful = None;
-        assert_eq!(verify(&p, &hp, &test_assets(), 0), None);
+        assert_eq!(verify(&p, &hp, 0), None);
     }
 
     fn native_balance() -> AccountBalance {
@@ -1164,7 +1208,7 @@ mod tests {
         let hp: HorizonPayment = serde_json::from_str(data).unwrap();
         let p = pending("XLM", "10.00");
         assert!(matches!(
-            verify(&p, &hp, &test_assets(), 0),
+            verify(&p, &hp, 0),
             Some(Verdict::Completed { .. })
         ));
     }

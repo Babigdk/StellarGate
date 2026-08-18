@@ -68,6 +68,7 @@ Never reuse the placeholders — startup rejects known placeholder values, and
 | `CORS_ALLOWED_ORIGINS` set | **Required** on `public` — boot fails without it |
 | Trustlines added for every accepted asset | Payments in an untrusted asset bounce |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` false | Enabling it in production reopens the SSRF hole |
+| `TRUSTED_PROXY_CIDRS` set correctly | Forwarding headers are honored **only** from these proxies; unset = headers ignored (safe default) — see [Trusted proxies and client IP](#trusted-proxies-and-client-ip) |
 | `deploy/stellargate.env` is `chmod 600` | It holds every secret the service has |
 
 ---
@@ -143,7 +144,12 @@ curl https://your-domain.com/ready    # {"status":"ok"} once Horizon is reachabl
 ```
 
 `/ready` returning `503` with a `"reason"` field tells you immediately whether
-the database or Horizon is the problem.
+the database, Horizon, or the payment-detection cursor is the problem. Once a
+gateway is configured, `/ready` also requires a successful Horizon poll (or
+stream event) within `POLL_INTERVAL_SECS × CURSOR_STALENESS_MULTIPLE` — so a
+poller that died at startup surfaces as `payment detection stalled` instead of
+leaving the probe green (issue #315). `/health` fails when an expected
+background task is no longer running, naming the dead task in its `reason`.
 
 The first build compiles the whole dependency tree and takes several minutes on
 a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
@@ -153,6 +159,42 @@ a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
 Only Caddy binds to the host, on 80/443. The gateway itself is reachable solely
 over the internal Compose network, so there is no way to reach the API over
 plaintext by hitting the VM's IP directly.
+
+---
+
+## Trusted proxies and client IP
+
+Rate limiting and the auth logs attribute every request to a client IP.
+`X-Forwarded-For` and `X-Real-IP` are **client-supplied** — an attacker can put
+anything in them — so StellarGate ignores them unless the request's socket
+peer is one of the proxies you name in `TRUSTED_PROXY_CIDRS`
+(comma-separated CIDR blocks, IPv4 or IPv6):
+
+```bash
+# Behind a reverse proxy on the same host / private network
+TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.0.0/16
+```
+
+**The default (unset) is the safe one:** no proxy is trusted, so the headers
+are always ignored and the peer's own address is used. A directly-exposed
+gateway must never trust them, and the default doesn't.
+
+When the peer **is** a trusted proxy, the rightmost `X-Forwarded-For` value
+that is not itself a trusted proxy is taken as the client (falling back to
+`X-Real-IP`, then the peer). This is what keeps every client behind your proxy
+on its own rate-limit bucket and with its own attribution in the auth logs,
+while still ignoring anything a non-proxy caller tries to inject.
+
+Two log lines let you confirm the setup at boot:
+
+```
+INFO client IP strategy: no trusted proxies configured — X-Forwarded-For/X-Real-IP are ignored; the socket peer address is used for rate limiting and auth attribution
+INFO client IP strategy: forwarding headers are honored only from trusted proxies; all other peers are attributed by socket address  trusted_proxies=[10.0.0.0/8, 192.168.0.0/16]
+```
+
+If the peer address is ever unavailable (the router is served without connect
+info), StellarGate fails closed: every such request shares a single key and
+the headers are still ignored, with a one-time warning.
 
 ---
 
@@ -188,7 +230,8 @@ outcomes, retries, delivery latency, and auth success/failure.
 
 | Signal | Why it matters |
 |---|---|
-| `/ready` failing | Horizon or the database is unreachable — payments will not be detected |
+| `/ready` failing | Horizon or the database is unreachable, **or** the payment-detection cursor is stale — payments will not be detected |
+| `/health` failing | An expected background task (poller, stream, sweeper, retention, redrive) died — a restart is the fix |
 | `stellargate_webhook_deliveries_total{outcome="failed"}` rising | Merchants are not learning about completed payments |
 | `cursor_age_secs` climbing in logs | The listener is falling behind the chain |
 | `stellargate_auth_attempts_total{outcome="failure"}` spiking | Credential stuffing, or a broken integration |

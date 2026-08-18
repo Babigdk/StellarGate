@@ -95,6 +95,7 @@ pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) ->
         "amount": canonical_amount,
         "paid_amount": canonical_paid_amount,
         "asset": payment.asset,
+        "asset_issuer": payment.asset_issuer,
         "status": payment.status,
     });
     if let Some(d) = canonical_delta {
@@ -446,6 +447,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00".into(),
             updated_at: "2026-01-01T00:00:01".into(),
             expires_at: "2026-01-01T01:00:00".into(),
+            asset_issuer: None,
         };
 
         for event in &[

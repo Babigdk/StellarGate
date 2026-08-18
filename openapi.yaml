@@ -38,6 +38,10 @@ paths:
     get:
       operationId: health
       summary: Health check
+      # Explicitly unauthenticated. Stating this is not redundant: without it a
+      # reader cannot tell "no credential required" from "the spec forgot to
+      # say", which is the ambiguity this whole block exists to remove.
+      security: []
       responses:
         "200":
           description: Service is up
@@ -57,8 +61,8 @@ paths:
     post:
       operationId: createPayment
       summary: Create a payment intent
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -69,8 +73,12 @@ paths:
         "201":
           description: Payment intent created
           headers:
-            X-Request-Id:
-              $ref: "#/components/headers/XRequestId"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
           content:
             application/json:
               schema:
@@ -86,15 +94,53 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Payment"
-        "400":
-          $ref: "#/components/responses/ValidationError"
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_amount:
+                  summary: Invalid amount
+                  value:
+                    error: amount must be a positive number with at most 7 decimal places
+                    code: invalid_amount
+                unsupported_asset:
+                  summary: Unsupported asset
+                  value:
+                    error: "unsupported asset 'EURC'; supported: XLM, USDC"
+                    code: unsupported_asset
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "429":
-          $ref: "#/components/responses/RateLimited"
+          description: >-
+            Rate limit exceeded. The request fell into the `payments` bucket,
+            whose quota is RATE_LIMIT_REQUESTS_PER_SEC × 1. See the Rate
+            Limiting section of the README for the full bucket/quota model.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+            X-RateLimit-Limit:
+              $ref: "#/components/headers/XRateLimitLimit"
+            X-RateLimit-Remaining:
+              $ref: "#/components/headers/XRateLimitRemaining"
+            X-RateLimit-Reset:
+              $ref: "#/components/headers/XRateLimitReset"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                rate_limit_exceeded:
+                  summary: Rate limit exceeded
+                  value:
+                    error: rate limit exceeded
+                    code: rate_limit_exceeded
 
     get:
       operationId: listPayments
       summary: List payments
+      description: >-
+        Scoped to the merchant that owns the API key. There is no parameter for
+        selecting a different merchant.
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/StatusFilter"
         - $ref: "#/components/parameters/LimitParam"
@@ -111,31 +157,82 @@ paths:
               schema:
                 $ref: "#/components/schemas/ListPaymentsResponse"
         "400":
-          $ref: "#/components/responses/ValidationError"
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /v1/payments/{id}:
     get:
       operationId: getPayment
       summary: Get a payment by ID
+      description: >-
+        Authentication is optional here and changes what comes back, so this is
+        the one operation whose security requirement is genuinely a choice
+        rather than a gate. It stays reachable without a credential so a
+        checkout page can poll it directly.
+
+
+        **No credential** returns a minimal public projection — `id`, `status`
+        and `expires_at`. Enough to answer "has this been paid yet", and
+        nothing else. It deliberately omits `merchant_id`, every amount and
+        `tx_hash`: payment ids travel through logs, referrers and browser
+        history, so anything on this response should be treated as effectively
+        public.
+
+
+        **The owning merchant's key** returns the full record.
+
+
+        **Another merchant's key** returns `404`, the same answer an unknown id
+        gets. A `403` would confirm the payment exists and belongs to someone
+        else.
+
+
+        **An invalid or revoked key** returns `401` rather than silently
+        falling back to the public view, so a typo'd credential says so instead
+        of leaving the caller wondering why fields are missing.
+      security:
+        # An empty requirement alongside the scheme is how OpenAPI expresses
+        # "auth optional, but it changes the response". Flattening this to a
+        # single requirement would misdocument the endpoint most likely to be
+        # integrated against.
+        - {}              # anonymous  -> PublicPaymentView
+        - bearerAuth: []  # owner      -> Payment
       parameters:
         - $ref: "#/components/parameters/PaymentId"
       responses:
         "200":
-          description: Payment found
-          headers:
-            X-Request-Id:
-              $ref: "#/components/headers/XRequestId"
+          description: >-
+            Payment found. The schema depends on the credential: the full
+            Payment for the owning merchant, PublicPaymentView for an
+            anonymous caller.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Payment"
+                oneOf:
+                  - $ref: "#/components/schemas/Payment"
+                  - $ref: "#/components/schemas/PublicPaymentView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
-          $ref: "#/components/responses/NotFound"
+          description: >-
+            No such payment, or it belongs to another merchant — the two are
+            deliberately indistinguishable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /v1/payments/{id}/webhooks:
     get:
       operationId: listWebhookDeliveries
       summary: List webhook deliveries for a payment
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/PaymentId"
       responses:
@@ -148,6 +245,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -155,15 +254,16 @@ paths:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
+      security:
+        - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/PaymentId"
         - $ref: "#/components/parameters/DeliveryId"
       responses:
         "200":
           description: Redelivery succeeded
-          headers:
-            X-Request-Id:
-              $ref: "#/components/headers/XRequestId"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "502":
@@ -326,215 +426,46 @@ paths:
           $ref: "#/components/responses/DeprecatedWebhookBadGateway"
 
 components:
-  headers:
-    XRequestId:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
       description: >-
-        Correlation id for the request, echoed from the caller's `x-request-id`
-        or generated server-side as a UUID. Present on every response.
-      schema:
-        type: string
-        format: uuid
-    Deprecation:
-      description: >-
-        Present on responses from the deprecated unprefixed mount (RFC 8594).
-        Always the literal string `true`.
-      schema:
-        type: string
-        enum: ["true"]
-    Link:
-      description: >-
-        Present on responses from the deprecated unprefixed mount (RFC 8288).
-        Points at the canonical `/v1` successor of the requested path.
-      schema:
-        type: string
-      example: '</v1/payments>; rel="successor-version"'
-
-  parameters:
-    IdempotencyKey:
-      name: Idempotency-Key
+        Merchant API key, issued by POST /merchants or POST
+        /merchants/{id}/keys and sent as `Authorization: Bearer <key>`. The
+        merchant is derived from the key — it is never taken from a request
+        body or query parameter — so a key scopes every payment operation to
+        exactly one tenant.
+    adminSecret:
+      type: apiKey
       in: header
-      required: false
+      name: X-Admin-Secret
       description: >-
-        Optional client-chosen key that makes creating a payment safe to retry
-        after a network blip. Scoped per merchant; an empty value is treated as
-        absent. Reusing a key returns the original intent with `200 OK` instead
-        of minting a duplicate.
-      schema:
-        type: string
-    PaymentId:
-      name: id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    DeliveryId:
-      name: delivery_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    StatusFilter:
-      name: status
-      in: query
-      required: false
-      description: Filter by status
-      schema:
-        $ref: "#/components/schemas/PaymentStatus"
-    LimitParam:
-      name: limit
-      in: query
-      required: false
-      description: Page size
-      schema:
-        type: integer
-        minimum: 1
-        maximum: 100
-        default: 20
-    OffsetParam:
-      name: offset
-      in: query
-      required: false
-      description: Rows to skip (offset pagination)
-      schema:
-        type: integer
-        minimum: 0
-        default: 0
-    CursorParam:
-      name: cursor
-      in: query
-      required: false
-      description: Opaque cursor for keyset pagination (returned as next_cursor)
-      schema:
-        type: string
+        Operator secret from ADMIN_PROVISIONING_SECRET. Guards merchant
+        provisioning and the API-key lifecycle routes only; it is never
+        accepted on a payment route. An unset ADMIN_PROVISIONING_SECRET
+        disables those routes entirely rather than leaving them open.
 
   responses:
-    ValidationError:
-      description: Validation error
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
+    Unauthorized:
+      description: >-
+        Missing, malformed, invalid, or revoked credential. Uses the standard
+        error envelope with code `unauthorized`.
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
           examples:
-            invalid_amount:
-              summary: Invalid amount
+            missing_key:
+              summary: No Authorization header
               value:
-                error: amount must be a positive number with at most 7 decimal places
-                code: invalid_amount
-            unsupported_asset:
-              summary: Unsupported asset
+                error: missing or invalid Authorization header
+                code: unauthorized
+            invalid_key:
+              summary: Key did not match any merchant
               value:
-                error: "unsupported asset 'EURC'; supported: XLM, USDC"
-                code: unsupported_asset
-    NotFound:
-      description: Resource not found
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          examples:
-            payment_not_found:
-              summary: Payment not found
-              value:
-                error: payment not found
-                code: payment_not_found
-            delivery_not_found:
-              summary: Delivery not found (redelivery only)
-              value:
-                error: delivery not found
-                code: delivery_not_found
-    RateLimited:
-      description: Rate limit exceeded
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          examples:
-            rate_limit_exceeded:
-              summary: Rate limit exceeded
-              value:
-                error: rate limit exceeded
-                code: rate_limit_exceeded
-    WebhookBadGateway:
-      description: Webhook endpoint returned an error
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          examples:
-            webhook_delivery_failed:
-              summary: Redelivery failed
-              value:
-                error: webhook delivery failed
-                code: webhook_delivery_failed
-
-    # Deprecated-mount twins: identical bodies, plus the `Deprecation` and `Link`
-    # headers that `mark_deprecated` stamps on every unprefixed response.
-    DeprecatedValidationError:
-      description: Validation error
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-        Deprecation:
-          $ref: "#/components/headers/Deprecation"
-        Link:
-          $ref: "#/components/headers/Link"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    DeprecatedNotFound:
-      description: Resource not found
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-        Deprecation:
-          $ref: "#/components/headers/Deprecation"
-        Link:
-          $ref: "#/components/headers/Link"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    DeprecatedRateLimited:
-      description: Rate limit exceeded
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-        Deprecation:
-          $ref: "#/components/headers/Deprecation"
-        Link:
-          $ref: "#/components/headers/Link"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-    DeprecatedWebhookBadGateway:
-      description: Webhook endpoint returned an error
-      headers:
-        X-Request-Id:
-          $ref: "#/components/headers/XRequestId"
-        Deprecation:
-          $ref: "#/components/headers/Deprecation"
-        Link:
-          $ref: "#/components/headers/Link"
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
+                error: invalid API key
+                code: unauthorized
 
   schemas:
     HealthResponse:
@@ -602,9 +533,31 @@ components:
           type: string
           format: date-time
 
+    PublicPaymentView:
+      type: object
+      description: >-
+        What GET /payments/{id} returns to a caller with no credential. Enough
+        to poll for completion, with nothing that identifies the merchant or
+        the sum involved.
+      required: [id, status, expires_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/PaymentStatus"
+        expires_at:
+          type: string
+          format: date-time
+
     CreatePaymentRequest:
       type: object
       required: [amount]
+      # The server rejects any field not listed here with 400 unknown_field.
+      # `merchant_id` used to be documented but was never read — the merchant is
+      # taken from the API key — so sending it now fails loudly instead of
+      # silently binding the intent to whichever merchant owns the key.
+      additionalProperties: false
       properties:
         amount:
           type: string
@@ -614,9 +567,10 @@ components:
           type: string
           enum: [XLM, USDC]
           default: XLM
-        merchant_id:
-          type: string
-          example: my-shop
+          description: >-
+            Defaults to XLM when omitted. Because the default applies silently,
+            a misspelled field name (e.g. `assset`) would otherwise create an
+            XLM intent; it is rejected as unknown_field instead.
         webhook_url:
           type: string
           format: uri
@@ -700,7 +654,7 @@ components:
           description: >-
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
-            invalid_request, unsupported_asset, invalid_amount,
+            invalid_request, unknown_field, unsupported_asset, invalid_amount,
             invalid_webhook_url, invalid_status, invalid_cursor,
             payment_not_found, delivery_not_found, rate_limit_exceeded,
             not_found, webhook_target_blocked, webhook_delivery_failed, and

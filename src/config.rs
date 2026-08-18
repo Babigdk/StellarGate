@@ -1,4 +1,6 @@
 use anyhow::Result;
+use ipnet::IpNet;
+use std::collections::HashSet;
 
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,8 +87,9 @@ pub struct Config {
     pub network: String,
     pub horizon_url: String,
     pub gateway_public: String,
-    /// Assets the gateway will accept, validated on POST /payments and in verify().
-    /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
+    /// Assets the gateway will accept, validated on POST /payments.
+    /// Duplicate codes are rejected at boot (issue #222). Configure via
+    /// `ACCEPTED_ASSETS=XLM,USDC:GISSUER` (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
@@ -142,9 +145,21 @@ pub struct Config {
     /// pruning.
     pub idempotency_retention_days: i64,
     pub poll_interval_secs: u64,
+    /// How many `POLL_INTERVAL_SECS` may elapse without a successful Horizon
+    /// poll (or stream event) before `/ready` reports the payment-detection
+    /// cursor as stale and returns `503`. A healthy poller cycles on the poll
+    /// interval, so the default of 3 tolerates a couple of missed cycles
+    /// (transient Horizon errors) while still catching a permanently dead
+    /// poller or a wedged stream (issue #315).
+    pub cursor_staleness_multiple: u32,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
+    /// Maximum number of overdue intents the expiry sweeper transitions in one
+    /// sweep. Batching keeps each sweeper write short — SQLite has a single
+    /// writer, so one unbounded sweep over a large backlog would stall payment
+    /// writes until it finished (issue #323).
+    pub expiry_batch_size: i64,
     /// Maximum number of requests per second allowed per client IP before the
     /// rate-limit middleware responds with `429 Too Many Requests`.
     pub rate_limit_requests_per_sec: u32,
@@ -173,6 +188,15 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    /// CIDR blocks whose `X-Forwarded-For` / `X-Real-IP` headers are honoured
+    /// for rate-limit bucketing and auth-log source attribution (issue #330).
+    ///
+    /// Forwarding headers are client-supplied, so they are trusted ONLY when
+    /// the socket peer is one of these proxies; every other peer is attributed
+    /// by its own address and its headers are ignored. Empty (the default)
+    /// means no proxy is trusted and the headers are always ignored — the
+    /// safe default for a directly-exposed gateway.
+    pub trusted_proxy_cidrs: Vec<IpNet>,
 }
 
 impl Config {
@@ -257,7 +281,9 @@ impl Config {
             webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
             idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
+            cursor_staleness_multiple: parse_env("CURSOR_STALENESS_MULTIPLE", 3)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
+            expiry_batch_size: parse_env("EXPIRY_BATCH_SIZE", 500)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
             db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
             db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000)?,
@@ -268,6 +294,9 @@ impl Config {
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
+            trusted_proxy_cidrs: parse_cidrs(
+                &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+            )?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -304,6 +333,19 @@ impl Config {
                 })?;
             }
         }
+        /* Stellar asset codes are not unique — anyone can issue `USDC`. Two
+        allow-list entries sharing a code made `verify()` accept a payment from
+        either issuer against an intent that stored only the code (issue #222). */
+        let mut seen_codes = HashSet::new();
+        for asset in &self.accepted_assets {
+            let code = asset.code.to_ascii_uppercase();
+            if !seen_codes.insert(code.clone()) {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS has duplicate code {code}. Stellar asset codes are not \
+                     unique across issuers; pin each code to a single issuer."
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -314,6 +356,7 @@ impl Config {
     /// - `PAYMENT_TTL_SECS == 0` → every intent expires the moment it is created
     /// - `PAYMENT_TTL_SECS < POLL_INTERVAL_SECS` → intents expire before the
     ///   poller ever scans them, so payments land but are never matched
+    /// - `EXPIRY_BATCH_SIZE <= 0` → the expiry sweeper never transitions anything
     /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
@@ -326,6 +369,14 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
                  A zero interval creates a tight polling loop at 100% CPU."
+            ));
+        }
+
+        if self.cursor_staleness_multiple == 0 {
+            return Err(anyhow::anyhow!(
+                "CURSOR_STALENESS_MULTIPLE must be > 0 (got 0). \
+                 A zero window would make /ready report a stale cursor the \
+                 moment the poller finishes a cycle."
             ));
         }
 
@@ -343,6 +394,14 @@ impl Config {
                  the poller ever gets a chance to detect it.",
                 self.payment_ttl_secs,
                 self.poll_interval_secs
+            ));
+        }
+
+        if self.expiry_batch_size <= 0 {
+            return Err(anyhow::anyhow!(
+                "EXPIRY_BATCH_SIZE must be > 0 (got {}). \
+                 A zero or negative batch would make the expiry sweeper a no-op.",
+                self.expiry_batch_size
             ));
         }
 
@@ -461,7 +520,9 @@ impl std::fmt::Debug for Config {
                 &self.webhook_redrive_backoff_max_secs,
             )
             .field("poll_interval_secs", &self.poll_interval_secs)
+            .field("cursor_staleness_multiple", &self.cursor_staleness_multiple)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
+            .field("expiry_batch_size", &self.expiry_batch_size)
             .field(
                 "rate_limit_requests_per_sec",
                 &self.rate_limit_requests_per_sec,
@@ -476,12 +537,34 @@ impl std::fmt::Debug for Config {
             )
             .field("admin_provisioning_secret", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
+/// IPv6), e.g. `TRUSTED_PROXY_CIDRS=10.0.0.0/8,192.168.1.0/24`. Empty/unset
+/// means no trusted proxies, in which case forwarding headers are ignored
+/// entirely (issue #330). A malformed entry aborts boot — a mistyped
+/// allow-list must not silently degrade into trusting headers it shouldn't.
+fn parse_cidrs(raw: &str) -> Result<Vec<IpNet>> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            entry.parse::<IpNet>().map_err(|e| {
+                anyhow::anyhow!(
+                    "TRUSTED_PROXY_CIDRS contains an invalid CIDR {entry:?}: {e}. \
+                     Expected comma-separated CIDR blocks, e.g. 10.0.0.0/8. \
+                     Fix or remove the bad entry."
+                )
+            })
+        })
+        .collect()
 }
 
 /// Parse an env var into `T`.
@@ -535,7 +618,9 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -544,6 +629,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -610,7 +696,9 @@ mod tests {
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -619,6 +707,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 
@@ -652,6 +741,24 @@ mod tests {
             issuer: Some("GNOTAREALISSUER".into()),
         }];
         let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_addresses_rejects_duplicate_asset_codes() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+        ];
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
         assert!(err.contains("USDC"), "got: {err}");
     }
 
@@ -849,6 +956,14 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_zero_cursor_staleness_multiple() {
+        let mut cfg = timing_config();
+        cfg.cursor_staleness_multiple = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("CURSOR_STALENESS_MULTIPLE"), "got: {err}");
+    }
+
+    #[test]
     fn timing_rejects_zero_poll_interval() {
         let mut cfg = timing_config();
         cfg.poll_interval_secs = 0;
@@ -907,6 +1022,19 @@ mod tests {
         cfg.webhook_retry_attempts = 1;
         cfg.webhook_retry_delay_ms = 0; // no retries, so no burst
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_expiry_batch() {
+        let mut cfg = timing_config();
+        cfg.expiry_batch_size = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("EXPIRY_BATCH_SIZE"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_default_expiry_batch() {
+        assert!(timing_config().validate_timing().is_ok());
     }
 
     #[test]
@@ -988,6 +1116,51 @@ mod tests {
         assert!(
             err.contains("streem"),
             "error should echo the bad value; got: {err}"
+        );
+    }
+
+    // ── CURSOR_STALENESS_MULTIPLE ────────────────────────────────────────────
+
+    /// Every `run_with_env` closure below must set a valid WEBHOOK_SECRET (and
+    /// anything else `from_env` hard-requires), otherwise the panic inside the
+    /// closure poisons the shared env-test mutex and every subsequent
+    /// `run_with_env` test fails at the lock.
+    const ENV_WEBHOOK_SECRET: &str = "a-very-long-and-secure-webhook-signing-secret-32-chars";
+
+    #[test]
+    fn cursor_staleness_multiple_defaults_to_three() {
+        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
+            assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 3);
+        });
+    }
+
+    #[test]
+    fn cursor_staleness_multiple_parses_from_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("CURSOR_STALENESS_MULTIPLE", Some("7")),
+            ],
+            || {
+                assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 7);
+            },
+        );
+    }
+
+    #[test]
+    fn cursor_staleness_multiple_rejects_non_numeric_value() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("CURSOR_STALENESS_MULTIPLE", Some("soon")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("CURSOR_STALENESS_MULTIPLE"),
+                    "boot should abort on a non-numeric value; got: {err}"
+                );
+            },
         );
     }
 }

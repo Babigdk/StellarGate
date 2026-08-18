@@ -33,6 +33,7 @@ Fired when cumulative payment equals the requested amount exactly.
   "amount": "10.00",
   "paid_amount": "10.00",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "completed"
 }
 ```
