@@ -38,4 +38,5 @@ LICENSE
 docker-compose.yml
 deny.toml
 openapi.yaml
+redocly.yaml
 fly.toml

@@ -72,3 +72,21 @@ jobs:
         run: cargo test --locked
         env:
           RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+
+  openapi:
+    name: openapi lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Lints the spec's shape (redocly.yaml extends `recommended`). The
+      # complementary spec↔router cross-check — that documented paths actually
+      # resolve and that the deprecated mount carries its headers — is the
+      # `openapi_contract` integration test, which runs in the `test` job above.
+      # Major pinned to match what the spec was validated against locally.
+      - name: Lint openapi.yaml
+        run: npx --yes @redocly/cli@1 lint openapi.yaml

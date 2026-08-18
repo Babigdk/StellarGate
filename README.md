@@ -393,6 +393,12 @@ are **not** versioned. They are infrastructure rather than contract; moving a
 liveness probe with every API revision would break probes and scrape configs
 for no benefit.
 
+The full request/response contract — the `Idempotency-Key` request header and
+the `Deprecation`, `Link` and `x-request-id` response headers included — is
+described in [`openapi.yaml`](openapi.yaml). CI lints that spec and
+cross-checks its documented paths against the live router, so it cannot quietly
+drift from what the service actually serves.
+
 #### Deprecation policy
 
 | Change | How it ships |
@@ -998,7 +1004,7 @@ cargo fmt                   # format
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule). The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
+CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
 
 `deny.toml` is present but no workflow runs `cargo deny` yet, so its license, ban, and duplicate-version policy is not currently enforced (#293).
 
@@ -1011,6 +1017,7 @@ CI enforces all four on every pull request, plus a [`cargo audit`](https://githu
 | `tests/rate_limit_tests.rs` | Per-bucket limiting |
 | `tests/webhook_dispatch_tests.rs` | Signing, retries, redrive |
 | `tests/trustline_tests.rs` | Asset trustline checks |
+| `tests/openapi_contract.rs` | `openapi.yaml` ↔ router: paths resolve, deprecation headers, path-set parity |
 
 Integration tests run against an in-memory SQLite database and a [wiremock](https://github.com/LukeMathWalker/wiremock-rs) HTTP server — no network access or external services required.
 

@@ -1,8 +1,33 @@
 openapi: 3.1.0
 info:
   title: StellarGate
-  description: Payment gateway API built on Stellar for accepting and managing payments in XLM and USDC.
+  description: |-
+    Payment gateway API built on Stellar for accepting and managing payments in
+    XLM and USDC.
+
+    ## Versioning
+
+    `/v1` is the canonical, versioned surface — use it for all new integrations.
+    The same operations are also served **unprefixed** (`POST /payments`, …) for
+    backward compatibility (issue #121); those paths are **deprecated** and every
+    response on them carries, per RFC 8594 / RFC 8288:
+
+    ```
+    Deprecation: true
+    Link: </v1/…>; rel="successor-version"
+    ```
+
+    The deprecated operations are documented below and marked `deprecated: true`
+    so a generated client surfaces the move. Operational endpoints (`/health`,
+    `/ready`, `/metrics`, `/dashboard`) are infrastructure rather than contract
+    and are intentionally unversioned.
+
+    Every response also carries an `x-request-id` header — echoed from the
+    caller's or generated server-side — worth quoting in a support request.
   version: 0.1.0
+  license:
+    name: MIT
+    url: https://github.com/StellarGateLabs/StellarGate/blob/main/LICENSE
 
 servers:
   - url: http://localhost:3000
@@ -16,15 +41,24 @@ paths:
       responses:
         "200":
           description: Service is up
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
-  /payments:
+  # ---------------------------------------------------------------------------
+  # Canonical surface (/v1). Use these for all new integrations.
+  # ---------------------------------------------------------------------------
+
+  /v1/payments:
     post:
       operationId: createPayment
       summary: Create a payment intent
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -34,179 +68,474 @@ paths:
       responses:
         "201":
           description: Payment intent created
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "200":
+          description: >-
+            Idempotent replay — a prior request carrying the same
+            `Idempotency-Key` (for this merchant) already created this intent,
+            so the original is returned rather than a duplicate.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Payment"
         "400":
-          description: Validation error
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                invalid_amount:
-                  summary: Invalid amount
-                  value:
-                    error: amount must be a positive number with at most 7 decimal places
-                    code: invalid_amount
-                unsupported_asset:
-                  summary: Unsupported asset
-                  value:
-                    error: "unsupported asset 'EURC'; supported: XLM, USDC"
-                    code: unsupported_asset
+          $ref: "#/components/responses/ValidationError"
         "429":
-          description: Rate limit exceeded
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                rate_limit_exceeded:
-                  summary: Rate limit exceeded
-                  value:
-                    error: rate limit exceeded
-                    code: rate_limit_exceeded
+          $ref: "#/components/responses/RateLimited"
 
     get:
       operationId: listPayments
       summary: List payments
       parameters:
-        - name: status
-          in: query
-          schema:
-            $ref: "#/components/schemas/PaymentStatus"
-          description: Filter by status
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 20
-          description: Page size
-        - name: offset
-          in: query
-          schema:
-            type: integer
-            minimum: 0
-            default: 0
-          description: Rows to skip (offset pagination)
-        - name: cursor
-          in: query
-          schema:
-            type: string
-          description: Opaque cursor for keyset pagination (returned as next_cursor)
+        - $ref: "#/components/parameters/StatusFilter"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - $ref: "#/components/parameters/CursorParam"
       responses:
         "200":
           description: Paginated list of payments
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListPaymentsResponse"
         "400":
-          description: Invalid query parameter
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/ValidationError"
 
-  /payments/{id}:
+  /v1/payments/{id}:
     get:
       operationId: getPayment
       summary: Get a payment by ID
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/PaymentId"
       responses:
         "200":
           description: Payment found
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Payment"
         "404":
-          description: Payment not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/NotFound"
 
-  /payments/{id}/webhooks:
+  /v1/payments/{id}/webhooks:
     get:
       operationId: listWebhookDeliveries
       summary: List webhook deliveries for a payment
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/PaymentId"
       responses:
         "200":
           description: Webhook delivery history
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
         "404":
-          description: Payment not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
+          $ref: "#/components/responses/NotFound"
 
-  /payments/{id}/webhooks/{delivery_id}/redeliver:
+  /v1/payments/{id}/webhooks/{delivery_id}/redeliver:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
-        - name: delivery_id
-          in: path
-          required: true
-          schema:
-            type: string
-            format: uuid
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "#/components/parameters/DeliveryId"
       responses:
         "200":
           description: Redelivery succeeded
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
         "404":
-          description: Payment or delivery not found
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                delivery_not_found:
-                  summary: Delivery not found
-                  value:
-                    error: delivery not found
-                    code: delivery_not_found
+          $ref: "#/components/responses/NotFound"
         "502":
-          description: Webhook endpoint returned an error
+          $ref: "#/components/responses/WebhookBadGateway"
+
+  # ---------------------------------------------------------------------------
+  # Deprecated unprefixed mount. These are aliases of the /v1 operations above,
+  # kept served for backward compatibility (issue #121). Every response carries
+  # `Deprecation` and `Link: rel="successor-version"` headers. New integrations
+  # must use /v1.
+  # ---------------------------------------------------------------------------
+
+  /payments:
+    post:
+      operationId: createPaymentLegacy
+      summary: Create a payment intent (deprecated)
+      description: Deprecated alias of `POST /v1/payments`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentRequest"
+      responses:
+        "201":
+          description: Payment intent created
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                webhook_delivery_failed:
-                  summary: Redelivery failed
-                  value:
-                    error: webhook delivery failed
-                    code: webhook_delivery_failed
+                $ref: "#/components/schemas/Payment"
+        "200":
+          description: Idempotent replay — see `POST /v1/payments`.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "400":
+          $ref: "#/components/responses/DeprecatedValidationError"
+        "429":
+          $ref: "#/components/responses/DeprecatedRateLimited"
+
+    get:
+      operationId: listPaymentsLegacy
+      summary: List payments (deprecated)
+      description: Deprecated alias of `GET /v1/payments`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/StatusFilter"
+        - $ref: "#/components/parameters/LimitParam"
+        - $ref: "#/components/parameters/OffsetParam"
+        - $ref: "#/components/parameters/CursorParam"
+      responses:
+        "200":
+          description: Paginated list of payments
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListPaymentsResponse"
+        "400":
+          $ref: "#/components/responses/DeprecatedValidationError"
+
+  /payments/{id}:
+    get:
+      operationId: getPaymentLegacy
+      summary: Get a payment by ID (deprecated)
+      description: Deprecated alias of `GET /v1/payments/{id}`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Payment found
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Payment"
+        "404":
+          $ref: "#/components/responses/DeprecatedNotFound"
+
+  /payments/{id}/webhooks:
+    get:
+      operationId: listWebhookDeliveriesLegacy
+      summary: List webhook deliveries for a payment (deprecated)
+      description: Deprecated alias of `GET /v1/payments/{id}/webhooks`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Webhook delivery history
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+        "404":
+          $ref: "#/components/responses/DeprecatedNotFound"
+
+  /payments/{id}/webhooks/{delivery_id}/redeliver:
+    post:
+      operationId: redeliverWebhookLegacy
+      summary: Re-attempt a webhook delivery (deprecated)
+      description: >-
+        Deprecated alias of
+        `POST /v1/payments/{id}/webhooks/{delivery_id}/redeliver`.
+      deprecated: true
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "#/components/parameters/DeliveryId"
+      responses:
+        "200":
+          description: Redelivery succeeded
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/XRequestId"
+            Deprecation:
+              $ref: "#/components/headers/Deprecation"
+            Link:
+              $ref: "#/components/headers/Link"
+        "404":
+          $ref: "#/components/responses/DeprecatedNotFound"
+        "502":
+          $ref: "#/components/responses/DeprecatedWebhookBadGateway"
 
 components:
+  headers:
+    XRequestId:
+      description: >-
+        Correlation id for the request, echoed from the caller's `x-request-id`
+        or generated server-side as a UUID. Present on every response.
+      schema:
+        type: string
+        format: uuid
+    Deprecation:
+      description: >-
+        Present on responses from the deprecated unprefixed mount (RFC 8594).
+        Always the literal string `true`.
+      schema:
+        type: string
+        enum: ["true"]
+    Link:
+      description: >-
+        Present on responses from the deprecated unprefixed mount (RFC 8288).
+        Points at the canonical `/v1` successor of the requested path.
+      schema:
+        type: string
+      example: '</v1/payments>; rel="successor-version"'
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Optional client-chosen key that makes creating a payment safe to retry
+        after a network blip. Scoped per merchant; an empty value is treated as
+        absent. Reusing a key returns the original intent with `200 OK` instead
+        of minting a duplicate.
+      schema:
+        type: string
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeliveryId:
+      name: delivery_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by status
+      schema:
+        $ref: "#/components/schemas/PaymentStatus"
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    OffsetParam:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip (offset pagination)
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    CursorParam:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor for keyset pagination (returned as next_cursor)
+      schema:
+        type: string
+
+  responses:
+    ValidationError:
+      description: Validation error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalid_amount:
+              summary: Invalid amount
+              value:
+                error: amount must be a positive number with at most 7 decimal places
+                code: invalid_amount
+            unsupported_asset:
+              summary: Unsupported asset
+              value:
+                error: "unsupported asset 'EURC'; supported: XLM, USDC"
+                code: unsupported_asset
+    NotFound:
+      description: Resource not found
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            payment_not_found:
+              summary: Payment not found
+              value:
+                error: payment not found
+                code: payment_not_found
+            delivery_not_found:
+              summary: Delivery not found (redelivery only)
+              value:
+                error: delivery not found
+                code: delivery_not_found
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            rate_limit_exceeded:
+              summary: Rate limit exceeded
+              value:
+                error: rate limit exceeded
+                code: rate_limit_exceeded
+    WebhookBadGateway:
+      description: Webhook endpoint returned an error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            webhook_delivery_failed:
+              summary: Redelivery failed
+              value:
+                error: webhook delivery failed
+                code: webhook_delivery_failed
+
+    # Deprecated-mount twins: identical bodies, plus the `Deprecation` and `Link`
+    # headers that `mark_deprecated` stamps on every unprefixed response.
+    DeprecatedValidationError:
+      description: Validation error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedNotFound:
+      description: Resource not found
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedRateLimited:
+      description: Rate limit exceeded
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedWebhookBadGateway:
+      description: Webhook endpoint returned an error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
   schemas:
     HealthResponse:
       type: object
@@ -258,12 +587,10 @@ components:
         status:
           $ref: "#/components/schemas/PaymentStatus"
         tx_hash:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: On-chain transaction hash once settled
         paid_amount:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Cumulative amount received
         created_at:
           type: string
@@ -313,8 +640,7 @@ components:
           type: integer
           description: Present when using offset pagination
         next_cursor:
-          type: string
-          nullable: true
+          type: [string, "null"]
           description: Pass as cursor on the next request to get the following page
 
     WebhookDelivery:
@@ -339,9 +665,8 @@ components:
         attempts:
           type: integer
         last_attempt:
-          type: string
+          type: [string, "null"]
           format: date-time
-          nullable: true
         created_at:
           type: string
           format: date-time
