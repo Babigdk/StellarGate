@@ -940,7 +940,7 @@ pub async fn list_redrivable_deliveries(
                  + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
-    ))
+    )
     .bind(max_attempts)
     .bind(grace_secs)
     .bind(grace_secs)
