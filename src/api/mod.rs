@@ -1,16 +1,19 @@
-use crate::api::payments::{AppError, JsonBody};
+use crate::api::payments::{AppError, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
     extract::{ConnectInfo, Path, Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json,
 };
+use governor::clock::{Clock, DefaultClock};
+use governor::middleware::StateInformationMiddleware;
+use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +46,12 @@ const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 struct RateLimitState {
     requests_per_sec: u32,
+    /// Trusted proxies from `TRUSTED_PROXY_CIDRS`. Forwarding headers
+    /// (`X-Forwarded-For` / `X-Real-IP`) are honoured only when the socket
+    /// peer is one of these; every other peer is bucketed by its own address
+    /// and its headers are ignored (issue #330). Empty means no proxy is
+    /// trusted and the headers are always ignored.
+    trusted_proxies: Vec<IpNet>,
     /// Bounded, TTL-evicting cache of per-(bucket, IP) rate limiters.
     ///
     /// Replaces the previous `Mutex<HashMap<...>>`:
@@ -52,17 +61,31 @@ struct RateLimitState {
     ///   so limiter state for quiet IPs is automatically reclaimed.
     /// - moka uses internal sharding, eliminating the single global lock that
     ///   the old `Mutex` imposed.
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+    ///
+    /// Built `with_middleware::<StateInformationMiddleware>` so a successful
+    /// `check()` returns a `StateSnapshot` rather than `()`. That snapshot is
+    /// where `X-RateLimit-Remaining` comes from; without it the limiter can
+    /// only answer "allowed or not", and a client has no way to pace itself
+    /// before being throttled (issue #327).
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
 }
 
+/// Rate-limit headers. Named here so the CORS `expose_headers` list and the
+/// middleware cannot drift apart — a header a browser client can't read is the
+/// same as one that was never sent.
+const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
+
 impl RateLimitState {
-    fn new(requests_per_sec: u32) -> Self {
+    fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
         let limiters = Cache::builder()
             .max_capacity(RATE_LIMITER_MAX_KEYS)
             .time_to_idle(RATE_LIMITER_IDLE_TTL)
             .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
+            trusted_proxies,
             limiters,
         }
     }
@@ -70,7 +93,10 @@ impl RateLimitState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
-    let rate_limit = RateLimitState::new(state.config.rate_limit_requests_per_sec);
+    let rate_limit = RateLimitState::new(
+        state.config.rate_limit_requests_per_sec,
+        state.config.trusted_proxy_cidrs.clone(),
+    );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
     axum::Router::new()
@@ -191,7 +217,7 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> axum::response::Response {
-    let source_ip = client_ip_key(&req);
+    let source_ip = client_ip_key(&req, &state.config.trusted_proxy_cidrs);
 
     let raw_key = req
         .headers()
@@ -313,7 +339,7 @@ async fn provision_merchant(
 async fn issue_api_key(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
-    body: Option<JsonBody<IssueKeyRequest>>,
+    OptionalJsonBody(body): OptionalJsonBody<IssueKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -322,7 +348,7 @@ async fn issue_api_key(
         ));
     }
 
-    let label = body.and_then(|JsonBody(b)| b.label);
+    let label = body.and_then(|b| b.label);
     if let Some(l) = &label {
         if l.len() > 100 {
             return Err(AppError::bad_request(
@@ -423,45 +449,127 @@ async fn revoke_api_key(
     ))
 }
 
+/// The optional `POST /merchants/:id/keys` body.
+///
+/// `deny_unknown_fields` for the same reason as `CreatePaymentRequest`
+/// (issue #329): a mistyped `lable` should say so rather than quietly issuing
+/// an unlabelled key.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IssueKeyRequest {
     label: Option<String>,
 }
 
+/// Enforce the per-(bucket, client) quota and describe it to the caller.
+///
+/// Every response — throttled or not — carries `X-RateLimit-Limit`,
+/// `X-RateLimit-Remaining` and `X-RateLimit-Reset`, so a client can pace itself
+/// *before* being throttled rather than discovering the limit by hitting it
+/// (issue #327).
+///
+/// On a rejection, `Retry-After` is derived from the limiter's own state.
+/// `governor` computes exactly this value — `check()` returns
+/// `Err(NotUntil<_>)`, whose `wait_time_from` is the duration until the request
+/// would be permitted — and the previous code discarded it in favour of a
+/// hard-coded `1`. That constant was wrong in both directions: too short and a
+/// well-behaved client that honours it retries straight into another `429`,
+/// generating exactly the load the limiter is shedding; too long and throughput
+/// is left on the table. It only looked right because the default quota is
+/// per-second, and grew steadily more wrong as `RATE_LIMIT_REQUESTS_PER_SEC`
+/// was tuned.
 async fn rate_limit_middleware(
     State(rate_limit): State<RateLimitState>,
     req: Request,
     next: Next,
 ) -> axum::response::Response {
-    if let Some(bucket) = rate_limited_bucket(&req) {
-        let key = rate_limit_key(bucket, &req);
-        let base_rps = rate_limit.requests_per_sec;
-        let effective_rps = base_rps
-            .saturating_mul(bucket_rate_multiplier(bucket))
-            .max(1);
-        /* `get_with` clones the `Arc` out of the cache rather than handing back a
-        guard, so nothing borrowed from the cache is held across the `.await`
-        below. */
-        let limiter = rate_limit.limiters.get_with(key, || {
-            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps).unwrap(),
-            )))
-        });
+    let Some(bucket) = rate_limited_bucket(&req) else {
+        return next.run(req).await;
+    };
 
-        if limiter.check().is_err() {
-            return (
+    let key = rate_limit_key(bucket, &req, &rate_limit.trusted_proxies);
+    let base_rps = rate_limit.requests_per_sec;
+    let effective_rps = base_rps
+        .saturating_mul(bucket_rate_multiplier(bucket))
+        .max(1);
+    /* `get_with` clones the `Arc` out of the cache rather than handing back a
+    guard, so nothing borrowed from the cache is held across the `.await`
+    below. */
+    let limiter = rate_limit.limiters.get_with(key, || {
+        Arc::new(
+            governor::RateLimiter::direct(governor::Quota::per_second(
+                NonZeroU32::new(effective_rps).unwrap(),
+            ))
+            .with_middleware::<StateInformationMiddleware>(),
+        )
+    });
+
+    match limiter.check() {
+        Ok(snapshot) => {
+            let remaining = snapshot.remaining_burst_capacity();
+            let reset = reset_secs(snapshot.quota(), remaining, Duration::ZERO);
+            let mut res = next.run(req).await;
+            set_rate_limit_headers(res.headers_mut(), effective_rps, remaining, reset);
+            res
+        }
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            let retry_after = retry_after_secs(wait);
+            let reset = reset_secs(not_until.quota(), 0, wait);
+
+            let mut res = (
                 StatusCode::TOO_MANY_REQUESTS,
-                [(header::RETRY_AFTER, HeaderValue::from_static("1"))],
                 Json(json!({
                     "error": "rate limit exceeded",
                     "code": "rate_limit_exceeded"
                 })),
             )
                 .into_response();
+
+            let headers = res.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+            set_rate_limit_headers(headers, effective_rps, 0, reset);
+            res
         }
     }
+}
 
-    next.run(req).await
+/// `Retry-After`, in delta-seconds per RFC 9110.
+///
+/// Rounded *up*, with a floor of 1. Truncating would hand back a value the
+/// limiter has not actually reached — a 1.4s wait reported as `1` is a
+/// guaranteed second rejection — and `0` would tell a client honouring the
+/// header to retry immediately, i.e. to hot-loop.
+fn retry_after_secs(wait: Duration) -> u64 {
+    wait.as_secs_f64().ceil().max(1.0) as u64
+}
+
+/// Seconds until the bucket is back to full capacity.
+///
+/// `wait_for_next` is the delay before the *first* cell becomes available (zero
+/// when the request was allowed); the remaining cells refill one per
+/// `replenish_interval` after that. Reported as a delta rather than an epoch
+/// timestamp so a client with a skewed clock still gets a usable answer.
+fn reset_secs(quota: governor::Quota, remaining: u32, wait_for_next: Duration) -> u64 {
+    let missing = quota.burst_size().get().saturating_sub(remaining);
+    let refill = quota.replenish_interval().saturating_mul(missing);
+    // `wait_for_next` already covers the first missing cell on the throttled
+    // path, so it replaces one interval rather than adding to the total.
+    let total = refill.max(wait_for_next);
+    total.as_secs_f64().ceil() as u64
+}
+
+fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
+    for (name, value) in [
+        (X_RATELIMIT_LIMIT, limit as u64),
+        (X_RATELIMIT_REMAINING, remaining as u64),
+        (X_RATELIMIT_RESET, reset),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Identifies which rate-limit bucket a request falls into.
@@ -507,24 +615,96 @@ fn bucket_rate_multiplier(bucket: &str) -> u32 {
 /// Keyed by bucket + client so each bucket is rate-limited independently —
 /// provisioning a merchant should never eat into a client's payment quota (or
 /// vice versa).
-fn rate_limit_key(bucket: &str, req: &Request) -> String {
-    format!("{bucket}:{}", client_ip_key(req))
+fn rate_limit_key(bucket: &str, req: &Request, trusted_proxies: &[IpNet]) -> String {
+    format!("{bucket}:{}", client_ip_key(req, trusted_proxies))
 }
 
-fn client_ip_key(req: &Request) -> String {
-    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        return addr.ip().to_string();
+/// Client key used when a request carries no peer address at all (the router
+/// is served without `into_make_service_with_connect_info`). Fail-closed:
+/// every such request shares this one key rather than trusting client-supplied
+/// forwarding headers (issue #330).
+const CLIENT_IP_UNKNOWN: &str = "unknown";
+
+/// Resolve the client IP used for rate-limit bucketing and auth-log source
+/// attribution.
+///
+/// `X-Forwarded-For` and `X-Real-IP` are client-supplied, so they are honoured
+/// ONLY when the socket peer is a configured trusted proxy
+/// (`TRUSTED_PROXY_CIDRS`). In every other case the peer's own address is used
+/// and the headers are ignored entirely:
+///
+/// - Untrusted peer (or no trusted proxies configured): the peer address wins,
+///   so a caller cannot rotate a header per request to evade rate limiting or
+///   poison the auth logs.
+/// - Trusted peer: the rightmost `X-Forwarded-For` hop that is not itself a
+///   trusted proxy is taken as the client, falling back to `X-Real-IP` and
+///   then the peer address. This preserves per-client attribution behind a
+///   reverse proxy without letting the proxy chain be forged.
+/// - No peer address available: fail closed to a single shared key
+///   ([`CLIENT_IP_UNKNOWN`]) with a one-time warning, regardless of headers.
+fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
+    let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
+        warn_missing_connect_info_once();
+        return CLIENT_IP_UNKNOWN.to_string();
+    };
+
+    let peer_ip = addr.ip();
+
+    // Untrusted peer: the forwarding headers are ignored entirely.
+    if !trusted_proxies.iter().any(|net| net.contains(&peer_ip)) {
+        return peer_ip.to_string();
     }
 
-    for name in ["x-forwarded-for", "x-real-ip"] {
-        if let Some(value) = req.headers().get(name).and_then(|v| v.to_str().ok()) {
-            if let Some(first) = value.split(',').map(str::trim).find(|s| !s.is_empty()) {
-                return first.to_string();
+    // Trusted peer: walk X-Forwarded-For from the rightmost hop, skipping hops
+    // that are themselves trusted proxies, and take the first remaining value.
+    if let Some(value) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        for hop in value.split(',').map(str::trim).rev() {
+            if hop.is_empty() {
+                continue;
+            }
+            match hop.parse::<IpAddr>() {
+                // A hop that is itself a trusted proxy was added by a proxy we
+                // trust — keep walking left toward the real client.
+                Ok(ip) if trusted_proxies.iter().any(|net| net.contains(&ip)) => continue,
+                // First hop that is not a trusted proxy: this is the client.
+                Ok(ip) => return ip.to_string(),
+                // Unparseable value: cannot be a trusted proxy, so treat it as
+                // the client rather than guessing.
+                Err(_) => return hop.to_string(),
             }
         }
     }
 
-    "local".to_string()
+    // No X-Forwarded-For, or every hop was a trusted proxy: fall back to the
+    // single-value X-Real-IP header, also gated on the trusted peer.
+    if let Some(value) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+        if let Ok(ip) = value.trim().parse::<IpAddr>() {
+            if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
+                return ip.to_string();
+            }
+        }
+    }
+
+    peer_ip.to_string()
+}
+
+/// Warn once (per process) when a request has no peer address, i.e. the router
+/// is being served without `into_make_service_with_connect_info`. From then on
+/// every such request shares a single fail-closed client key, so an operator
+/// embedding the router sees exactly one warning instead of one per request.
+fn warn_missing_connect_info_once() {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "no ConnectInfo peer address on request: forwarding headers are ignored and all \
+             such requests share one client key. Serve the router with \
+             into_make_service_with_connect_info to restore per-client attribution."
+        );
+    });
 }
 
 /// The HTTP methods the strict CORS layer permits from a browser.
@@ -595,9 +775,26 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
 
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(allow_origins))
-        .allow_methods(CORS_ALLOWED_METHODS)
-        .allow_headers(CORS_ALLOWED_REQUEST_HEADERS.map(HeaderName::from_static))
-        .expose_headers(CORS_EXPOSED_HEADERS.map(HeaderName::from_static))
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("authorization"),
+        ])
+        /* Without this a browser client can see the 429 but not the headers
+        explaining it: the CORS spec hides every response header outside the
+        safelist unless it is named here, and `Retry-After` is not on that
+        safelist. Emitting a self-pacing contract the browser cannot read would
+        be the same as not emitting it (issue #327). */
+        .expose_headers([
+            header::RETRY_AFTER,
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
+        ])
 }
 
 /// Service root.
@@ -631,18 +828,55 @@ async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
     }
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok" }))
+/// Liveness probe — cheap by design, and fails only on conditions a restart
+/// would fix: an expected background task is no longer running (issue #315),
+/// or a required task is crash-looping under the supervisor (issue #316).
+/// A poller or listener that died at startup must not leave the process
+/// looking healthy forever, so this checks [`TaskHealth`](crate::TaskHealth)
+/// rather than just returning a hard-coded ok.
+async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let dead = state.task_health.dead_required_tasks();
+    let looping = state.task_health.crash_looping_required_tasks();
+    if dead.is_empty() && looping.is_empty() {
+        return Json(json!({ "status": "ok" })).into_response();
+    }
+
+    let mut reasons = Vec::new();
+    if !dead.is_empty() {
+        reasons.push(format!(
+            "background task(s) not running: {}",
+            dead.join(", ")
+        ));
+    }
+    if !looping.is_empty() {
+        reasons.push(format!(
+            "background task(s) crash-looping: {}",
+            looping.join(", ")
+        ));
+    }
+
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "status": "unavailable",
+            "reason": reasons.join("; "),
+        })),
+    )
+        .into_response()
 }
 
-/// Readiness probe — returns 200 only when both the database AND Horizon are
-/// reachable. A pod that cannot reach Horizon cannot detect on-chain payments;
-/// routing traffic to it is worse than routing it elsewhere (issue #172).
+/// Readiness probe — returns 200 only when the database AND Horizon are
+/// reachable AND the payment-detection cursor is advancing. A pod that cannot
+/// reach Horizon cannot detect on-chain payments; routing traffic to it is
+/// worse than routing it elsewhere (issue #172). And a reachable Horizon plus
+/// a dead poller is indistinguishable from a healthy system, so the probe also
+/// requires a successful poll (or stream event) within a configurable window
+/// (issue #315).
 ///
 /// Uses a 3-second timeout on the Horizon check so a slow node never hangs
-/// the probe. The check is skipped when no gateway is configured
-/// (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED) since without a gateway there is no
-/// on-chain work to do.
+/// the probe. Both the Horizon probe and the cursor-freshness check are
+/// skipped when no gateway is configured (STELLAR_GATEWAY_PUBLIC=UNCONFIGURED)
+/// since without a gateway there is no on-chain work to do.
 async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 1. Database must respond.
     if db::ping(&state.pool).await.is_err() {
@@ -653,12 +887,36 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .into_response();
     }
 
-    // 2. Horizon must respond (only when a gateway wallet is configured).
+    // 2. Horizon must respond and the detection cursor must be fresh (only
+    //    when a gateway wallet is configured).
     if state.config.gateway_configured() {
         if let Err(reason) = check_horizon_ready(&state).await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "status": "unavailable", "reason": reason })),
+            )
+                .into_response();
+        }
+
+        /* The poller/stream must have made progress recently. Horizon being
+        reachable says nothing about whether a worker is actually watching it
+        (issue #315): a poller that exited at startup leaves /ready green
+        forever without this check. The window is POLL_INTERVAL_SECS ×
+        CURSOR_STALENESS_MULTIPLE, so a healthy poller — which cycles on the
+        poll interval — always clears it. */
+        let staleness_limit =
+            state.config.poll_interval_secs as i64 * state.config.cursor_staleness_multiple as i64;
+        let cursor_age = state.task_health.last_success_age_secs();
+        if cursor_age > staleness_limit {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "unavailable",
+                    "reason": format!(
+                        "payment detection stalled: no successful poll or stream event in \
+                         {cursor_age}s (limit {staleness_limit}s)"
+                    ),
+                })),
             )
                 .into_response();
         }
@@ -690,7 +948,11 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
 
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let body = crate::metrics::render(&state.webhook_metrics, &state.auth_metrics);
+    let body = crate::metrics::render(
+        &state.webhook_metrics,
+        &state.auth_metrics,
+        &state.task_health,
+    );
     (
         StatusCode::OK,
         [(
@@ -793,5 +1055,169 @@ mod tests {
         let server = TestServer::new(timeout_test_router(Duration::from_millis(200))).unwrap();
         let response = server.get("/fast").await;
         response.assert_status_ok();
+    }
+
+    // ── client_ip_key (issue #330) ───────────────────────────────────────────
+
+    /// Build a bare request with an optional peer IP and headers, the inputs
+    /// `client_ip_key` actually reads (extensions + headers).
+    fn req_with(peer: Option<&str>, headers: &[(&str, &str)]) -> Request<axum::body::Body> {
+        let mut req = Request::builder().body(axum::body::Body::empty()).unwrap();
+        if let Some(ip) = peer {
+            let addr = SocketAddr::new(ip.parse().unwrap(), 0);
+            req.extensions_mut().insert(ConnectInfo(addr));
+        }
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        req
+    }
+
+    fn cidrs(list: &[&str]) -> Vec<IpNet> {
+        list.iter().map(|c| c.parse().unwrap()).collect()
+    }
+
+    /// TEST-NET-3 (RFC 5737) — documentation IPs, safe to use as fake clients.
+    const PEER: &str = "203.0.113.9";
+    const FAKE_CLIENT: &str = "198.51.100.7";
+
+    #[test]
+    fn untrusted_peer_ignores_spoofed_forwarding_headers() {
+        let req = req_with(
+            Some(PEER),
+            &[
+                ("x-forwarded-for", FAKE_CLIENT),
+                ("x-real-ip", "198.51.100.8"),
+            ],
+        );
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            PEER,
+            "an untrusted peer must be attributed by its own address"
+        );
+    }
+
+    #[test]
+    fn headers_ignored_when_no_trusted_proxies_configured() {
+        // The acceptance criterion: with TRUSTED_PROXY_CIDRS unset, forwarding
+        // headers are ignored regardless of ConnectInfo.
+        let req = req_with(Some(PEER), &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &[]), PEER);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_takes_rightmost_non_trusted_hop() {
+        // Peer is a trusted proxy; the chain was appended by trusted proxies
+        // (rightmost first), so the leftmost client survives.
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "198.51.100.7, 10.0.0.5, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn trusted_proxy_chain_of_only_trusted_hops_falls_back_to_peer() {
+        let req = req_with(
+            Some("10.0.0.1"),
+            &[("x-forwarded-for", "10.0.0.9, 10.0.0.1")],
+        );
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), "10.0.0.1");
+    }
+
+    #[test]
+    fn trusted_proxy_honors_x_real_ip_when_no_forwarded_for() {
+        let req = req_with(Some("10.0.0.1"), &[("x-real-ip", FAKE_CLIENT)]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), FAKE_CLIENT);
+    }
+
+    #[test]
+    fn missing_connect_info_fails_closed_to_shared_key() {
+        // Router served without connect info: headers must never be trusted,
+        // and every request shares one key rather than minting per-header ones.
+        let req = req_with(None, &[("x-forwarded-for", FAKE_CLIENT)]);
+        assert_eq!(
+            client_ip_key(&req, &cidrs(&["10.0.0.0/8"])),
+            CLIENT_IP_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn plain_peer_with_no_headers_uses_peer_address() {
+        let req = req_with(Some(PEER), &[]);
+        assert_eq!(client_ip_key(&req, &cidrs(&["10.0.0.0/8"])), PEER);
+    }
+
+    // ── reset_and_retry_after (issue #327) ───────────────────────────────────
+    //
+    // These are where the "derived, not fabricated" claim is actually pinned.
+    // The integration tests cannot do it: every quota the service builds is a
+    // `Quota::per_second(n)`, under which one cell replenishes in `1/n` seconds,
+    // so the wait is always sub-second and `Retry-After` — an integer per
+    // RFC 9110 — rounds to `1` at every configured rate. The hard-coded `1` was
+    // numerically indistinguishable from the truth for every reachable
+    // configuration, which is precisely why it survived review.
+    //
+    // A slow quota is where the two diverge, so that is what these use. They
+    // also mean the derivation stays correct if the quota shape ever changes
+    // (a per-minute window, a burst allowance) without anyone remembering that
+    // a constant elsewhere encodes an assumption about it.
+
+    /// A ten-minute replenish interval: the derived answer is 600, a fabricated
+    /// one is 1.
+    #[test]
+    fn retry_after_follows_a_slow_quota_instead_of_a_constant() {
+        assert_eq!(retry_after_secs(Duration::from_secs(600)), 600);
+    }
+
+    #[test]
+    fn retry_after_rounds_up_rather_than_truncating() {
+        // 1.4s truncated to 1 would retry into another rejection.
+        assert_eq!(retry_after_secs(Duration::from_millis(1_400)), 2);
+    }
+
+    #[test]
+    fn retry_after_never_tells_a_client_to_retry_immediately() {
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+    }
+
+    fn slow_quota(period: Duration, burst: u32) -> governor::Quota {
+        governor::Quota::with_period(period)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(burst).unwrap())
+    }
+
+    #[test]
+    fn reset_is_zero_when_the_bucket_is_untouched() {
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 5, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn reset_counts_every_missing_cell_not_just_the_next_one() {
+        // 3 of 5 cells spent, one minute each to replenish → 180s to full.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 2, Duration::ZERO), 180);
+    }
+
+    #[test]
+    fn reset_on_a_drained_bucket_covers_the_whole_refill() {
+        // Empty, with the next cell 60s out: still 5 × 60s to full capacity.
+        let quota = slow_quota(Duration::from_secs(60), 5);
+        assert_eq!(reset_secs(quota, 0, Duration::from_secs(60)), 300);
+    }
+
+    /// `Reset` is time-to-full and `Retry-After` is time-to-one-cell, so the
+    /// former can never be the smaller of the two. A client that waited
+    /// `Reset` and still got throttled would have no way to make progress.
+    #[test]
+    fn reset_is_never_shorter_than_retry_after() {
+        let quota = slow_quota(Duration::from_secs(600), 1);
+        let wait = Duration::from_secs(600);
+        assert!(reset_secs(quota, 0, wait) >= retry_after_secs(wait));
     }
 }

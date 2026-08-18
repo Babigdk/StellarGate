@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`X-RateLimit-*` response headers.** Every response now carries
+  `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
+  bucket it fell into, so a client can pace itself before being throttled
+  instead of discovering the limit by hitting it. All four rate-limit headers
+  (including `Retry-After`) are listed in `Access-Control-Expose-Headers` — the
+  CORS spec hides everything outside its safelist, and `Retry-After` is not on
+  it, so a browser client could previously see the `429` but none of the
+  headers explaining it. The bucket/quota model is now documented per route in
+  the README and in `openapi.yaml` (issue #327).
+
+### Fixed
+
+- **`openapi.yaml` declares its security schemes.** The spec had no
+  `components.securitySchemes` block and no `security` key on any operation, so
+  every route read as unauthenticated — a client generated from it exposed no
+  way to supply an API key, sent none, and got `401` on every call, leaving the
+  integrator's first impression that the API was broken rather than that the
+  spec was incomplete. It also misrepresented the security posture to anyone
+  reviewing the contract. `bearerAuth` (merchant API key) and `adminSecret`
+  (`X-Admin-Secret`) are now defined, `bearerAuth` is attached to every
+  protected payment operation, `/health` declares `security: []` explicitly,
+  and each protected operation documents its `401` shape.
+  `GET /payments/{id}` is genuinely tri-modal, so its optional-auth behaviour
+  is expressed as `[{}, {bearerAuth: []}]` with a `PublicPaymentView` schema
+  for the anonymous projection, rather than flattened to a single requirement
+  (issue #325).
+
+- **Background-task supervisor.** A panic in the poller, stream listener,
+  sweeper, retention worker, or webhook redrive used to end that task for the
+  life of the process while HTTP and `/health` kept serving. Each worker is
+  now supervised: panics are logged and counted when they happen, the task is
+  restarted with bounded exponential backoff, crash-loops fail `/health`, and
+  start/stop/fail/restart counters are exported on `/metrics` (issue #316).
+
+### Added
+
 - **API versioning.** Public routes are now served under `/v1` alongside a
   documented deprecation policy. Unversioned paths keep working and return
   `Deprecation` and `Link: rel="successor-version"` headers pointing at their
@@ -64,6 +100,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removing four near-identical spawn blocks and a macro that existed only to
   work around the same repetition. Behaviour unchanged.
 - README rewritten against the actual API surface.
+- **TLS switched from native-tls to rustls.** Both `sqlx` and `reqwest` now
+  use `rustls`-based feature flags, eliminating the system OpenSSL runtime
+  dependency and simplifying static/musl builds.
+- **Listener mode validation tightened.** An invalid `STELLAR_LISTENER_MODE`
+  value now fails fast at boot with a clear error instead of defaulting
+  silently to `stream`.
+- **Placeholder secrets rejected at boot.** Known placeholder values from
+  `.env.example` (e.g., `default-secret`, `your_webhook_signing_secret`) are
+  now detected and rejected during startup with a clear error to prevent
+  accidental production use of weak credentials.
 
 ### Security
 
@@ -82,6 +128,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /payments` offset pages now order rows exactly like cursor pages.**
+  The offset query sorted by `created_at DESC` alone while the keyset query
+  broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted
+  from an offset page silently skipped the rest of the tie group when handed
+  to the cursor branch. The offset query now orders by
+  `(created_at DESC, id DESC)` — the same ordering and the same index — and a
+  short offset page returns `null` instead of a dangling cursor. The migration
+  path from offset to cursor pagination is documented in the README; offset
+  mode is marked deprecated (issues #328, #269).
+- **Expiry sweeping now batches transitions.** `expire_overdue` previously
+  issued one guarded `UPDATE` per overdue intent, costing N round-trips and N
+  write-lock acquisitions per sweep — a real burden on the single SQLite
+  writer after an outage leaves a large backlog overdue at once. It now
+  transitions a bounded batch in a single `UPDATE … RETURNING`, so each sweep
+  is one write sized by `EXPIRY_BATCH_SIZE` (default `500`) and the backlog
+  drains over several sweeps. The `status IN ('pending','underpaid')` guard and
+  the "only rows actually transitioned produce a webhook" property are
+  preserved (issue #323).
 - **The build.** `main` did not compile. An unclosed block in
   `rate_limit_middleware` plus a reversion to the pre-`moka` `Mutex` API, a
   duplicated struct field and an unterminated character literal in `config.rs`,

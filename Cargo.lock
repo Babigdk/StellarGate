@@ -2275,6 +2275,7 @@ dependencies = [
  "governor",
  "hex",
  "hmac 0.13.0",
+ "ipnet",
  "moka",
  "rand 0.9.5",
  "reqwest",

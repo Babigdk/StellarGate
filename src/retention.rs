@@ -31,6 +31,7 @@ pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Rec
         && state.config.idempotency_retention_days <= 0
     {
         info!("retention worker disabled (both retention windows are 0)");
+        let _ = shutdown.changed().await;
         return;
     }
 
@@ -141,7 +142,9 @@ mod tests {
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
             poll_interval_secs: 10,
+            cursor_staleness_multiple: 3,
             payment_ttl_secs: 3600,
+            expiry_batch_size: 1,
             rate_limit_requests_per_sec: 1000,
             db_pool_max_connections: 1,
             db_busy_timeout_ms: 5000,
@@ -150,6 +153,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin".into(),
             request_timeout_secs: 30,
+            trusted_proxy_cidrs: vec![],
         }
     }
 

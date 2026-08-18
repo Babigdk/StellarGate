@@ -21,6 +21,7 @@ A payment gateway API built on [Stellar](https://stellar.org) for accepting, ver
 - [Dashboard](#dashboard)
 - [Configuration](#configuration)
   - [Trustlines](#trustlines)
+- [Rate Limiting](#rate-limiting)
 - [API Reference](#api-reference)
   - [Versioning](#versioning)
   - [API Key Lifecycle](#post-merchantsidkeys)
@@ -239,7 +240,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
@@ -305,7 +306,13 @@ XLM free to cover one per asset.
 |---|---|---|
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
+| `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
+| `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
+
+Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
+backlog drains over several sweeps instead of one long write lock — SQLite has
+a single writer.
 
 ### Webhooks
 
@@ -361,8 +368,63 @@ until it finished; a backlog drains over several cycles instead.
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. | `10` |
+| `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | Lock-acquisition wait before erroring. Must be `> 0` under concurrent load. | `5000` |
+
+---
+
+## Rate Limiting
+
+Every request is assigned to a **bucket**, and each bucket is limited
+independently per client IP — so provisioning a merchant can never eat into a
+client's payment quota, or vice versa. The client IP is resolved per
+`TRUSTED_PROXY_CIDRS` above.
+
+| Bucket | Routes | Quota |
+|---|---|---|
+| `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
+| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+Write and sensitive routes get the base rate; read-only traffic gets a more
+generous allowance so ordinary polling is not throttled. Redelivery is bucketed
+by *shape*, not by path — the URL carries payment and delivery ids, and keying
+on those would let every id mint its own limiter entry, which is both an
+unbounded map and a trivially bypassed limit.
+
+### Response headers
+
+**Every** response carries the current state of its bucket, so a client can pace
+itself before being throttled rather than discovering the limit by hitting it:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | The bucket's effective quota, i.e. the multiplier is already applied |
+| `X-RateLimit-Remaining` | Requests still available in this bucket right now |
+| `X-RateLimit-Reset` | Delta-seconds until the bucket is back to **full** capacity |
+
+A `429` additionally carries `Retry-After`, in delta-seconds, derived from the
+limiter's own state — `governor` knows exactly when the next request would be
+permitted, and this is that value rounded up with a floor of `1`. `Retry-After`
+is time until a **single** request is permitted; `X-RateLimit-Reset` is time
+until the bucket is full, so `Reset` is never the smaller of the two.
+
+`Reset` is a delta rather than an epoch timestamp so that a client with a skewed
+clock still gets a usable answer.
+
+All four headers are listed in `Access-Control-Expose-Headers`. The CORS spec
+hides every response header outside its safelist unless it is named there, and
+`Retry-After` is not on that safelist — a self-pacing contract a browser cannot
+read would be the same as no contract at all.
+
+> **Note on precision.** Quotas are per-second, so a single cell replenishes in
+> `1 / RATE_LIMIT_REQUESTS_PER_SEC` seconds — always under a second. Since
+> `Retry-After` is an integer number of seconds (RFC 9110), it currently reports
+> `1` at every configured rate. It is derived rather than hard-coded so that it
+> stays correct if the quota shape changes; for pacing *now*, use
+> `X-RateLimit-Remaining`.
 
 ---
 
@@ -421,6 +483,12 @@ only, because a sunset header is a commitment and none has been made.
 
 `GET /payments/:id` is reachable without a key so a checkout page can poll it directly, but **what it returns depends on who is asking** — an unauthenticated caller gets a minimal projection with no merchant or financial detail. See the endpoint below.
 
+Both schemes are declared in [`openapi.yaml`](openapi.yaml) as `bearerAuth` and
+`adminSecret`, and each operation carries its own `security` requirement, so a
+generated SDK exposes a way to supply credentials and sends them without manual
+modification. `GET /payments/:id` declares `[{}, {bearerAuth: []}]` — the
+OpenAPI spelling of "auth is optional but changes the response".
+
 ### Error Envelope
 
 Every error response uses the same shape:
@@ -434,10 +502,37 @@ Every error response uses the same shape:
 
 The `code` field is stable across releases and is what you should branch on.
 
+**Request bodies are closed.** Every JSON body is validated against exactly the
+fields its endpoint accepts, and anything else is rejected with `400`
+`unknown_field` naming the offending field. A typo is not quietly dropped:
+
+```bash
+curl -X POST http://localhost:3000/v1/payments \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"amount": "100", "assset": "USDC"}'
+```
+
+```json
+{
+  "error": "invalid request body: Failed to deserialize the JSON body into the target type: unknown field `assset`, expected one of `amount`, `asset`, `webhook_url`",
+  "code": "unknown_field"
+}
+```
+
+This matters most where a field has a default. `asset` defaults to `XLM` when
+absent, so before this the request above created a **100 XLM** intent and
+returned `201` describing it — the single transposed character was recoverable
+only by reading the response back carefully. `merchant_id` was the other sharp
+edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
+always taken the merchant from the API key, so a client that sent it believed
+it was choosing the tenant and was not.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
+| `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
@@ -576,6 +671,10 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
+Any other field is rejected with `400` `unknown_field` — see [Error
+Envelope](#error-envelope). In particular there is no `merchant_id` field: the
+merchant comes from the API key and cannot be overridden by the body.
+
 | Header | Required | Description |
 |---|---|---|
 | `Content-Type: application/json` | ✅ | Anything else returns `415` |
@@ -591,6 +690,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "created_at": "2026-04-29T15:00:00Z",
   "expires_at": "2026-04-29T16:00:00Z"
@@ -630,6 +730,7 @@ curl http://localhost:3000/payments/$ID -H "Authorization: Bearer $API_KEY"
   "memo": "A1B2C3D4",
   "amount": "10",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "pending",
   "tx_hash": null,
   "paid_amount": null,
@@ -671,7 +772,8 @@ browser history, so treat anything on that response as effectively public.
 
 ### `GET /payments`
 
-List the authenticated merchant's payments, newest first. Supports **cursor** (recommended) and **offset** (legacy) pagination.
+List the authenticated merchant's payments, newest first. Supports **cursor**
+(recommended) and **offset** (legacy) pagination.
 
 | Param | Description | Default |
 |---|---|---|
@@ -680,7 +782,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor** (r
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`) | `0` |
 
-**`200 OK`** — cursor mode
+**`200 OK`** — cursor mode (no `cursor` parameter on the first request)
 
 ```json
 {
@@ -690,9 +792,32 @@ List the authenticated merchant's payments, newest first. Supports **cursor** (r
 }
 ```
 
-`next_cursor` is `null` on the final page. Offset mode additionally returns `total` and `offset`.
+**`200 OK`** — offset mode (no `cursor` parameter, `offset` set)
 
-> Cursor pagination is keyset-based and stays stable regardless of page depth or concurrent inserts. Offset mode is retained for backward compatibility and can skip or repeat rows if data changes mid-scan.
+```json
+{
+  "payments": [ { "id": "...", "status": "pending" } ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0,
+  "next_cursor": "3230..."
+}
+```
+
+Both modes order rows identically (`created_at DESC`, then `id DESC` to break
+the whole-second `created_at` ties), so a `next_cursor` returned by an offset
+page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
+of either mode. Offset mode additionally returns `total` and `offset`.
+
+> **Migration path.** Switch to cursor pagination by sending `cursor` instead
+> of `offset`. Start with a first request that carries **no** `cursor` and
+> **no** `offset`, then continue with the previous response's `next_cursor` on
+> each subsequent request. The `next_cursor` an offset response returns is a
+> courtesy for this migration — you may use it as the *first* cursor, but once
+> you do you must stay in cursor mode; offset and cursor pagination cannot be
+> mixed within one scan. Offset mode is retained for backward compatibility
+> and is deprecated: like any offset paging, it can skip or repeat rows if
+> data changes mid-scan.
 
 ---
 
@@ -727,19 +852,23 @@ Manually re-send a delivery. The stored payload and event type are replayed verb
 
 ### `GET /health`
 
-Liveness probe. Returns `200 OK` while the process is running.
+Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever. The poller and stream are only "expected" once a gateway wallet is configured; without one they idle by design.
 
 ```json
 { "status": "ok" }
 ```
 
+```json
+{ "status": "unavailable", "reason": "background task(s) not running: poller" }
+```
+
 ### `GET /ready`
 
-Readiness probe. Runs `SELECT 1` against the database.
+Readiness probe. Runs `SELECT 1` against the database, probes Horizon (3 s timeout), and — once a gateway is configured — requires the payment-detection cursor to have advanced recently. The cursor is fresh when a successful poll or stream event landed within `POLL_INTERVAL_SECS × CURSOR_STALENESS_MULTIPLE`; a dead poller with a reachable Horizon is therefore `503`, not green.
 
 ```
 200 OK          — { "status": "ok" }
-503 Unavailable — { "status": "unavailable" }
+503 Unavailable — { "status": "unavailable", "reason": "database unreachable | Horizon unreachable: … | payment detection stalled: …" }
 ```
 
 ### `GET /metrics`
@@ -800,6 +929,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
+  "asset_issuer": null,
   "status": "completed",
   "delta": "2.5"
 }
@@ -900,6 +1030,8 @@ For the full canonical reference, see **[WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE
 
 **Rate limiting.** Every route falls into a per-IP bucket. Write and sensitive routes get the base quota; read-only routes get 5×. The limiter cache is capacity-bounded with idle eviction, so key cardinality cannot exhaust memory.
 
+**Client IP attribution is fail-closed.** `X-Forwarded-For`/`X-Real-IP` are client-supplied, so they are honored only when the socket peer is a configured trusted proxy (`TRUSTED_PROXY_CIDRS`) — an unset allow-list means the headers are always ignored and the peer address is used, so a caller can't rotate a header to evade the limiter or poison the auth logs. When no peer address is available at all, every request shares a single key rather than trusting a header.
+
 **Bounded requests.** Bodies are capped at 256 KiB and every request is subject to `REQUEST_TIMEOUT_SECS`.
 
 **Fail-fast configuration.** Invalid strkeys, unknown listener modes, and short webhook secrets abort startup instead of degrading silently.
@@ -918,6 +1050,12 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_webhook_deliveries_total` | counter | Delivery outcomes |
 | `stellargate_webhook_retries_total` | counter | Retry attempts |
 | `stellargate_webhook_delivery_latency_ms` | histogram | End-to-end delivery latency |
+| `stellargate_tasks_started_total` | counter | Background task starts (including restarts) |
+| `stellargate_tasks_stopped_total` | counter | Clean background task stops |
+| `stellargate_tasks_failed_total` | counter | Background task panics |
+| `stellargate_task_restarts_total` | counter | Supervisor restarts, labelled by `task` |
+| `stellargate_task_running` | gauge | `1` if the named task is running |
+| `stellargate_task_consecutive_failures` | gauge | Consecutive panics since the last stable run |
 
 Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 
@@ -970,7 +1108,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
-- A few one-time data backfills (populating `processed_transactions` from legacy rows, normalising pre-RFC 3339 timestamps) run alongside them.
+- A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 

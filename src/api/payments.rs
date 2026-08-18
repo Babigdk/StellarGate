@@ -80,10 +80,25 @@ where
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
                 match &rejection {
-                    JsonRejection::JsonDataError(_) => Err(AppError::bad_request(
-                        "invalid_request",
-                        format!("invalid request body: {}", rejection.body_text()),
-                    )),
+                    JsonRejection::JsonDataError(_) => {
+                        let detail = rejection.body_text();
+                        /* An unrecognised field is its own failure mode, not a
+                        generic deserialization error: it almost always means a
+                        typo or a client written against an older spec, and the
+                        fix is different from "the value had the wrong type".
+                        Give it a dedicated code so a client can branch on it,
+                        and keep serde's message — it names the offending field
+                        and lists the accepted ones. */
+                        let code = if detail.contains("unknown field") {
+                            "unknown_field"
+                        } else {
+                            "invalid_request"
+                        };
+                        Err(AppError::bad_request(
+                            code,
+                            format!("invalid request body: {detail}"),
+                        ))
+                    }
                     JsonRejection::JsonSyntaxError(_) => Err(AppError::bad_request(
                         "invalid_request",
                         "request body contains malformed JSON",
@@ -104,7 +119,66 @@ where
     }
 }
 
+/// The `POST /payments` body.
+///
+/// `deny_unknown_fields` because silently discarding what serde does not
+/// recognise is the wrong default for a payments API (issue #329). Without it a
+/// client could send `merchant_id` — which older revisions of `openapi.yaml`
+/// still advertised — and get a `201` describing an intent on whichever
+/// merchant owns the API key, believing it had chosen the tenant itself.
+///
+/// The interaction with `asset` is what makes silence expensive rather than
+/// merely untidy: `asset` defaults to `XLM` when absent, so `{"amount":"100",
+/// "assset":"USDC"}` — one transposed character — used to mint a 100 XLM intent
+/// and return `201`. Rejecting the field name is the only point at which that
+/// typo is still cheap to fix.
+///
+/// This matches how the rest of the API already treats input it does not
+/// understand: `status` is checked against an allow-list, an undecodable
+/// `cursor` is `400 invalid_cursor`, an unaccepted asset is `400
+/// unsupported_asset`. Strictness previously stopped at field names.
+/// A JSON body that may be omitted entirely, but must be valid when present.
+///
+/// `Option<JsonBody<T>>` cannot express this. Axum's `Option` extractor maps
+/// *every* rejection to `None`, so a body carrying a mistyped field would be
+/// discarded in exactly the same way as no body at all — reintroducing, on the
+/// one endpoint with an optional body, the silence issue #329 is about.
+///
+/// An absent or empty body is `None`; anything else is deserialized strictly
+/// and its failures surface as the [`JsonBody`] rejection they are.
+pub struct OptionalJsonBody<T>(pub Option<T>);
+
+#[async_trait]
+impl<T, S> FromRequest<S> for OptionalJsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (parts, body) = req.into_parts();
+
+        /* `RequestBodyLimitLayer` already caps the body well below this, and
+        exceeding it fails there rather than here; `usize::MAX` just means "no
+        second, lower limit of our own". */
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.map_err(|_| {
+            AppError::bad_request("invalid_request", "could not read the request body")
+        })?;
+
+        if bytes.is_empty() {
+            return Ok(OptionalJsonBody(None));
+        }
+
+        let req = Request::from_parts(parts, axum::body::Body::from(bytes));
+        JsonBody::<T>::from_request(req, state)
+            .await
+            .map(|JsonBody(value)| OptionalJsonBody(Some(value)))
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreatePaymentRequest {
     pub amount: String,
     #[serde(default = "default_asset")]
@@ -124,17 +198,30 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), AppError> {
     let asset = body.asset.to_uppercase();
     let accepted = &state.config.accepted_assets;
-    if !accepted.iter().any(|a| a.code == asset) {
-        let codes = accepted
-            .iter()
-            .map(|a| a.code.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AppError::bad_request(
-            "unsupported_asset",
-            format!("unsupported asset '{}'; supported: {}", body.asset, codes),
-        ));
-    }
+    let matched: Vec<_> = accepted.iter().filter(|a| a.code == asset).collect();
+    let accepted_asset = match matched.as_slice() {
+        [] => {
+            let codes = accepted
+                .iter()
+                .map(|a| a.code.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::bad_request(
+                "unsupported_asset",
+                format!("unsupported asset '{}'; supported: {}", body.asset, codes),
+            ));
+        }
+        [one] => *one,
+        _ => {
+            return Err(AppError::bad_request(
+                "ambiguous_asset",
+                format!(
+                    "asset '{asset}' maps to more than one issuer; pin ACCEPTED_ASSETS to a single issuer per code"
+                ),
+            ));
+        }
+    };
+    let asset_issuer = accepted_asset.issuer.as_deref();
     if !money::is_valid_amount(&body.amount) {
         return Err(AppError::bad_request(
             "invalid_amount",
@@ -260,6 +347,7 @@ pub async fn create(
             memo: &memo,
             amount: &body.amount,
             asset: &asset,
+            asset_issuer,
             webhook_url: body.webhook_url.as_deref(),
             ttl_secs: state.config.payment_ttl_secs as i64,
         },
@@ -411,8 +499,18 @@ pub async fn list(
         )
         .await?;
 
-        // Provide next_cursor to ease migration to keyset pagination.
-        let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
+        // A migration affordance, not a second pagination model: the caller
+        // may take this cursor as the *first* cursor and then stay in pure
+        // cursor mode from the next request on. `list_payments` orders by
+        // (created_at DESC, id DESC), identical to the keyset query, so the
+        // cursor resumes at the row after this page and never re-reads the
+        // whole-second tie group that ends it. A short page returns null,
+        // mirroring cursor mode.
+        let next_cursor = if payments.len() == limit as usize {
+            payments.last().map(|p| encode_cursor(&p.created_at, &p.id))
+        } else {
+            None
+        };
 
         Ok(Json(json!({
             "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
@@ -492,6 +590,7 @@ fn to_json(p: &db::Payment) -> Value {
         "memo": p.memo,
         "amount": canonical_amount,
         "asset": p.asset,
+        "asset_issuer": p.asset_issuer,
         "status": p.status,
         "tx_hash": p.tx_hash,
         "paid_amount": canonical_paid_amount,

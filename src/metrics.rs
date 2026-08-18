@@ -209,9 +209,9 @@ impl Default for AuthMetrics {
 
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery and auth outcome metrics as a Prometheus-compatible
-/// plain-text snapshot. Called by `GET /metrics`.
-pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics) -> String {
+/// Render webhook delivery, auth outcome, and background-task metrics as a
+/// Prometheus-compatible plain-text snapshot. Called by `GET /metrics`.
+pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, tasks: &crate::TaskHealth) -> String {
     let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
@@ -280,6 +280,61 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics) -> String {
         "stellargate_auth_attempts_total{{outcome=\"failure\",reason=\"internal_error\"}} {}\n",
         auth.failure_internal_error()
     ));
+
+    // Background task counters (issue #316): a crash-looping worker must be
+    // visible on the scrape, not only as a log line at shutdown.
+    out.push_str(
+        "# HELP stellargate_tasks_started_total Total background task starts (including restarts).\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_started_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_started_total {}\n",
+        tasks.started()
+    ));
+    out.push_str("# HELP stellargate_tasks_stopped_total Total background task clean stops.\n");
+    out.push_str("# TYPE stellargate_tasks_stopped_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_stopped_total {}\n",
+        tasks.stopped()
+    ));
+    out.push_str("# HELP stellargate_tasks_failed_total Total background task panics.\n");
+    out.push_str("# TYPE stellargate_tasks_failed_total counter\n");
+    out.push_str(&format!(
+        "stellargate_tasks_failed_total {}\n",
+        tasks.failed()
+    ));
+    out.push_str(
+        "# HELP stellargate_task_restarts_total Supervisor restarts of a background task after panic or unexpected return.\n",
+    );
+    out.push_str("# TYPE stellargate_task_restarts_total counter\n");
+    let snaps = tasks.snapshot();
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_restarts_total{{task=\"{}\"}} {}\n",
+            snap.name, snap.restarts
+        ));
+    }
+    out.push_str(
+        "# HELP stellargate_task_running Whether the named background task is currently running (1) or not (0).\n",
+    );
+    out.push_str("# TYPE stellargate_task_running gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_running{{task=\"{}\"}} {}\n",
+            snap.name,
+            if snap.running { 1 } else { 0 }
+        ));
+    }
+    out.push_str(
+        "# HELP stellargate_task_consecutive_failures Consecutive panics of a background task since it last ran stably.\n",
+    );
+    out.push_str("# TYPE stellargate_task_consecutive_failures gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_consecutive_failures{{task=\"{}\"}} {}\n",
+            snap.name, snap.consecutive_failures
+        ));
+    }
 
     out
 }
