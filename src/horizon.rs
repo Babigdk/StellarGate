@@ -41,6 +41,7 @@
 //! The matching logic in [`verify`] is pure and unit-tested; the networked
 //! functions wrap it with I/O.
 
+use crate::supervise::TaskExit;
 use crate::{db, money, webhook, AppState};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -611,13 +612,14 @@ async fn settle(
 
 /// Background loop that polls Horizon on the configured interval until the
 /// process shuts down. Idles (without polling) while no gateway is configured.
-pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     if !state.config.gateway_configured() {
-        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon poller disabled");
-        // Stay alive until shutdown so the supervisor does not treat a
-        // deliberate idle as an unexpected return and restart us.
-        let _ = shutdown.changed().await;
-        return;
+        /* Previously this parked on the shutdown signal purely so the
+        supervisor would not read a deliberate idle as an unexpected return.
+        Saying so explicitly is both clearer and cheaper: the supervisor now
+        knows this is terminal-by-design, reports it once, and does not hold a
+        task open for the life of the process to convey it (issue #317). */
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
@@ -632,7 +634,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("Horizon poller shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         match poll_once(&state).await {
@@ -682,11 +684,12 @@ fn parse_sse_block(block: &str) -> SseEvent {
 /// automatically with exponential backoff, resuming from the last seen cursor
 /// so no payments are missed across a dropped connection. Idles (without
 /// connecting) while no gateway is configured.
-pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_stream_listener(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     if !state.config.gateway_configured() {
-        warn!("STELLAR_GATEWAY_PUBLIC is unconfigured; Horizon stream listener disabled");
-        let _ = shutdown.changed().await;
-        return;
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
     }
 
     info!(account = %state.config.gateway_public, "Horizon payment stream listener started");
@@ -700,8 +703,12 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
     {
         Ok(c) => c,
         Err(e) => {
-            warn!(error = %e, "failed to build stream HTTP client; stream listener disabled");
-            return;
+            /* The case issue #317 calls out by name: this was a `warn!`
+            followed by a permanent exit, recorded as an ordinary stop. Payment
+            detection over the stream was simply gone, and nothing said so.
+            It is a fault, not a configuration choice, so it is reported as one
+            and the supervisor retries it. */
+            return TaskExit::Fatal(format!("failed to build stream HTTP client: {e}"));
         }
     };
 
@@ -722,7 +729,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             }
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -734,7 +741,7 @@ pub async fn run_stream_listener(state: Arc<AppState>, mut shutdown: watch::Rece
             _ = tokio::time::sleep(backoff) => {}
             _ = shutdown.changed() => {
                 info!("Horizon stream listener shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         backoff = (backoff * 2).min(max_backoff);

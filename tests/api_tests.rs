@@ -24,6 +24,7 @@ fn make_config() -> Config {
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         /* Both schemes are allowed here so the scheme allow-list isn't what
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
@@ -35,6 +36,7 @@ fn make_config() -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
+        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
@@ -169,6 +171,98 @@ async fn test_health_ok_when_required_task_running() {
     let res = server.get("/health").await;
     res.assert_status_ok();
     assert_eq!(res.json::<Value>()["status"], "ok");
+}
+
+// ── Expected-versus-live worker counts (issue #317) ──────────────────────────
+
+/// After boot there was no way to answer "how many workers should be running,
+/// and how many are?" — the information existed but `stopped` was overloaded
+/// across clean shutdown, config-disabled exit and fault, so the arithmetic
+/// would have been wrong even once exposed.
+#[tokio::test]
+async fn test_health_reports_expected_and_live_task_counts() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("sweeper");
+    health.task_started("poller");
+    health.task_started("sweeper");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let tasks = &res.json::<Value>()["tasks"];
+    assert_eq!(tasks["expected"], 2);
+    assert_eq!(tasks["live"], 2);
+    assert_eq!(tasks["disabled"].as_array().unwrap().len(), 0);
+}
+
+/// A worker switched off by configuration is neither dead nor expected. A
+/// poll-only deployment, or one with retention disabled, must not read as
+/// permanently degraded.
+#[tokio::test]
+async fn test_health_excludes_config_disabled_tasks_from_expected() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("retention");
+    health.task_started("poller");
+    health.task_disabled("retention", "both retention windows are 0");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let body = res.json::<Value>();
+    assert_eq!(body["status"], "ok", "a disabled worker is not a failure");
+    assert_eq!(body["tasks"]["expected"], 1);
+    assert_eq!(body["tasks"]["live"], 1);
+
+    let disabled = body["tasks"]["disabled"].as_array().unwrap();
+    assert_eq!(disabled.len(), 1);
+    assert_eq!(disabled[0]["task"], "retention");
+    assert_eq!(disabled[0]["reason"], "both retention windows are 0");
+}
+
+/// A genuine death shows up as a shortfall, not just a boolean.
+#[tokio::test]
+async fn test_health_shows_a_shortfall_when_a_task_dies() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("sweeper");
+    health.task_started("poller");
+    health.task_started("sweeper");
+    health.task_stopped("sweeper");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let res = server.get("/health").await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    let tasks = &res.json::<Value>()["tasks"];
+    assert_eq!(tasks["expected"], 2);
+    assert_eq!(tasks["live"], 1);
+}
+
+#[tokio::test]
+async fn test_metrics_expose_expected_and_live_task_counts() {
+    let health = stellargate::TaskHealth::new();
+    health.require("poller");
+    health.require("retention");
+    health.task_started("poller");
+    health.task_disabled("retention", "both retention windows are 0");
+    let (server, _pool) = server_with_config_and_health(make_config(), health).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_tasks_expected 1"),
+        "expected count must exclude the disabled worker:\n{body}"
+    );
+    assert!(body.contains("stellargate_tasks_live 1"), "{body}");
+    assert!(
+        body.contains("stellargate_task_disabled{task=\"retention\"} 1"),
+        "a disabled worker must be distinguishable from one that is merely \
+         not running:\n{body}"
+    );
+    assert!(
+        body.contains("stellargate_task_disabled{task=\"poller\"} 0"),
+        "{body}"
+    );
 }
 
 /// A required background task that stopped (a poller that died at startup)
@@ -1368,6 +1462,316 @@ async fn test_list_webhooks_empty() {
     assert_eq!(body["deliveries"].as_array().unwrap().len(), 0);
 }
 
+// ── Dead-letter view: GET /payments/webhooks (issue #319) ────────────────────
+
+/// Create a payment and seed `n` deliveries against it with a given status.
+async fn seed_deliveries(
+    server: &TestServer,
+    pool: &db::Db,
+    auth: &str,
+    status: &str,
+    n: usize,
+    prefix: &str,
+) -> String {
+    let payment_id = server
+        .post("/payments")
+        .add_header("Authorization", auth.to_string())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for i in 0..n {
+        let delivery_id = format!("{prefix}-{i}");
+        db::save_webhook_delivery(
+            pool,
+            &delivery_id,
+            &payment_id,
+            "https://receiver.example/hook",
+            r#"{"event":"payment.completed"}"#,
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        db::update_webhook_delivery(pool, &delivery_id, status, 8)
+            .await
+            .unwrap();
+    }
+    payment_id
+}
+
+/// The whole point of the endpoint: find failures **without** already knowing
+/// which payment they belong to. The reason to go looking is "a merchant says
+/// they are missing events", and a payment id is exactly what the person asking
+/// does not have.
+#[tokio::test]
+async fn test_dead_letter_lists_failures_across_payments() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    seed_deliveries(&server, &pool, &auth, "failed", 2, "a").await;
+    seed_deliveries(&server, &pool, &auth, "failed", 3, "b").await;
+    // Noise that must not appear under the default `failed` filter.
+    seed_deliveries(&server, &pool, &auth, "delivered", 4, "c").await;
+
+    let res = server
+        .get("/payments/webhooks")
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+
+    assert_eq!(body["status"], "failed", "defaults to the dead-letter case");
+    let deliveries = body["deliveries"].as_array().unwrap();
+    assert_eq!(
+        deliveries.len(),
+        5,
+        "failures from both payments, and only those"
+    );
+    assert!(
+        deliveries.iter().all(|d| d["status"] == "failed"),
+        "delivered rows must not leak into the failed filter"
+    );
+    // Spanning more than one payment is the property that matters.
+    let payments: std::collections::HashSet<_> = deliveries
+        .iter()
+        .map(|d| d["payment_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(payments.len(), 2);
+}
+
+/// Scoping is a join to `payments`, not a caller-supplied filter, so one
+/// merchant's dead-letter view can never contain another's deliveries.
+#[tokio::test]
+async fn test_dead_letter_is_merchant_scoped() {
+    let (server, pool) = test_server_with_pool().await;
+    let key_a = provision_merchant(&server).await;
+    let key_b = provision_merchant(&server).await;
+
+    seed_deliveries(&server, &pool, &format!("Bearer {key_a}"), "failed", 3, "a").await;
+    seed_deliveries(&server, &pool, &format!("Bearer {key_b}"), "failed", 1, "b").await;
+
+    let res = server
+        .get("/payments/webhooks")
+        .add_header("Authorization", format!("Bearer {key_b}"))
+        .await;
+    res.assert_status_ok();
+    let deliveries = res.json::<Value>()["deliveries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(
+        deliveries.len(),
+        1,
+        "merchant B sees only their own failure"
+    );
+    assert!(deliveries[0]["id"].as_str().unwrap().starts_with('b'));
+}
+
+#[tokio::test]
+async fn test_dead_letter_requires_authentication() {
+    let server = test_server().await;
+    server
+        .get("/payments/webhooks")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// The static `/payments/webhooks` segment must win over `/payments/:id`, or
+/// the dead-letter view would be shadowed by the per-payment lookup.
+#[tokio::test]
+async fn test_dead_letter_route_is_not_shadowed_by_payment_id() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .get("/payments/webhooks")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert!(
+        body.get("deliveries").is_some(),
+        "should reach the dead-letter handler, not get_by_id; got {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_dead_letter_paginates_with_a_cursor() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    seed_deliveries(&server, &pool, &auth, "failed", 5, "d").await;
+
+    let first = server
+        .get("/payments/webhooks?limit=2")
+        .add_header("Authorization", auth.clone())
+        .await;
+    first.assert_status_ok();
+    let first: Value = first.json();
+    assert_eq!(first["deliveries"].as_array().unwrap().len(), 2);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+    let second = server
+        .get(&format!("/payments/webhooks?limit=2&cursor={cursor}"))
+        .add_header("Authorization", auth)
+        .await;
+    second.assert_status_ok();
+    let second: Value = second.json();
+
+    let page1: Vec<_> = first["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    let page2: Vec<_> = second["deliveries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        page1.iter().all(|id| !page2.contains(id)),
+        "pages must not repeat rows: {page1:?} vs {page2:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_dead_letter_rejects_an_unknown_status() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments/webhooks?status=exploded")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_status");
+}
+
+#[tokio::test]
+async fn test_dead_letter_rejects_a_malformed_cursor() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments/webhooks?cursor=zzzz")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
+}
+
+// ── Bulk recovery: POST /payments/webhooks/redeliver (issue #319) ────────────
+
+/// A merchant who has fixed their endpoint can recover everything they missed
+/// in one call, without knowing any payment ids.
+#[tokio::test]
+async fn test_bulk_redeliver_requeues_every_failure() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    seed_deliveries(&server, &pool, &auth, "failed", 3, "e").await;
+
+    let res = server
+        .post("/payments/webhooks/redeliver")
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["requeued"], 3);
+
+    // Requeued rows go back to the redrive worker with a clean attempt count,
+    // rather than being sent inline — the worker's concurrency limit and
+    // backoff are what keep a recovering receiver from being stampeded.
+    let res = server
+        .get("/payments/webhooks?status=pending")
+        .add_header("Authorization", auth)
+        .await;
+    let deliveries = res.json::<Value>()["deliveries"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(deliveries.len(), 3);
+    assert!(deliveries.iter().all(|d| d["attempts"] == 0));
+    assert!(
+        deliveries.iter().all(|d| !d["acknowledged_at"].is_null()),
+        "requeueing counts as acting on the failure, so retention may reclaim it"
+    );
+}
+
+#[tokio::test]
+async fn test_bulk_redeliver_accepts_specific_ids() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    seed_deliveries(&server, &pool, &auth, "failed", 3, "f").await;
+
+    let res = server
+        .post("/payments/webhooks/redeliver")
+        .add_header("Authorization", auth)
+        .json(&json!({ "delivery_ids": ["f-0", "f-2"] }))
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["requeued"], 2);
+
+    let still_failed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_failed, 1, "only the named deliveries move");
+}
+
+/// Bulk requeue must not become a cross-tenant write.
+#[tokio::test]
+async fn test_bulk_redeliver_cannot_touch_another_merchants_deliveries() {
+    let (server, pool) = test_server_with_pool().await;
+    let key_a = provision_merchant(&server).await;
+    let key_b = provision_merchant(&server).await;
+    seed_deliveries(&server, &pool, &format!("Bearer {key_a}"), "failed", 2, "a").await;
+
+    // B names A's delivery ids explicitly.
+    let res = server
+        .post("/payments/webhooks/redeliver")
+        .add_header("Authorization", format!("Bearer {key_b}"))
+        .json(&json!({ "delivery_ids": ["a-0", "a-1"] }))
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["requeued"], 0);
+
+    let still_failed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE status = 'failed'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_failed, 2, "A's deliveries are untouched");
+}
+
+#[tokio::test]
+async fn test_bulk_redeliver_caps_the_id_list() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let ids: Vec<String> = (0..101).map(|i| format!("d-{i}")).collect();
+    let res = server
+        .post("/payments/webhooks/redeliver")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "delivery_ids": ids }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "too_many_delivery_ids");
+}
+
+#[tokio::test]
+async fn test_bulk_redeliver_requires_authentication() {
+    let server = test_server().await;
+    server
+        .post("/payments/webhooks/redeliver")
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
 /// A merchant cannot read another merchant's webhook deliveries — the payment
 /// id alone must not be enough, and the response must not distinguish "not
 /// yours" from "doesn't exist".
@@ -1404,6 +1808,175 @@ async fn test_list_webhooks_rejects_other_merchants_payment() {
         .await;
     res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(res.json::<Value>()["code"], "payment_not_found");
+}
+
+/// Regression for #326: the webhook-delivery listing must be paginated like
+/// `GET /payments`. Create more deliveries than one page holds, then walk the
+/// keyset cursor until it runs dry, asserting every delivery is seen exactly
+/// once and the final page reports a null `next_cursor`.
+#[tokio::test]
+async fn test_list_webhooks_walks_cursor_across_pages() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for i in 1..=5 {
+        stellargate::db::save_webhook_delivery(
+            &pool,
+            &format!("delivery-{i}"),
+            &id,
+            "https://example.com/webhook",
+            r#"{"event":"payment.completed"}"#,
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+    }
+
+    // Page 1 — a full page of 2 must mint a cursor.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["deliveries"].as_array().unwrap().len(), 2);
+    assert_eq!(body["limit"], 2);
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("a full page must mint next_cursor");
+
+    // Pages 2 and 3 walk the cursor; only the last (short) page is null.
+    let res2 = server
+        .get(&format!("/payments/{id}/webhooks?cursor={cursor}&limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    assert_eq!(body2["deliveries"].as_array().unwrap().len(), 2);
+    let cursor2 = body2["next_cursor"]
+        .as_str()
+        .expect("second full page must mint next_cursor");
+
+    let res3 = server
+        .get(&format!("/payments/{id}/webhooks?cursor={cursor2}&limit=2"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    assert_eq!(body3["deliveries"].as_array().unwrap().len(), 1);
+    assert!(
+        body3["next_cursor"].is_null(),
+        "last page must have null next_cursor"
+    );
+
+    // All five deliveries walked exactly once.
+    let ids: Vec<String> = [&body, &body2, &body3]
+        .iter()
+        .flat_map(|b| b["deliveries"].as_array().unwrap().iter())
+        .map(|d| d["id"].as_str().unwrap().to_string())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 5, "pages must never repeat a delivery");
+}
+
+/// Regression for #326: the webhook-delivery listing accepts a `status`
+/// filter and rejects anything that isn't a real delivery status.
+#[tokio::test]
+async fn test_list_webhooks_status_filter() {
+    let (server, pool) = test_server_with_pool().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for i in 1..=4 {
+        stellargate::db::save_webhook_delivery(
+            &pool,
+            &format!("delivery-{i}"),
+            &id,
+            "https://example.com/webhook",
+            r#"{"event":"payment.completed"}"#,
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+    }
+    // Mark delivery-1 failed and delivery-2 pending; the rest stay delivered.
+    stellargate::db::update_webhook_delivery(&pool, "delivery-1", "failed", 8)
+        .await
+        .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-3", "delivered", 1)
+        .await
+        .unwrap();
+
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?status=failed&limit=5"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    let deliveries = body["deliveries"].as_array().unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0]["id"], "delivery-1");
+    assert_eq!(deliveries[0]["status"], "failed");
+
+    // An invalid status is a 400, matching the payments listing.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?status=nonsense"))
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_status");
+}
+
+/// Regression for #326: an undecodable `cursor` is rejected with a 400, and
+/// `limit` is clamped into the acknowledged range.
+#[tokio::test]
+async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?cursor=not-a-cursor"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
+
+    // Above MAX_LIMIT is clamped down to 100, not an error.
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?limit=5000"))
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    assert_eq!(res.json::<Value>()["limit"], 100);
 }
 
 #[tokio::test]

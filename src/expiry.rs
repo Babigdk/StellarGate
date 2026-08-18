@@ -9,6 +9,7 @@
 //! Expiry is purely time- and database-driven, so the sweeper runs even when no
 //! Stellar gateway is configured (unlike the Horizon poller).
 
+use crate::supervise::TaskExit;
 use crate::{db, webhook, AppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 
 /// Background loop that sweeps expired intents on the configured poll interval
 /// until the process shuts down.
-pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) -> TaskExit {
     let interval = Duration::from_secs(state.config.poll_interval_secs.max(1));
     info!(
         ttl_secs = state.config.payment_ttl_secs,
@@ -46,7 +47,7 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("expiry sweeper shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
         match sweep_once(&state).await {
@@ -77,6 +78,7 @@ mod tests {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -85,6 +87,7 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
+            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,

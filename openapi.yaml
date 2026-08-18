@@ -218,14 +218,120 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
-  /v1/payments/{id}/webhooks:
+  /payments/webhooks:
+    get:
+      operationId: listMerchantWebhookDeliveries
+      summary: List webhook deliveries across all of a merchant's payments
+      description: >-
+        The dead-letter view. Defaults to status=failed. Unlike
+        /payments/{id}/webhooks this does not require knowing which payment a
+        failure belongs to, which is the situation an operator is actually in
+        when a merchant reports missing events. Scoped to the authenticated
+        merchant by a join, not by a caller-supplied filter.
+      parameters:
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/WebhookDeliveryStatus"
+          description: Filter by delivery status. Defaults to `failed`.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
+      responses:
+        "200":
+          description: Paginated deliveries for this merchant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListMerchantWebhookDeliveriesResponse"
+        "400":
+          description: Invalid `status` or `cursor`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /payments/webhooks/redeliver:
+    post:
+      operationId: redeliverWebhooksBulk
+      summary: Requeue failed webhook deliveries in bulk
+      description: >-
+        Bulk recovery after a merchant has fixed their receiver. This endpoint
+        sends nothing itself: it resets matching failed deliveries to `pending`
+        with `attempts = 0` and hands them to the background redrive worker,
+        whose concurrency limit and exponential backoff bound the outbound
+        rate. Requeueing also sets `acknowledged_at`, returning the rows to
+        ordinary retention.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RedeliverBulkRequest"
+      responses:
+        "200":
+          description: Deliveries requeued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RedeliverBulkResponse"
+        "400":
+          description: More than 100 delivery_ids supplied
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                too_many_delivery_ids:
+                  summary: Too many ids
+                  value:
+                    error: >-
+                      at most 100 delivery_ids per request; omit the field to
+                      requeue every failed delivery
+                    code: too_many_delivery_ids
+
+  /payments/{id}/webhooks:
     get:
       operationId: listWebhookDeliveries
       summary: List webhook deliveries for a payment
       security:
         - bearerAuth: []
       parameters:
-        - $ref: "#/components/parameters/PaymentId"
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+          description: Filter deliveries by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
       responses:
         "200":
           description: Webhook delivery history
@@ -236,6 +342,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListWebhookDeliveriesResponse"
+"400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -788,6 +900,75 @@ components:
           type: [string, "null"]
           description: Pass as cursor on the next request to get the following page
 
+    WebhookDeliveryStatus:
+      type: string
+      enum: [failed, pending, delivered]
+
+    RedeliverBulkRequest:
+      type: object
+      properties:
+        delivery_ids:
+          type: array
+          maxItems: 100
+          items:
+            type: string
+            format: uuid
+          description: >-
+            Specific deliveries to requeue. Omit, or send an empty list, to
+            requeue every failed delivery this merchant has — that form has no
+            id limit, since it needs no list.
+
+    RedeliverBulkResponse:
+      type: object
+      required: [requeued]
+      properties:
+        requeued:
+          type: integer
+          description: How many deliveries were moved back to `pending`.
+          example: 42
+        detail:
+          type: string
+
+    ListMerchantWebhookDeliveriesResponse:
+      type: object
+      required: [deliveries, status, limit]
+      properties:
+        deliveries:
+          type: array
+          items:
+            $ref: "#/components/schemas/MerchantWebhookDelivery"
+        status:
+          $ref: "#/components/schemas/WebhookDeliveryStatus"
+        limit:
+          type: integer
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
+
+    MerchantWebhookDelivery:
+      allOf:
+        - $ref: "#/components/schemas/WebhookDelivery"
+        - type: object
+          required: [payment_id]
+          properties:
+            payment_id:
+              type: string
+              format: uuid
+              description: >-
+                Which payment this delivery belongs to. Present here because
+                the listing spans every payment the merchant owns.
+            acknowledged_at:
+              type: string
+              format: date-time
+              nullable: true
+              description: >-
+                When this delivery was requeued or otherwise acted on. While
+                null, a `failed` delivery is exempt from
+                WEBHOOK_DELIVERY_RETENTION_DAYS and is not deleted — it is
+                compacted to a payload-less tombstone instead, so the record
+                that an event was permanently lost outlives the window.
+
     WebhookDelivery:
       type: object
       required: [id, url, event, status, attempts, created_at]
@@ -818,7 +999,7 @@ components:
 
     ListWebhookDeliveriesResponse:
       type: object
-      required: [payment_id, deliveries]
+      required: [payment_id, deliveries, limit]
       properties:
         payment_id:
           type: string
@@ -827,6 +1008,13 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/WebhookDelivery"
+        limit:
+          type: integer
+          description: Page size applied to this response
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
 
     ErrorResponse:
       type: object

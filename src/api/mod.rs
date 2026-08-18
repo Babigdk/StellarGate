@@ -162,6 +162,16 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
     both authenticated and anonymous callers — see `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
+        /* The dead-letter view: a merchant's deliveries across *all* their
+        payments (issue #319). Declared before `/:id` and matched ahead of it —
+        `webhooks` is a static segment, and matchit gives static segments
+        priority over parameters, so this can never be shadowed by a payment
+        whose id happens to be the literal string "webhooks". */
+        .route("/webhooks", get(payments::list_merchant_webhooks))
+        .route(
+            "/webhooks/redeliver",
+            post(payments::redeliver_webhooks_bulk),
+        )
         .route("/:id/webhooks", get(payments::list_webhooks))
         .route(
             "/:id/webhooks/:delivery_id/redeliver",
@@ -803,8 +813,30 @@ async fn root(headers: axum::http::HeaderMap) -> impl IntoResponse {
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let dead = state.task_health.dead_required_tasks();
     let looping = state.task_health.crash_looping_required_tasks();
+
+    /* Expected-versus-live, so the probe answers "how many workers should be
+    running, and how many are?" rather than only "is anything wrong?"
+    (issue #317). `expected` already excludes workers configuration has
+    deliberately switched off, so a poll-only deployment does not read as
+    permanently degraded. */
+    let expected = state.task_health.expected_tasks();
+    let live = state.task_health.live_tasks();
+    let disabled: Vec<_> = state
+        .task_health
+        .snapshot()
+        .into_iter()
+        .filter_map(|s| {
+            s.disabled_reason
+                .map(|r| json!({ "task": s.name, "reason": r }))
+        })
+        .collect();
+
     if dead.is_empty() && looping.is_empty() {
-        return Json(json!({ "status": "ok" })).into_response();
+        return Json(json!({
+            "status": "ok",
+            "tasks": { "expected": expected, "live": live, "disabled": disabled },
+        }))
+        .into_response();
     }
 
     let mut reasons = Vec::new();
@@ -826,6 +858,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         Json(json!({
             "status": "unavailable",
             "reason": reasons.join("; "),
+            "tasks": { "expected": expected, "live": live, "disabled": disabled },
         })),
     )
         .into_response()

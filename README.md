@@ -321,9 +321,39 @@ a single writer.
 | `WEBHOOK_SECRET` | HMAC-SHA256 signing secret. Must be **≥ 32 characters**; known placeholder values are rejected at boot. | — |
 | `ALLOWED_WEBHOOK_SCHEMES` | Comma-separated URL schemes accepted for `webhook_url`. HTTPS is enforced on `public` regardless of this value. | `https` |
 | `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery attempts | `3` |
-| `WEBHOOK_RETRY_DELAY_MS` | Delay between inline retries | `5000` |
+| `WEBHOOK_RETRY_DELAY_MS` | **Base** delay between inline retries — the first step of an exponential, jittered schedule, not a fixed interval | `5000` |
+| `WEBHOOK_RETRY_MAX_DELAY_MS` | Ceiling on one inline retry delay. Must be `≥` `WEBHOOK_RETRY_DELAY_MS`. | `60000` |
 | `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout; each retry is bounded independently | `10` |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypasses the SSRF private-range check. **Development and tests only.** | `false` |
+
+#### Retry schedule
+
+Inline retries back off exponentially and are jittered. Both halves matter, and
+for different reasons.
+
+**Backoff**, because a constant delay meant a receiver returning `503` for two
+minutes produced — per delivery — three attempts at `t`, `t+5s`, `t+10s`. Across
+a settlement burst of N payments that is `3N` requests arriving in three tight
+clusters, precisely when the receiver is least able to absorb them.
+
+**Jitter**, because backoff alone desynchronises nothing. Deliveries that failed
+together share an attempt number, so a purely exponential schedule puts their
+next attempts at the same instant — the same lockstep, just spaced further
+apart.
+
+The delay before retry *n* is drawn uniformly from
+`[ceiling/2, ceiling]` where `ceiling = min(WEBHOOK_RETRY_DELAY_MS × 2^(n−1),
+WEBHOOK_RETRY_MAX_DELAY_MS)`. That is **equal** jitter rather than the more
+common full jitter over `[0, ceiling]`: full jitter can return a near-zero
+delay, and this service already rejects `WEBHOOK_RETRY_DELAY_MS=0` at boot
+because a zero delay causes exactly the retry bursts being avoided here. Equal
+jitter keeps a guaranteed floor under every retry while still spreading a
+co-failing batch across half the window.
+
+`WEBHOOK_REDRIVE_GRACE_SECS` is validated at boot against this schedule, so a
+grace window too short to clear the worst-case inline delivery — which would let
+the redrive worker send a delivery whose inline dispatch is still running — is
+rejected rather than discovered in production.
 
 ### Webhook Redrive Worker
 
@@ -337,6 +367,15 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 | `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. | `60` |
 | `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. `0` disables growth. | `30` |
 | `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `≥` the initial value. | `900` |
+| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. `0` disables. | `30` |
+
+The jitter is what actually decorrelates a batch. Rows that failed together
+share an `attempts` value and a near-identical `last_attempt`, so
+`initial × 2^(attempts−1)` resolves to the same instant for all of them and the
+worker — which computes eligibility in SQL — would hand itself the whole cluster
+on every pass. The offset is drawn per row per statement, so each pass admits a
+different random subset and the batch spreads over several intervals. It only
+ever delays a row, never pulls one forward past the grace window.
 
 ### Retention
 
@@ -829,7 +868,17 @@ of either mode. Offset mode additionally returns `total` and `offset`.
 
 ### `GET /payments/:id/webhooks`
 
-List every delivery attempt for a payment. Requires the owning merchant's API key.
+List delivery attempts for a payment, newest first. Requires the owning merchant's API key.
+
+| Query param | Description | Default |
+|---|---|---|
+| `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
+| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `cursor` | Keyset cursor from a previous `next_cursor` | — |
+
+`next_cursor` is `null` on the final page. To page through the history, start with a
+request that carries **no** `cursor`, then pass the previous response's `next_cursor`
+on each subsequent request.
 
 **`200 OK`**
 
@@ -846,7 +895,9 @@ List every delivery attempt for a payment. Requires the owning merchant's API ke
       "last_attempt": "2026-04-29T15:04:00Z",
       "created_at": "2026-04-29T15:03:59Z"
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": "3230..."
 }
 ```
 
@@ -856,17 +907,161 @@ Manually re-send a delivery. The stored payload and event type are replayed verb
 
 ---
 
+### `GET /payments/webhooks`
+
+The **dead-letter view**: every delivery for the authenticated merchant, across
+all of their payments. Defaults to `status=failed`.
+
+This is the endpoint to reach for when a merchant says they are missing events,
+because that question arrives *without* a payment id —
+`GET /payments/:id/webhooks` can only answer it if you already know where to
+look.
+
+| Query | Default | Notes |
+|---|---|---|
+| `status` | `failed` | One of `failed`, `pending`, `delivered` |
+| `limit` | `20` | 1–100 |
+| `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+```bash
+curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+**`200 OK`**
+
+```json
+{
+  "deliveries": [
+    {
+      "id": "d1e2f3...",
+      "payment_id": "a1b2c3d4-...",
+      "url": "https://yourapp.com/webhooks/stellar",
+      "event": "payment.completed",
+      "status": "failed",
+      "attempts": 8,
+      "last_attempt": "2026-04-29T15:04:00Z",
+      "acknowledged_at": null,
+      "created_at": "2026-04-29T15:03:59Z"
+    }
+  ],
+  "status": "failed",
+  "limit": 50,
+  "next_cursor": "3230..."
+}
+```
+
+Scoping is a join to `payments`, not a filter you supply, so this can never
+return another merchant's deliveries. The signed `payload` is omitted — a
+listing is for triage, not replay.
+
+---
+
+### `POST /payments/webhooks/redeliver`
+
+Bulk recovery after you have fixed your receiver. Requeues failed deliveries so
+the background redrive worker retries them.
+
+```bash
+# Everything that failed
+curl -X POST http://localhost:3000/v1/payments/webhooks/redeliver \
+  -H "Authorization: Bearer $API_KEY"
+
+# Or just specific ones (max 100 per request)
+curl -X POST http://localhost:3000/v1/payments/webhooks/redeliver \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"delivery_ids": ["d1e2f3...", "d4e5f6..."]}'
+```
+
+**`200 OK`** — `{ "requeued": 42, "detail": "..." }`
+
+> This endpoint **sends nothing itself**. It resets matching rows to `pending`
+> with `attempts = 0` and hands them to the redrive worker, whose
+> `WEBHOOK_REDRIVE_CONCURRENCY` and exponential backoff already bound the
+> outbound rate. Requeueing ten thousand deliveries therefore costs one `UPDATE`
+> and cannot stampede a receiver that has only just come back up.
+
+Requeueing also **acknowledges** the delivery — see below.
+
+### Retention of failed deliveries
+
+A terminal failure is the evidence for "we never received your webhook", and
+that question usually arrives long after the fact. So a `failed` delivery that
+nobody has acknowledged is **exempt from
+`WEBHOOK_DELIVERY_RETENTION_DAYS`** and is not deleted on a timer.
+
+To keep that from trading one unbounded table for another, a retained failure is
+**compacted** once it ages past the window: the row survives, its stored
+`payload` is cleared. The payload's only consumer is redelivery, which is not
+something anyone does to a months-old failure, and it is by far the largest
+column — so the record of what was lost stays queryable indefinitely at a few
+hundred bytes.
+
+Requeueing via the endpoint above sets `acknowledged_at`, which returns the row
+to ordinary retention.
+
+Terminal failures are also counted in
+`stellargate_webhook_deliveries_total{outcome="failed"}` — **including** the
+SSRF-blocked path, which previously incremented nothing, leaving a whole class
+of permanent failure invisible to alerts.
+
+---
+
 ### `GET /health`
 
-Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever. The poller and stream are only "expected" once a gateway wallet is configured; without one they idle by design.
+Liveness probe — cheap, and fails only on conditions a restart would fix. Returns `200 OK` while the process is running **and** every expected background task (poller, stream, sweeper, retention, redrive) is running. A task that died — a panic, or a poller that exited at startup — returns `503` naming the dead task, so a process whose payment detection is gone never looks healthy forever.
 
 ```json
-{ "status": "ok" }
+{
+  "status": "ok",
+  "tasks": { "expected": 5, "live": 5, "disabled": [] }
+}
 ```
 
 ```json
-{ "status": "unavailable", "reason": "background task(s) not running: poller" }
+{
+  "status": "unavailable",
+  "reason": "background task(s) not running: poller",
+  "tasks": { "expected": 5, "live": 4, "disabled": [] }
+}
 ```
+
+`tasks` answers "how many workers should be running, and how many are?" — a
+question the process could not previously answer at all. **`expected` already
+excludes workers that configuration has deliberately switched off**, so a
+poll-only deployment (no stream listener) or one with both retention windows set
+to `0` does not read as permanently degraded:
+
+```json
+{
+  "status": "ok",
+  "tasks": {
+    "expected": 4,
+    "live": 4,
+    "disabled": [
+      { "task": "retention", "reason": "both WEBHOOK_DELIVERY_RETENTION_DAYS and IDEMPOTENCY_RETENTION_DAYS are 0" }
+    ]
+  }
+}
+```
+
+#### Why a worker stopped
+
+Each worker returns an explicit reason rather than leaving the supervisor to
+infer one, and the three are handled differently:
+
+| Exit | Restarted? | Logged at | `/health` |
+|---|---|---|---|
+| Shutdown requested | no | `info` | n/a — the process is going away |
+| Disabled by configuration | **no** — terminal, reported once at boot | `info` | listed under `disabled`; **not** a failure |
+| Fatal error | **yes**, with bounded backoff | **`error`**, naming the task | counts as not running |
+
+The distinction is load-bearing. Retention exiting because both windows are `0`
+is a deployment choice; the stream listener exiting because its HTTP client
+would not build is a fault that silently ends stream-based payment detection.
+Both used to be recorded identically as "stopped", so the counters could not
+separate them and neither could anyone reading them.
 
 ### `GET /ready`
 
@@ -1062,6 +1257,17 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_task_restarts_total` | counter | Supervisor restarts, labelled by `task` |
 | `stellargate_task_running` | gauge | `1` if the named task is running |
 | `stellargate_task_consecutive_failures` | gauge | Consecutive panics since the last stable run |
+| `stellargate_tasks_expected` | gauge | Workers this deployment expects to be running, excluding any disabled by configuration |
+| `stellargate_tasks_live` | gauge | Expected workers currently running |
+| `stellargate_task_disabled` | gauge | `1` if the named task exited because configuration gave it nothing to do |
+
+**Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
+comparison was not previously possible: `stellargate_tasks_stopped_total` was
+overloaded across clean shutdown, configuration-disabled exit and fault, so
+`started − stopped − failed` was not a live count and there was nothing to
+compare it against. `stellargate_task_disabled` is what separates "switched off
+on purpose" from "not running", which `stellargate_task_running` alone reports
+identically.
 
 Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 

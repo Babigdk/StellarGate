@@ -20,6 +20,7 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
+use crate::supervise::TaskExit;
 use crate::{db, AppState};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
 use hmac::{Hmac, KeyInit, Mac};
@@ -151,13 +152,20 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         Ok(c) => c,
         Err(e) => {
             warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
+            /* This is a terminal failure and must be counted like one. It was
+            not, so an entire class of permanent failure — a target that
+            resolves into a blocked range — was invisible to
+            `stellargate_webhook_deliveries_total{outcome="failed"}` and to any
+            alert built on it (issues #319, #233). */
+            state.webhook_metrics.record_failed();
             let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
             return;
         }
     };
 
     let attempts = state.config.webhook_retry_attempts.max(1);
-    let delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let base_delay = Duration::from_millis(state.config.webhook_retry_delay_ms);
+    let max_delay = Duration::from_millis(state.config.webhook_retry_max_delay_ms);
     let start = Instant::now();
 
     for attempt in 1..=attempts {
@@ -201,7 +209,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         }
 
         if attempt < attempts {
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(retry_delay(attempt, base_delay, max_delay)).await;
         }
     }
 
@@ -211,6 +219,43 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         .webhook_metrics
         .record_latency_ms(start.elapsed().as_millis() as u64);
     let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", attempts as i64).await;
+}
+
+/// How long to wait before inline retry `attempt + 1`, given the configured
+/// base and cap.
+///
+/// Two properties, and the issue needs both (#318).
+///
+/// **Growth.** `base * 2^(attempt-1)`, capped at `max`. A constant delay meant
+/// a receiver returning 503 for two minutes saw, per delivery, three attempts
+/// at `t`, `t+5s`, `t+10s` — and across a settlement burst of N payments, `3N`
+/// requests arriving in three tight clusters, precisely while the receiver was
+/// least able to absorb them.
+///
+/// **Jitter**, because growth alone does not desynchronise anything. Deliveries
+/// that fail together share an attempt number, so a purely exponential schedule
+/// puts their next attempts at the same instant — the same lockstep, just
+/// further apart.
+///
+/// This is *equal* jitter — uniform in `[ceiling/2, ceiling]` — rather than the
+/// more common full jitter over `[0, ceiling]`. Full jitter can return a
+/// near-zero delay, and this service already treats that as a misconfiguration:
+/// `WEBHOOK_RETRY_DELAY_MS == 0` with retries enabled is rejected at boot
+/// because "a zero delay causes retry bursts that hammer the target endpoint".
+/// Equal jitter keeps a guaranteed floor under every retry while still spreading
+/// a co-failing batch across half the window.
+pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
+    /* `2^(attempt-1)`, saturating rather than wrapping: a large
+    WEBHOOK_RETRY_ATTEMPTS must clamp to `max`, not overflow to a tiny delay. */
+    let factor = 2u32.saturating_pow(attempt.saturating_sub(1));
+    let ceiling = base.saturating_mul(factor).min(max);
+
+    let ceiling_ms = ceiling.as_millis() as u64;
+    if ceiling_ms == 0 {
+        return Duration::ZERO;
+    }
+    let half = ceiling_ms / 2;
+    Duration::from_millis(half + rand::random_range(0..=(ceiling_ms - half)))
 }
 
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated
@@ -243,6 +288,7 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
         state.config.webhook_redrive_grace_secs,
         state.config.webhook_redrive_backoff_initial_secs,
         state.config.webhook_redrive_backoff_max_secs,
+        state.config.webhook_redrive_jitter_secs,
     )
     .await
     {
@@ -293,6 +339,8 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
         Ok(c) => c,
         Err(e) => {
             warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
+            // Terminal, so counted — same gap as the inline path above.
+            state.webhook_metrics.record_failed();
             let _ =
                 db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
                     .await;
@@ -360,7 +408,10 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
 /// the process shuts down. Runs one pass immediately on startup — before the
 /// first sleep — so a restart repairs any deliveries left `pending`/`failed`
 /// by the previous process without waiting a full interval.
-pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_redrive_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.webhook_redrive_interval_secs.max(1));
     info!(
         interval_secs = state.config.webhook_redrive_interval_secs,
@@ -377,7 +428,7 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("webhook redrive worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
     }
@@ -386,6 +437,87 @@ pub async fn run_redrive_worker(state: Arc<AppState>, mut shutdown: watch::Recei
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Inline retry backoff and jitter (issue #318) ─────────────────────────
+
+    const BASE: Duration = Duration::from_millis(1_000);
+    const MAX: Duration = Duration::from_millis(30_000);
+
+    /// The ceiling doubles per attempt: a constant delay meant a settlement
+    /// burst of N payments produced 3N requests in three tight clusters,
+    /// arriving exactly while a restarting receiver was least able to take
+    /// them.
+    #[test]
+    fn inline_retry_delay_grows_exponentially() {
+        // Equal jitter puts every sample in [ceiling/2, ceiling], so the
+        // *whole range* for attempt n sits at or above attempt n-1's ceiling
+        // only once doubled — assert on the bounds rather than one sample.
+        for (attempt, lo, hi) in [(1, 500, 1_000), (2, 1_000, 2_000), (3, 2_000, 4_000)] {
+            for _ in 0..200 {
+                let d = retry_delay(attempt, BASE, MAX).as_millis() as u64;
+                assert!(
+                    (lo..=hi).contains(&d),
+                    "attempt {attempt} delay {d}ms outside [{lo}, {hi}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_retry_delay_is_capped() {
+        // Attempt 20 would be 1s * 2^19 ≈ 145 hours without the cap.
+        for _ in 0..200 {
+            assert!(retry_delay(20, BASE, MAX) <= MAX);
+        }
+    }
+
+    /// Saturating arithmetic, not wrapping: an absurd attempt number must
+    /// clamp to the cap rather than overflow into a tiny delay and reproduce
+    /// the burst this issue is about.
+    #[test]
+    fn inline_retry_delay_does_not_overflow_to_a_small_value() {
+        let d = retry_delay(u32::MAX, BASE, MAX);
+        assert!(d >= MAX / 2 && d <= MAX, "got {d:?}");
+    }
+
+    /// The property the issue actually asks for: deliveries that fail at the
+    /// same moment must not retry at the same moment. Without jitter every one
+    /// of these samples would be identical.
+    #[test]
+    fn simultaneous_failures_do_not_retry_simultaneously() {
+        let samples: std::collections::HashSet<u128> = (0..500)
+            .map(|_| retry_delay(1, BASE, MAX).as_millis())
+            .collect();
+        assert!(
+            samples.len() > 100,
+            "500 deliveries failing together produced only {} distinct retry \
+             delays — they would still arrive in lockstep",
+            samples.len()
+        );
+    }
+
+    /// Equal jitter, not full jitter. `WEBHOOK_RETRY_DELAY_MS == 0` is rejected
+    /// at boot because "a zero delay causes retry bursts that hammer the target
+    /// endpoint"; jitter that could return ~0 would reintroduce exactly that.
+    #[test]
+    fn jitter_never_collapses_the_delay_to_zero() {
+        for _ in 0..500 {
+            assert!(
+                retry_delay(1, BASE, MAX) >= BASE / 2,
+                "every retry keeps a floor of half the configured base delay"
+            );
+        }
+    }
+
+    /// A zero base (only reachable with retries disabled, which the config
+    /// validator enforces) must not panic on the modulo.
+    #[test]
+    fn zero_base_delay_is_handled() {
+        assert_eq!(
+            retry_delay(1, Duration::ZERO, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn signature_is_deterministic() {

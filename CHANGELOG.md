@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Background tasks report *why* they exited.** `spawn_task` counted a start,
+  and counted a stop when the future returned — with no way to tell "returned
+  because shutdown was signalled" from "returned early because something went
+  wrong". Several workers return permanently on a startup condition, and each
+  looked exactly like a clean shutdown: `run_retention_worker` exiting because
+  both retention windows are `0` (a deployment choice) recorded the same thing
+  as `run_stream_listener` exiting because its HTTP client would not build (a
+  `warn!` followed by a permanent end to stream-based payment detection).
+  Workers now return an explicit `TaskExit` — `ShutdownRequested`,
+  `DisabledByConfig` or `Fatal` — and the supervisor acts on it: a fatal exit is
+  logged at **`error`** naming the task and restarted, a config-disabled exit is
+  reported once at boot and is terminal, and neither is confused with an
+  ordinary stop (issue #317).
+
 ### Added
+
+- **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
+  there was no way to answer "how many workers should be running, and how many
+  are?" — the information existed, but `stopped` was overloaded across three
+  different meanings, so the arithmetic would have been wrong even once exposed.
+  `/health` now carries a `tasks` object (`expected`, `live`, `disabled` with
+  reasons) and `/metrics` exports `stellargate_tasks_expected`,
+  `stellargate_tasks_live` and `stellargate_task_disabled`. `expected` excludes
+  deliberately-disabled workers, so a poll-only or retention-disabled deployment
+  does not read as permanently degraded, and
+  `stellargate_tasks_live < stellargate_tasks_expected` is a usable alert
+  (issues #317, #282, #103).
 
 - **`X-RateLimit-*` response headers.** Every response now carries
   `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` for the
@@ -18,9 +46,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it, so a browser client could previously see the `429` but none of the
   headers explaining it. The bucket/quota model is now documented per route in
   the README and in `openapi.yaml` (issue #327).
+- **Dead-letter view for webhook deliveries.** Once a delivery exhausted its
+  attempts it was marked `failed` and left there, findable only by knowing the
+  payment id and calling `GET /payments/:id/webhooks` — backwards, since the
+  reason to go looking is normally "a merchant says they are missing events"
+  and a payment id is exactly what the person asking does not have. Answering
+  it meant querying SQLite directly on the production volume, and a merchant
+  could not self-serve at all. `GET /v1/payments/webhooks?status=failed` now
+  lists a merchant's deliveries across every payment, cursor-paginated with the
+  same conventions as `GET /payments` and scoped by a join rather than a
+  caller-supplied filter (issue #319).
+- **Bulk webhook recovery.** `POST /v1/payments/webhooks/redeliver` requeues
+  failed deliveries — all of them, or up to 100 named ids — so a merchant who
+  has fixed their receiver can recover what they missed. It sends nothing
+  itself: rows go back to `pending` with `attempts = 0` and are retried by the
+  redrive worker, whose concurrency limit and backoff already bound the
+  outbound rate, so a bulk requeue cannot exhaust the redrive budget or
+  stampede a receiver that has only just come back up (issues #319, #235).
+
+### Changed
+
+- **Unacknowledged terminal webhook failures survive retention.** A `failed`
+  delivery was deleted after `WEBHOOK_DELIVERY_RETENTION_DAYS`, so the evidence
+  that an event was permanently lost expired on a timer whether or not anyone
+  had looked at it — precisely when it was most likely to be asked for. Such a
+  row is now exempt until it is acknowledged (requeueing acknowledges it). To
+  avoid trading one unbounded table for another, a retained failure is
+  **compacted** once past the window: the row stays, its `payload` is cleared.
+  The payload is the largest column and its only consumer is redelivery, which
+  is not something anyone does to a months-old failure, so the record stays
+  queryable indefinitely at a few hundred bytes (issue #319).
 
 ### Fixed
 
+- **SSRF-blocked webhook deliveries are counted as terminal failures.** A
+  target that resolves into a blocked range can never succeed, but neither the
+  inline dispatch path nor the redrive path incremented
+  `stellargate_webhook_deliveries_total{outcome="failed"}` — leaving an entire
+  class of permanent failure invisible to the counter and to any alert built on
+  it (issues #319, #233).
 - **`openapi.yaml` declares its security schemes.** The spec had no
   `components.securitySchemes` block and no `security` key on any operation, so
   every route read as unauthenticated — a client generated from it exposed no
@@ -45,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`GET /payments/:id/webhooks` now paginates like the payments listing.**
+  The endpoint previously serialised every delivery row for a payment with no
+  `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
+  the response without bound. It now supports a `status` filter
+  (`pending`/`delivered`/`failed`), a `limit` (default 20, max 100), and keyset
+  `cursor` pagination with `next_cursor` in the same contract as
+  `GET /payments` (issue #326).
 - **API versioning.** Public routes are now served under `/v1` alongside a
   documented deprecation policy. Unversioned paths keep working and return
   `Deprecation` and `Link: rel="successor-version"` headers pointing at their

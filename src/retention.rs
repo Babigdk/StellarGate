@@ -10,6 +10,7 @@
 //! This worker prunes both on an interval, in batches so no single statement
 //! holds the write lock long enough to stall payment traffic.
 
+use crate::supervise::TaskExit;
 use crate::{db, AppState};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,15 +25,20 @@ use tracing::{debug, info, warn};
 /// stall.
 const MAX_PER_CYCLE: u64 = 50_000;
 
-pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_retention_worker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
     let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
 
     if state.config.webhook_delivery_retention_days <= 0
         && state.config.idempotency_retention_days <= 0
     {
-        info!("retention worker disabled (both retention windows are 0)");
-        let _ = shutdown.changed().await;
-        return;
+        /* A legitimate configuration choice, not a fault — and now
+        distinguishable from one (issue #317). */
+        return TaskExit::DisabledByConfig(
+            "both WEBHOOK_DELIVERY_RETENTION_DAYS and IDEMPOTENCY_RETENTION_DAYS are 0",
+        );
     }
 
     info!(
@@ -49,7 +55,7 @@ pub async fn run_retention_worker(state: Arc<AppState>, mut shutdown: watch::Rec
             _ = tokio::time::sleep(interval) => {}
             _ = shutdown.changed() => {
                 info!("retention worker shutting down");
-                return;
+                return TaskExit::ShutdownRequested;
             }
         }
 
@@ -77,6 +83,25 @@ pub async fn prune_once(state: &Arc<AppState>) -> anyhow::Result<(u64, u64)> {
             db::prune_webhook_deliveries(&state.pool, state.config.webhook_delivery_retention_days)
         })
         .await?;
+
+        /* Aged-out failures nobody has acknowledged are kept rather than
+        deleted (issue #319), so they are compacted instead: the payload is
+        the bulk of the row and its only reader is redelivery, which is not
+        something anyone does to a months-old failure. Counted separately from
+        `deliveries` — these rows are retained, not removed. */
+        let compacted = drain(MAX_PER_CYCLE, || {
+            db::compact_stale_failed_deliveries(
+                &state.pool,
+                state.config.webhook_delivery_retention_days,
+            )
+        })
+        .await?;
+        if compacted > 0 {
+            info!(
+                compacted,
+                "retention compacted unacknowledged failed deliveries to tombstones"
+            );
+        }
     }
 
     let mut keys = 0;
@@ -130,6 +155,7 @@ mod tests {
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
             webhook_retry_attempts: 1,
             webhook_retry_delay_ms: 0,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -138,6 +164,7 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 0,
             webhook_redrive_backoff_max_secs: 0,
+            webhook_redrive_jitter_secs: 0,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: delivery_days,
             idempotency_retention_days: idempotency_days,
@@ -175,39 +202,113 @@ mod tests {
         })
     }
 
-    /// Aged terminal deliveries go; recent ones and in-flight ones stay.
+    /// Insert one delivery row with an explicit age and acknowledgement state.
+    async fn insert_delivery(
+        state: &Arc<AppState>,
+        id: &str,
+        status: &str,
+        age_days: i64,
+        acknowledged: bool,
+    ) {
+        sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (id, payment_id, url, payload, status, attempts, acknowledged_at, created_at)
+             VALUES (?, 'p', 'https://e.example/h', '{\"event\":\"payment.completed\"}', ?, 1,
+                     CASE WHEN ? THEN strftime('%Y-%m-%dT%H:%M:%SZ','now') ELSE NULL END,
+                     strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(acknowledged)
+        .bind(format!("-{age_days} days"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    }
+
+    /// Aged deliveries go — *except* a terminal failure nobody has looked at.
+    ///
+    /// Deleting one of those destroys, on a timer, the only record that an
+    /// event was permanently lost; the evidence for "we never received your
+    /// webhook" expired precisely when it was most likely to be asked for
+    /// (issue #319).
     #[tokio::test]
-    async fn prunes_only_aged_terminal_deliveries() {
+    async fn prunes_aged_deliveries_but_keeps_unacknowledged_failures() {
         let state = state_with(test_config(30, 7)).await;
 
-        for (id, status, age_days) in [
-            ("old-delivered", "delivered", 60),
-            ("old-failed", "failed", 60),
-            ("old-pending", "pending", 60), // still owned by the redrive worker
-            ("new-delivered", "delivered", 1),
-        ] {
-            sqlx::query(
-                "INSERT INTO webhook_deliveries
-                 (id, payment_id, url, payload, status, attempts, created_at)
-                 VALUES (?, 'p', 'https://e.example/h', '{}', ?, 1,
-                         strftime('%Y-%m-%dT%H:%M:%SZ','now', ?))",
-            )
-            .bind(id)
-            .bind(status)
-            .bind(format!("-{age_days} days"))
-            .execute(&state.pool)
-            .await
-            .unwrap();
-        }
+        insert_delivery(&state, "old-delivered", "delivered", 60, false).await;
+        insert_delivery(&state, "old-failed-unacked", "failed", 60, false).await;
+        insert_delivery(&state, "old-failed-acked", "failed", 60, true).await;
+        // Still owned by the redrive worker.
+        insert_delivery(&state, "old-pending", "pending", 60, false).await;
+        insert_delivery(&state, "new-delivered", "delivered", 1, false).await;
 
         let (deliveries, _) = prune_once(&state).await.unwrap();
-        assert_eq!(deliveries, 2, "both aged terminal rows should go");
+        assert_eq!(
+            deliveries, 2,
+            "the delivered row and the acknowledged failure should go"
+        );
 
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")
             .fetch_all(&state.pool)
             .await
             .unwrap();
-        assert_eq!(left, vec!["new-delivered", "old-pending"]);
+        assert_eq!(
+            left,
+            vec!["new-delivered", "old-failed-unacked", "old-pending"]
+        );
+    }
+
+    /// Exempting failures outright would trade one unbounded table for
+    /// another, so a retained failure is compacted to a tombstone instead: the
+    /// row survives, the payload does not.
+    #[tokio::test]
+    async fn retained_failures_are_compacted_to_tombstones() {
+        let state = state_with(test_config(30, 7)).await;
+        insert_delivery(&state, "old-failed", "failed", 60, false).await;
+        insert_delivery(&state, "new-failed", "failed", 1, false).await;
+
+        prune_once(&state).await.unwrap();
+
+        let old: String = sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = ?")
+            .bind("old-failed")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            old, "",
+            "an aged retained failure keeps the row, not the body"
+        );
+
+        let new: String = sqlx::query_scalar("SELECT payload FROM webhook_deliveries WHERE id = ?")
+            .bind("new-failed")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert!(
+            new.contains("payment.completed"),
+            "a failure inside the retention window is still redeliverable"
+        );
+    }
+
+    /// Compaction must not rewrite the same row on every cycle.
+    #[tokio::test]
+    async fn compaction_is_idempotent() {
+        let state = state_with(test_config(30, 7)).await;
+        insert_delivery(&state, "old-failed", "failed", 60, false).await;
+
+        let first = db::compact_stale_failed_deliveries(&state.pool, 30)
+            .await
+            .unwrap();
+        let second = db::compact_stale_failed_deliveries(&state.pool, 30)
+            .await
+            .unwrap();
+
+        assert_eq!(first, 1);
+        assert_eq!(
+            second, 0,
+            "an already-compacted row must not be touched again"
+        );
     }
 
     /// A pending delivery must never be pruned, however old: the redrive

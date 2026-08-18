@@ -27,6 +27,10 @@ pub struct TaskSnapshot {
     pub running: bool,
     pub restarts: u64,
     pub consecutive_failures: u32,
+    /// Set when the task exited because configuration gave it nothing to do.
+    /// Distinguishes "switched off on purpose" from "not running", which the
+    /// counters alone could not (issue #317).
+    pub disabled_reason: Option<&'static str>,
 }
 
 /// Tracks background task health: per-task liveness for `/health`, the last
@@ -50,6 +54,12 @@ struct TaskHealthInner {
     restarts: Mutex<HashMap<&'static str, u64>>,
     /// Consecutive panics since the last stable run, keyed by task name.
     consecutive_failures: Mutex<HashMap<&'static str, u32>>,
+    /// Tasks that exited because configuration gave them nothing to do, with
+    /// the reason. Distinct from "stopped" on purpose (issue #317): a disabled
+    /// worker is a deployment choice, not a fault, so it must not fail
+    /// `/health` — while a worker that stopped for any *other* reason still
+    /// must.
+    disabled: Mutex<HashMap<&'static str, &'static str>>,
     /// Task names that must be running for `/health` to pass. Declared by the
     /// process that spawns the tasks (main.rs), so "expected" is a deployment
     /// decision rather than something the probe has to guess.
@@ -68,6 +78,7 @@ impl Default for TaskHealthInner {
             running: Mutex::new(HashMap::new()),
             restarts: Mutex::new(HashMap::new()),
             consecutive_failures: Mutex::new(HashMap::new()),
+            disabled: Mutex::new(HashMap::new()),
             required: Mutex::new(Vec::new()),
             last_success_unix: AtomicI64::new(0),
         }
@@ -113,6 +124,52 @@ impl TaskHealth {
     pub fn task_restarted(&self, name: &'static str) {
         let mut restarts = self.inner.restarts.lock().unwrap();
         *restarts.entry(name).or_insert(0) += 1;
+    }
+
+    /// Record that a task exited because configuration gave it nothing to do.
+    ///
+    /// Terminal and deliberate, so it is *not* a fault: the task is marked not
+    /// running, but excluded from [`dead_required_tasks`](Self::dead_required_tasks)
+    /// so `/health` does not report a worker that was switched off on purpose
+    /// as a failure (issue #317).
+    pub fn task_disabled(&self, name: &'static str, reason: &'static str) {
+        self.inner.stopped.fetch_add(1, Ordering::Relaxed);
+        self.inner.running.lock().unwrap().insert(name, false);
+        self.inner.disabled.lock().unwrap().insert(name, reason);
+    }
+
+    /// Whether a task exited via [`task_disabled`](Self::task_disabled), and why.
+    pub fn disabled_reason(&self, name: &'static str) -> Option<&'static str> {
+        self.inner.disabled.lock().unwrap().get(name).copied()
+    }
+
+    /// How many workers this deployment expects to be running: the required
+    /// set, minus any that configuration has deliberately disabled.
+    ///
+    /// The counters alone could never answer "how many workers should be
+    /// running, and how many are?" — `stopped` was overloaded across clean
+    /// shutdown, configuration-disabled exit and fault, so even once exposed
+    /// the arithmetic would have been wrong (issue #317).
+    pub fn expected_tasks(&self) -> usize {
+        let required = self.inner.required.lock().unwrap();
+        let disabled = self.inner.disabled.lock().unwrap();
+        required
+            .iter()
+            .filter(|name| !disabled.contains_key(*name))
+            .count()
+    }
+
+    /// How many of the expected workers are actually running right now.
+    /// Compare against [`expected_tasks`](Self::expected_tasks).
+    pub fn live_tasks(&self) -> usize {
+        let running = self.inner.running.lock().unwrap();
+        let required = self.inner.required.lock().unwrap();
+        let disabled = self.inner.disabled.lock().unwrap();
+        required
+            .iter()
+            .filter(|name| !disabled.contains_key(*name))
+            .filter(|name| running.get(*name) == Some(&true))
+            .count()
     }
 
     /// The inner task has been running without panicking long enough to treat
@@ -163,9 +220,13 @@ impl TaskHealth {
     pub fn dead_required_tasks(&self) -> Vec<&'static str> {
         let running = self.inner.running.lock().unwrap();
         let required = self.inner.required.lock().unwrap();
+        let disabled = self.inner.disabled.lock().unwrap();
         required
             .iter()
             .copied()
+            // A worker switched off by configuration is not dead; it was never
+            // meant to be running (issue #317).
+            .filter(|name| !disabled.contains_key(name))
             .filter(|name| running.get(name) != Some(&true))
             .collect()
     }
@@ -189,12 +250,14 @@ impl TaskHealth {
         let restarts = self.inner.restarts.lock().unwrap();
         let consecutive = self.inner.consecutive_failures.lock().unwrap();
         let required = self.inner.required.lock().unwrap();
+        let disabled = self.inner.disabled.lock().unwrap();
 
         let mut names: Vec<&'static str> = required.clone();
         for name in running
             .keys()
             .chain(restarts.keys())
             .chain(consecutive.keys())
+            .chain(disabled.keys())
         {
             if !names.contains(name) {
                 names.push(*name);
@@ -208,6 +271,7 @@ impl TaskHealth {
                 running: running.get(name).copied().unwrap_or(false),
                 restarts: restarts.get(name).copied().unwrap_or(0),
                 consecutive_failures: consecutive.get(name).copied().unwrap_or(0),
+                disabled_reason: disabled.get(name).copied(),
             })
             .collect()
     }

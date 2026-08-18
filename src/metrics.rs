@@ -336,5 +336,38 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, tasks: &crate::TaskH
         ));
     }
 
+    /* Expected-versus-live (issue #317). The raw counters could not answer
+    "how many workers should be running, and how many are?": `stopped` was
+    overloaded across clean shutdown, configuration-disabled exit and fault, so
+    `started - stopped - failed` was not a live count and there was nothing to
+    compare it against. These two gauges are that comparison, and
+    `expected` already excludes deliberately-disabled workers. Alert on
+    `stellargate_tasks_live < stellargate_tasks_expected`. */
+    out.push_str(
+        "# HELP stellargate_tasks_expected Background workers this deployment expects to be running, excluding any disabled by configuration.\n",
+    );
+    out.push_str("# TYPE stellargate_tasks_expected gauge\n");
+    out.push_str(&format!(
+        "stellargate_tasks_expected {}\n",
+        tasks.expected_tasks()
+    ));
+    out.push_str("# HELP stellargate_tasks_live Expected background workers currently running.\n");
+    out.push_str("# TYPE stellargate_tasks_live gauge\n");
+    out.push_str(&format!("stellargate_tasks_live {}\n", tasks.live_tasks()));
+
+    /* Separates "switched off on purpose" from "not running", which
+    `stellargate_task_running` alone reports identically. */
+    out.push_str(
+        "# HELP stellargate_task_disabled Whether the named background task exited because configuration gave it nothing to do (1) or not (0).\n",
+    );
+    out.push_str("# TYPE stellargate_task_disabled gauge\n");
+    for snap in &snaps {
+        out.push_str(&format!(
+            "stellargate_task_disabled{{task=\"{}\"}} {}\n",
+            snap.name,
+            if snap.disabled_reason.is_some() { 1 } else { 0 }
+        ));
+    }
+
     out
 }

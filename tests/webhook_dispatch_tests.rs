@@ -29,6 +29,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_secret: webhook_secret.into(),
         webhook_retry_attempts: retry_attempts,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
@@ -37,6 +38,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_redrive_grace_secs: 60,
         webhook_redrive_backoff_initial_secs: 0,
         webhook_redrive_backoff_max_secs: 0,
+        webhook_redrive_jitter_secs: 0,
         retention_interval_secs: 3600,
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
@@ -568,4 +570,67 @@ async fn redrive_marks_delivery_failed_after_exhausting_max_attempts() {
         .unwrap();
     assert_eq!(delivery.status, "failed");
     assert_eq!(delivery.attempts, 5);
+}
+
+// ── Terminal-failure metric coverage (issues #319, #233) ─────────────────────
+
+/// A webhook target that resolves into a blocked range is a *permanent*
+/// failure — no retry will ever make it succeed — but it was not counted as
+/// one. That left a whole class of terminal failure invisible to
+/// `stellargate_webhook_deliveries_total{outcome="failed"}` and to any alert
+/// built on it, which is precisely the alerting the dead-letter view relies on
+/// to tell an operator that failures are happening at all.
+#[tokio::test]
+async fn ssrf_blocked_dispatch_is_counted_as_a_terminal_failure() {
+    let mut cfg = make_config("secret", 3);
+    // Turn the guard back on so a loopback target is rejected.
+    cfg.webhook_allow_private_targets = false;
+    let state = setup_state(cfg).await;
+
+    // Resolves to loopback, so the SSRF guard rejects it before any request.
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    webhook::dispatch(&state, &payment, "payment.completed", None).await;
+
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "an SSRF-blocked delivery is terminal and must increment the failure counter"
+    );
+
+    let deliveries = db::list_webhook_deliveries(&state.pool, &payment.id)
+        .await
+        .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, "failed");
+}
+
+/// The same gap existed on the redrive path.
+#[tokio::test]
+async fn ssrf_blocked_redrive_is_counted_as_a_terminal_failure() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_allow_private_targets = false;
+    // The row is created moments before the redrive pass, so the default grace
+    // window would (correctly) treat it as possibly still in flight.
+    cfg.webhook_redrive_grace_secs = 0;
+    let state = setup_state(cfg).await;
+
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    db::save_webhook_delivery(
+        &state.pool,
+        "blocked-delivery",
+        &payment.id,
+        "http://127.0.0.1:1/hook",
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+
+    let state = Arc::new(state);
+    assert_eq!(webhook::redrive_once(&state).await, 1);
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "an SSRF-blocked redrive is terminal and must be counted"
+    );
 }

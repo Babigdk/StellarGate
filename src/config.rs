@@ -93,7 +93,18 @@ pub struct Config {
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
+    /// Base delay between inline retry attempts, in milliseconds. This is the
+    /// *first* step of an exponential schedule (`base * 2^(attempt-1)`, capped
+    /// by [`Self::webhook_retry_max_delay_ms`]), not a fixed interval — a
+    /// constant delay meant every delivery that failed at the same moment,
+    /// which is what happens when a receiver goes down, retried in lockstep
+    /// and hit it again at exactly the same instants as it tried to come back
+    /// up (issue #318).
     pub webhook_retry_delay_ms: u64,
+    /// Upper bound on one inline retry delay, in milliseconds. Without it the
+    /// doubling above would push the last attempt of a long retry chain
+    /// arbitrarily far out and keep a settlement waiting on it.
+    pub webhook_retry_max_delay_ms: u64,
     pub allowed_webhook_schemes: Vec<String>,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
@@ -113,11 +124,14 @@ pub struct Config {
     /// permanently.
     pub webhook_redrive_max_attempts: u32,
     /// How long (seconds) a delivery must sit idle since its last attempt (or
-    /// creation) before the redrive worker will touch it. Must comfortably
-    /// exceed the worst-case inline delivery time
-    /// (`webhook_retry_attempts * (webhook_timeout_secs + webhook_retry_delay_ms)`)
-    /// so the worker never races a `dispatch()` call that is still in flight
-    /// for the same row. Acts as a hard floor under the exponential backoff
+    /// creation) before the redrive worker will touch it. Must exceed the
+    /// worst-case inline delivery time so the worker never races a `dispatch()`
+    /// call that is still in flight for the same row — see
+    /// [`Self::worst_case_inline_delivery_secs`], which is checked at boot
+    /// (issue #238). That bound used to be
+    /// `attempts * (timeout + delay)`; now that the inline delay is
+    /// exponential rather than constant, the delays are summed across the
+    /// actual schedule. Acts as a hard floor under the exponential backoff
     /// below — a row is never touched sooner than this, even on its very
     /// first redrive attempt.
     pub webhook_redrive_grace_secs: i64,
@@ -133,6 +147,17 @@ pub struct Config {
     /// that has failed many times still gets retried at a bounded cadence
     /// rather than being pushed further and further out.
     pub webhook_redrive_backoff_max_secs: i64,
+    /// Width (seconds) of the random offset added to each row's redrive
+    /// eligibility, `0` to disable.
+    ///
+    /// Exponential backoff alone does not desynchronise a co-failing batch:
+    /// rows that failed together share an `attempts` value and a near-identical
+    /// `last_attempt`, so `initial * 2^(attempts-1)` schedules their next
+    /// attempts at the same instant, and the worker — which computes
+    /// eligibility in SQL from `last_attempt` — re-clusters them on every
+    /// subsequent pass. A per-row random offset is what actually breaks the
+    /// batch apart (issue #318).
+    pub webhook_redrive_jitter_secs: i64,
     /// How often the retention worker prunes rows that have outlived their
     /// usefulness. Both tables below grow monotonically without it, so on a
     /// long-running deployment the disk is the only thing that stops them.
@@ -267,6 +292,7 @@ impl Config {
             allowed_webhook_schemes,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
+            webhook_retry_max_delay_ms: parse_env("WEBHOOK_RETRY_MAX_DELAY_MS", 60_000)?,
             webhook_timeout_secs: parse_env("WEBHOOK_TIMEOUT_SECS", 10)?,
             webhook_redrive_interval_secs: parse_env("WEBHOOK_REDRIVE_INTERVAL_SECS", 30)?,
             webhook_redrive_concurrency: parse_env("WEBHOOK_REDRIVE_CONCURRENCY", 4)?,
@@ -277,6 +303,7 @@ impl Config {
                 30,
             )?,
             webhook_redrive_backoff_max_secs: parse_env("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", 900)?,
+            webhook_redrive_jitter_secs: parse_env("WEBHOOK_REDRIVE_JITTER_SECS", 30)?,
             retention_interval_secs: parse_env("RETENTION_INTERVAL_SECS", 3600)?,
             webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
             idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
@@ -420,6 +447,47 @@ impl Config {
             ));
         }
 
+        if self.webhook_retry_max_delay_ms < self.webhook_retry_delay_ms {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_RETRY_MAX_DELAY_MS ({}) must be >= WEBHOOK_RETRY_DELAY_MS ({}). \
+                 With the current settings the cap would override the starting delay and the \
+                 inline retry backoff would never actually grow.",
+                self.webhook_retry_max_delay_ms,
+                self.webhook_retry_delay_ms
+            ));
+        }
+
+        /* The redrive grace window has to clear the worst case a `dispatch()`
+        call can take, or the worker starts a second delivery for a row whose
+        first one is still in flight. Making the inline delay exponential
+        changed that arithmetic — the old comparison assumed a constant delay
+        (issue #238, coordinating with #318). */
+        let worst_case_inline = self.worst_case_inline_delivery_secs();
+        if self.webhook_redrive_grace_secs < worst_case_inline as i64 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_GRACE_SECS ({}) is below the worst-case inline delivery time \
+                 ({worst_case_inline}s). With the current settings the redrive worker could pick \
+                 up a delivery whose inline dispatch is still running and send it twice. \
+                 The inline budget is WEBHOOK_RETRY_ATTEMPTS ({}) attempts of up to \
+                 WEBHOOK_TIMEOUT_SECS ({}s) each, plus the exponential retry delays \
+                 (WEBHOOK_RETRY_DELAY_MS {}ms doubling to at most \
+                 WEBHOOK_RETRY_MAX_DELAY_MS {}ms).",
+                self.webhook_redrive_grace_secs,
+                self.webhook_retry_attempts,
+                self.webhook_timeout_secs,
+                self.webhook_retry_delay_ms,
+                self.webhook_retry_max_delay_ms
+            ));
+        }
+
+        if self.webhook_redrive_jitter_secs < 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_JITTER_SECS must be >= 0 (got {}). \
+                 A negative jitter would pull deliveries forward past their backoff.",
+                self.webhook_redrive_jitter_secs
+            ));
+        }
+
         if self.request_timeout_secs == 0 {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
@@ -438,6 +506,37 @@ impl Config {
         }
 
         Ok(())
+    }
+
+    /// Longest a single `webhook::dispatch` call can take, in seconds, rounded
+    /// up.
+    ///
+    /// Every attempt may burn a full `webhook_timeout_secs`, and each gap
+    /// between attempts is bounded by the exponential schedule
+    /// `retry_delay(n) <= min(base * 2^(n-1), max)`. Jitter only ever shortens
+    /// a gap, so the un-jittered ceiling is the worst case.
+    ///
+    /// This is what `WEBHOOK_REDRIVE_GRACE_SECS` has to clear for the redrive
+    /// worker never to race a live dispatch for the same row (issues #238,
+    /// #318). Before the delay became exponential the bound was simply
+    /// `attempts * (timeout + delay)`.
+    pub fn worst_case_inline_delivery_secs(&self) -> u64 {
+        let attempts = self.webhook_retry_attempts.max(1) as u64;
+        let timeouts = attempts.saturating_mul(self.webhook_timeout_secs);
+
+        let mut delays_ms: u64 = 0;
+        for attempt in 1..attempts {
+            let factor = 2u64.saturating_pow(attempt as u32 - 1);
+            let step = self
+                .webhook_retry_delay_ms
+                .saturating_mul(factor)
+                .min(self.webhook_retry_max_delay_ms);
+            delays_ms = delays_ms.saturating_add(step);
+        }
+
+        // Round the delay total up to whole seconds; a sub-second remainder
+        // still has to fit inside the grace window.
+        timeouts.saturating_add(delays_ms.div_ceil(1_000))
     }
 
     fn validate_webhook_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
@@ -494,6 +593,10 @@ impl std::fmt::Debug for Config {
             .field("webhook_secret", &"***")
             .field("webhook_retry_attempts", &self.webhook_retry_attempts)
             .field("webhook_retry_delay_ms", &self.webhook_retry_delay_ms)
+            .field(
+                "webhook_retry_max_delay_ms",
+                &self.webhook_retry_max_delay_ms,
+            )
             .field("webhook_timeout_secs", &self.webhook_timeout_secs)
             .field(
                 "webhook_redrive_interval_secs",
@@ -518,6 +621,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "webhook_redrive_backoff_max_secs",
                 &self.webhook_redrive_backoff_max_secs,
+            )
+            .field(
+                "webhook_redrive_jitter_secs",
+                &self.webhook_redrive_jitter_secs,
             )
             .field("poll_interval_secs", &self.poll_interval_secs)
             .field("cursor_staleness_multiple", &self.cursor_staleness_multiple)
@@ -606,6 +713,7 @@ mod tests {
             webhook_secret: "webhook-hmac-secret".into(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -614,6 +722,7 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
+            webhook_redrive_jitter_secs: 30,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
@@ -684,6 +793,7 @@ mod tests {
             webhook_secret: String::new(),
             webhook_retry_attempts: 3,
             webhook_retry_delay_ms: 5000,
+            webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
@@ -692,6 +802,7 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
+            webhook_redrive_jitter_secs: 30,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
@@ -997,6 +1108,84 @@ mod tests {
         cfg.poll_interval_secs = 60;
         cfg.payment_ttl_secs = 60; // equal is fine
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    // ── Retry schedule and grace-window validation (issues #318, #238) ───────
+
+    /// The bound the grace window is checked against: every attempt may burn a
+    /// full timeout, and the gaps follow the exponential schedule.
+    #[test]
+    fn worst_case_inline_sums_the_exponential_schedule() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 3;
+        cfg.webhook_timeout_secs = 10;
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 60_000;
+        // 3 × 10s of timeouts, plus gaps of 5s and 10s.
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 45);
+    }
+
+    /// The cap has to actually bind, or a long retry chain would report an
+    /// absurd worst case and demand an equally absurd grace window.
+    #[test]
+    fn worst_case_inline_respects_the_delay_cap() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_timeout_secs = 1;
+        cfg.webhook_retry_delay_ms = 1_000;
+        cfg.webhook_retry_max_delay_ms = 2_000;
+        // 5 × 1s, plus gaps of 1s, 2s, 2s (capped), 2s (capped).
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 12);
+    }
+
+    /// A single attempt has no gaps at all.
+    #[test]
+    fn worst_case_inline_with_no_retries_is_just_one_timeout() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 1;
+        cfg.webhook_timeout_secs = 10;
+        assert_eq!(cfg.worst_case_inline_delivery_secs(), 10);
+    }
+
+    /// The failure this guards against is a duplicate delivery: the worker
+    /// picking up a row whose inline dispatch has not finished.
+    #[test]
+    fn timing_rejects_a_grace_window_shorter_than_the_inline_schedule() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_attempts = 5;
+        cfg.webhook_timeout_secs = 30;
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 60_000;
+        cfg.webhook_redrive_grace_secs = 60; // far below 150s of timeouts alone
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_GRACE_SECS") && err.contains("send it twice"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_accepts_the_default_grace_window() {
+        // Defaults: 3 attempts × 10s, plus 5s and 10s gaps = 45s, under 60s.
+        let cfg = timing_config();
+        assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_a_retry_cap_below_the_base_delay() {
+        let mut cfg = timing_config();
+        cfg.webhook_retry_delay_ms = 5_000;
+        cfg.webhook_retry_max_delay_ms = 1_000;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_RETRY_MAX_DELAY_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_negative_redrive_jitter() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_jitter_secs = -1;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_REDRIVE_JITTER_SECS"), "got: {err}");
     }
 
     #[test]

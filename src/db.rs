@@ -106,6 +106,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT,
+            acknowledged_at TEXT,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
@@ -124,6 +125,23 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
+            .execute(pool)
+            .await?;
+    }
+
+    /* `acknowledged_at` records that somebody has seen a terminal failure and
+    acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
+    retention can distinguish "this failure was dealt with" from "nobody has
+    looked at this yet", and refuse to delete the latter (issue #319). Rows
+    that predate the column are NULL, i.e. unacknowledged, which is the safe
+    reading: we do not know that anyone saw them. */
+    let has_acknowledged_at: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'acknowledged_at'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_acknowledged_at == 0 {
+        sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
             .execute(pool)
             .await?;
     }
@@ -608,18 +626,36 @@ pub async fn list_pending(pool: &Db) -> Result<Vec<Payment>> {
     Ok(rows.iter().map(row_to_payment).collect())
 }
 
-/// Transition every watchable payment whose TTL has elapsed to `expired`,
-/// returning the rows that were swept so the caller can fire `payment.expired`
-/// webhooks. Each row is updated with a guard on a watchable status so a payment
-/// that settles concurrently is left untouched and not double-reported.
-pub async fn expire_overdue(pool: &Db) -> Result<Vec<Payment>> {
-    let overdue = sqlx::query(
-        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
-                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
-         FROM payments
-         WHERE status IN ('pending', 'underpaid')
-           AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
-         ORDER BY created_at ASC",
+/// Transition up to `batch` watchable payments whose TTL has elapsed to
+/// `expired`, returning the rows that were swept so the caller can fire
+/// `payment.expired` webhooks.
+///
+/// The whole batch is transitioned in a single `UPDATE … RETURNING` — one
+/// round-trip instead of one guarded `UPDATE` per intent (issue #323). The
+/// `WHERE … status IN ('pending','underpaid')` guard remains what makes a
+/// concurrent settlement win the race: the subquery and update run under one
+/// write lock, so a payment that settles in between is never selected here
+/// (if the settlement committed first) and a payment this statement sweeps is
+/// rejected by the settlement's own guard (issue #155) — never double-reported.
+/// `RETURNING` yields exactly the rows this statement actually transitioned.
+///
+/// `batch` bounds each statement, so a large backlog drains over several
+/// sweeps instead of one long write lock.
+pub async fn expire_overdue(pool: &Db, batch: i64) -> Result<Vec<Payment>> {
+    let rows = sqlx::query(
+        "UPDATE payments
+            SET status = 'expired',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+          WHERE id IN (
+              SELECT id FROM payments
+               WHERE status IN ('pending', 'underpaid')
+                 AND expires_at <= strftime('%Y-%m-%dT%H:%M:%SZ','now')
+               ORDER BY created_at ASC
+               LIMIT ?
+          )
+          RETURNING id, merchant_id, destination_address, memo, amount, asset,
+                    asset_issuer, status, webhook_url, tx_hash, paid_amount,
+                    created_at, updated_at, expires_at",
     )
     .bind(batch)
     .fetch_all(pool)
@@ -802,6 +838,10 @@ pub struct WebhookDelivery {
     pub status: String,
     pub attempts: i64,
     pub last_attempt: Option<String>,
+    /// When somebody acted on this delivery — requeued it, or explicitly
+    /// acknowledged it. `None` means nobody has looked at it yet, which is
+    /// what keeps a terminal failure exempt from retention (issue #319).
+    pub acknowledged_at: Option<String>,
     pub created_at: String,
 }
 
@@ -836,9 +876,15 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         status: row.get("status"),
         attempts: row.get("attempts"),
         last_attempt: row.get("last_attempt"),
+        acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
     }
 }
+
+/// Columns every delivery read selects, in the order `row_to_webhook_delivery`
+/// expects. Kept in one place so adding a column cannot leave one query behind.
+const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status, attempts, \
+                                last_attempt, acknowledged_at, created_at";
 
 /// Deliveries eligible for the background redrive worker: not yet delivered,
 /// under the attempt cap, and idle long enough that no in-flight `dispatch()`
@@ -861,13 +907,27 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// A row with `attempts == 0` (left behind by a crash between insert and its
 /// first send, not a delivery failure) is exempt from this backoff and is
 /// gated by `grace_secs` alone.
+///
+/// `jitter_secs` adds a per-row random offset in `[0, jitter_secs]` on top of
+/// whichever window applies, and is what actually decorrelates a co-failing
+/// batch (issue #318). The exponential backoff alone does not: rows that failed
+/// together share an `attempts` value and a near-identical `last_attempt`, so
+/// `initial * 2^(attempts-1)` resolves to the same instant for every one of
+/// them, and this query — which computes eligibility in SQL from `last_attempt`
+/// — re-clusters the batch on every pass. `RANDOM()` is evaluated per row per
+/// statement, so each pass admits a different random subset and a batch that
+/// failed together spreads over several intervals instead of moving as one
+/// block. Pass `0` to disable.
 pub async fn list_redrivable_deliveries(
     pool: &Db,
     max_attempts: i64,
     grace_secs: i64,
     backoff_initial_secs: i64,
     backoff_max_secs: i64,
+    jitter_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
+    /* `ABS(RANDOM()) % (n+1)` yields [0, n]. Guarded on `jitter_secs > 0`:
+    `% 1` is a constant 0, and a zero modulus is a runtime error in SQLite. */
     let rows = sqlx::query(
         "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
          FROM webhook_deliveries
@@ -877,14 +937,17 @@ pub async fn list_redrivable_deliveries(
                  CASE WHEN attempts = 0 THEN ?
                       ELSE MAX(?, MIN(? * (1 << MIN(attempts - 1, 32)), ?))
                  END
+                 + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
-    )
+    ))
     .bind(max_attempts)
     .bind(grace_secs)
     .bind(grace_secs)
     .bind(backoff_initial_secs)
     .bind(backoff_max_secs)
+    .bind(jitter_secs)
+    .bind(jitter_secs)
     .fetch_all(pool)
     .await?;
 
@@ -893,10 +956,10 @@ pub async fn list_redrivable_deliveries(
 
 /// Get all webhook deliveries for a payment, ordered by created_at descending.
 pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<WebhookDelivery>> {
-    let rows = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+    let rows = sqlx::query(&format!(
+        "SELECT {DELIVERY_COLUMNS}
          FROM webhook_deliveries WHERE payment_id = ? ORDER BY created_at DESC",
-    )
+    ))
     .bind(payment_id)
     .fetch_all(pool)
     .await?;
@@ -904,12 +967,91 @@ pub async fn list_webhook_deliveries(pool: &Db, payment_id: &str) -> Result<Vec<
     Ok(rows.iter().map(row_to_webhook_delivery).collect())
 }
 
+/// Get a page of webhook deliveries for a payment with keyset (cursor)
+/// pagination, sharing the contracts used by `GET /payments`.
+///
+/// Rows are ordered by `(created_at DESC, id DESC)` — the same ordering and
+/// tie-break as the payments listing — so a `next_cursor` encoded from any
+/// page resumes exactly after its last row and never re-reads or skips the
+/// whole-second `created_at` tie group that ends the page. An optional
+/// `status` filter narrows to deliveries in that state (`pending`,
+/// `delivered`, or `failed`).
+pub async fn list_webhook_deliveries_keyset(
+    pool: &Db,
+    payment_id: &str,
+    status: Option<&str>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<WebhookDelivery>> {
+    let rows = match (status, cursor) {
+        (None, None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (None, Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), None) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries WHERE payment_id = ? AND status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(s), Some((ts, cid))) => {
+            sqlx::query(
+                "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
+                 FROM webhook_deliveries
+                 WHERE payment_id = ? AND status = ?
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(payment_id)
+            .bind(s)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(rows.iter().map(row_to_webhook_delivery).collect())
+}
+
 /// Get a specific webhook delivery by id.
 pub async fn get_webhook_delivery(pool: &Db, id: &str) -> Result<Option<WebhookDelivery>> {
-    let row = sqlx::query(
-        "SELECT id, payment_id, url, payload, event_type, status, attempts, last_attempt, created_at
-         FROM webhook_deliveries WHERE id = ?",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT {DELIVERY_COLUMNS} FROM webhook_deliveries WHERE id = ?",
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await?;
@@ -1009,17 +1151,60 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
 
 /// Delete one batch of webhook deliveries that have finished and aged out.
 ///
-/// Only `delivered` and `failed` rows are eligible. A `pending` row is still
-/// owned by the redrive worker — pruning it would silently drop a delivery
-/// that was going to be retried. The worker marks rows `failed` once attempts
-/// are exhausted, so nothing stays exempt forever (issue #111).
+/// A `pending` row is still owned by the redrive worker — pruning it would
+/// silently drop a delivery that was going to be retried. The worker marks
+/// rows `failed` once attempts are exhausted, so nothing stays exempt forever
+/// (issue #111).
+///
+/// An **unacknowledged `failed`** row is also exempt. Deleting one destroys the
+/// only record that an event was permanently lost, on a timer, whether or not
+/// anybody looked at it — so the evidence for "we never received your webhook"
+/// expired exactly when it was most likely to be asked for (issue #319).
+/// Acknowledging or requeueing a delivery clears the exemption, and
+/// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
+/// what a full delivery row costs.
 pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
           WHERE rowid IN (
               SELECT rowid FROM webhook_deliveries
-               WHERE status IN ('delivered','failed')
+               WHERE (status = 'delivered'
+                      OR (status = 'failed' AND acknowledged_at IS NOT NULL))
+                 AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
+               LIMIT ?
+          )",
+    )
+    .bind(&cutoff)
+    .bind(PRUNE_BATCH)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n)
+}
+
+/// Drop the stored payload of aged-out, unacknowledged `failed` deliveries,
+/// leaving a compact tombstone.
+///
+/// Exempting terminal failures from retention outright would trade one
+/// unbounded table for another, which is the problem retention was added to
+/// solve (issues #110, #111). `payload` is by far the largest column, and its
+/// only consumer is redelivery — which is not something anyone does to a
+/// months-old failure. Clearing it keeps the row (and therefore the answer to
+/// "did this event ever get through?") at a few hundred bytes, indefinitely.
+///
+/// The `payload <> ''` guard makes this idempotent: a row is compacted once,
+/// not rewritten on every cycle.
+pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+    let cutoff = format!("-{retention_days} days");
+    let n = sqlx::query(
+        "UPDATE webhook_deliveries
+            SET payload = ''
+          WHERE rowid IN (
+              SELECT rowid FROM webhook_deliveries
+               WHERE status = 'failed'
+                 AND acknowledged_at IS NULL
+                 AND payload <> ''
                  AND created_at < strftime('%Y-%m-%dT%H:%M:%SZ','now',?)
                LIMIT ?
           )",
@@ -1593,7 +1778,9 @@ mod tests {
         .await
         .unwrap();
 
-        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0).await.unwrap();
+        let candidates = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
+            .await
+            .unwrap();
         let ids: Vec<&str> = candidates.iter().map(|d| d.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1677,18 +1864,92 @@ mod tests {
             .unwrap();
 
         // Freshly inserted, so a large grace window makes it ineligible...
-        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+        assert!(list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
             .await
             .unwrap()
             .is_empty());
         // ...while a zero grace window makes it immediately eligible.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
                 .await
                 .unwrap()
                 .len(),
             1
         );
+    }
+
+    /// The redrive half of issue #318.
+    ///
+    /// Exponential backoff does not desynchronise a batch that failed
+    /// together: those rows share an `attempts` value and a near-identical
+    /// `last_attempt`, so their next-attempt times coincide and this query
+    /// hands the worker the whole cluster on one pass — which is precisely the
+    /// stampede the backoff was supposed to prevent.
+    ///
+    /// With jitter, each pass admits a random subset instead. 200 co-failing
+    /// rows and a 100-second window: the chance of all 200 clearing a random
+    /// `[0,100]` offset at once is nil, so a full batch means jitter is not
+    /// being applied.
+    #[tokio::test]
+    async fn jitter_desynchronises_a_batch_that_failed_together() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOJIT", 3600))
+            .await
+            .unwrap();
+
+        // 200 deliveries, all created and failed at the same instant.
+        for i in 0..200 {
+            let id = format!("sync-{i}");
+            save_webhook_delivery(&pool, &id, "p1", "http://x", "{}", "payment.completed")
+                .await
+                .unwrap();
+        }
+
+        // No jitter: every row clears the zero grace window, so the worker
+        // takes the entire cluster in one pass — the behaviour being fixed.
+        let unjittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            unjittered.len(),
+            200,
+            "without jitter a co-failing batch moves as one block"
+        );
+
+        // With jitter, each row waits a random extra [0, 100] seconds.
+        let jittered = list_redrivable_deliveries(&pool, 8, 0, 0, 0, 100)
+            .await
+            .unwrap();
+        assert!(
+            jittered.len() < 200,
+            "jitter must spread the batch across passes, but all {} rows were \
+             returned at once",
+            jittered.len()
+        );
+    }
+
+    /// Jitter must only ever *delay* a row, never pull it forward past the
+    /// grace window that keeps the worker off a live `dispatch()`.
+    #[tokio::test]
+    async fn jitter_never_shortens_the_grace_window() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOJI2", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(&pool, "fresh", "p1", "http://x", "{}", "payment.completed")
+            .await
+            .unwrap();
+
+        for _ in 0..50 {
+            assert!(
+                list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 300)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a row inside its grace window must stay ineligible regardless \
+                 of the jitter draw"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1711,7 +1972,7 @@ mod tests {
         // attempts == 0 (never sent) is gated by grace_secs alone, not the
         // exponential backoff, even with a huge backoff floor configured.
         assert_eq!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
                 .await
                 .unwrap()
                 .len(),
@@ -1735,7 +1996,7 @@ mod tests {
         // One failed attempt (attempts=1): backoff = initial * 2^0 = initial.
         // A huge initial delay makes it ineligible even with grace_secs=0.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600)
+            list_redrivable_deliveries(&pool, 8, 0, 3600, 3600, 0)
                 .await
                 .unwrap()
                 .is_empty(),
@@ -1744,7 +2005,7 @@ mod tests {
         // grace_secs is a floor under the backoff: even with backoff disabled
         // (initial=max=0), a large grace_secs still holds the row back.
         assert!(
-            list_redrivable_deliveries(&pool, 8, 3600, 0, 0)
+            list_redrivable_deliveries(&pool, 8, 3600, 0, 0, 0)
                 .await
                 .unwrap()
                 .is_empty(),
