@@ -63,6 +63,8 @@ paths:
       summary: Create a payment intent
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -94,18 +96,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
-              examples:
-                invalid_amount:
-                  summary: Invalid amount
-                  value:
-                    error: amount must be a positive number with at most 7 decimal places
-                    code: invalid_amount
-                unsupported_asset:
-                  summary: Unsupported asset
-                  value:
-                    error: "unsupported asset 'EURC'; supported: XLM, USDC"
-                    code: unsupported_asset
+                $ref: "#/components/schemas/Payment"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -426,6 +417,116 @@ paths:
           $ref: "#/components/responses/DeprecatedWebhookBadGateway"
 
 components:
+  headers:
+    XRequestId:
+      description: >-
+        Correlation id for the request, echoed from the caller's `x-request-id`
+        or generated server-side as a UUID. Present on every response.
+      schema:
+        type: string
+        format: uuid
+    Deprecation:
+      description: >-
+        Present on responses from the deprecated unprefixed mount (RFC 8594).
+        Always the literal string `true`.
+      schema:
+        type: string
+        enum: ["true"]
+    Link:
+      description: >-
+        Present on responses from the deprecated unprefixed mount (RFC 8288).
+        Points at the canonical `/v1` successor of the requested path.
+      schema:
+        type: string
+      example: '</v1/payments>; rel="successor-version"'
+    RetryAfter:
+      description: >-
+        Seconds to wait before retrying, in delta-seconds per RFC 9110. Sent on
+        a `429`; derived from the limiter's own state and never less than 1.
+      schema:
+        type: integer
+        minimum: 1
+    XRateLimitLimit:
+      description: >-
+        The per-second request quota for the bucket this request fell into.
+        Present on every response, throttled or not.
+      schema:
+        type: integer
+    XRateLimitRemaining:
+      description: >-
+        Requests remaining before the bucket throttles. Present on every
+        response.
+      schema:
+        type: integer
+        minimum: 0
+    XRateLimitReset:
+      description: >-
+        Seconds until the bucket refills to its full quota. Present on every
+        response.
+      schema:
+        type: integer
+        minimum: 0
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: >-
+        Optional client-chosen key that makes creating a payment safe to retry
+        after a network blip. Scoped per merchant; an empty value is treated as
+        absent. Reusing a key returns the original intent with `200 OK` instead
+        of minting a duplicate.
+      schema:
+        type: string
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DeliveryId:
+      name: delivery_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    StatusFilter:
+      name: status
+      in: query
+      required: false
+      description: Filter by status
+      schema:
+        $ref: "#/components/schemas/PaymentStatus"
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    OffsetParam:
+      name: offset
+      in: query
+      required: false
+      description: Rows to skip (offset pagination)
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    CursorParam:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor for keyset pagination (returned as next_cursor)
+      schema:
+        type: string
+
   securitySchemes:
     bearerAuth:
       type: http
@@ -466,6 +567,96 @@ components:
               value:
                 error: invalid API key
                 code: unauthorized
+    NotFound:
+      description: Resource not found
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            payment_not_found:
+              summary: Payment not found
+              value:
+                error: payment not found
+                code: payment_not_found
+            delivery_not_found:
+              summary: Delivery not found (redelivery only)
+              value:
+                error: delivery not found
+                code: delivery_not_found
+    WebhookBadGateway:
+      description: Webhook endpoint returned an error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            webhook_delivery_failed:
+              summary: Redelivery failed
+              value:
+                error: webhook delivery failed
+                code: webhook_delivery_failed
+
+    # Deprecated-mount twins: identical bodies, plus the `Deprecation` and `Link`
+    # headers that `mark_deprecated` stamps on every unprefixed response.
+    DeprecatedValidationError:
+      description: Validation error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedNotFound:
+      description: Resource not found
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedRateLimited:
+      description: Rate limit exceeded
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    DeprecatedWebhookBadGateway:
+      description: Webhook endpoint returned an error
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/XRequestId"
+        Deprecation:
+          $ref: "#/components/headers/Deprecation"
+        Link:
+          $ref: "#/components/headers/Link"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
 
   schemas:
     HealthResponse:
