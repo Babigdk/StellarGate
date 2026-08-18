@@ -38,7 +38,8 @@ impl ListenerMode {
 ///
 /// `issuer` is `None` for the native XLM asset; all other assets require an
 /// issuer address. Configure via `ACCEPTED_ASSETS` as comma-separated entries
-/// of the form `CODE` (native) or `CODE:ISSUER`.
+/// of the form `CODE` (native XLM only) or `CODE:ISSUER`. A non-native code
+/// without an issuer is rejected at boot (issue #221).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedAsset {
     pub code: String,
@@ -88,7 +89,8 @@ pub struct Config {
     pub horizon_url: String,
     pub gateway_public: String,
     /// Assets the gateway will accept, validated on POST /payments.
-    /// Duplicate codes are rejected at boot (issue #222). Configure via
+    /// Duplicate codes are rejected at boot (issue #222). Non-native entries
+    /// without an issuer are also refused (issue #221). Configure via
     /// `ACCEPTED_ASSETS=XLM,USDC:GISSUER` (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
@@ -358,6 +360,16 @@ impl Config {
                         issuer
                     )
                 })?;
+            } else if !asset.code.eq_ignore_ascii_case("XLM") {
+                /* `issuer: None` is how parse_list represents native XLM. A bare
+                `USDC` entry used to produce the same shape, and `verify()` then
+                treated any native XLM payment as settling that USDC intent
+                (issue #221). */
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS entry \"{}\" has no issuer. Only the native asset (XLM) \
+                     may be written without one; every other asset must be given as CODE:ISSUER.",
+                    asset.code
+                ));
             }
         }
         /* Stellar asset codes are not unique — anyone can issue `USDC`. Two
@@ -856,6 +868,35 @@ mod tests {
     }
 
     #[test]
+    fn validate_addresses_rejects_issuer_less_non_native() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: None,
+            },
+        ];
+        let err = cfg.validate_addresses().unwrap_err().to_string();
+        assert!(err.contains("no issuer"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+        assert!(err.contains("CODE:ISSUER"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_addresses_accepts_native_without_issuer() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        cfg.validate_addresses().unwrap();
+    }
+
+    #[test]
     fn validate_addresses_rejects_duplicate_asset_codes() {
         let mut cfg = sample_config();
         cfg.accepted_assets = vec![
@@ -1014,6 +1055,26 @@ mod tests {
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
                 );
                 assert_eq!(cfg.cors_allowed_origins, vec!["https://example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_when_accepted_assets_omits_a_non_native_issuer() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("testnet")),
+                (
+                    "WEBHOOK_SECRET",
+                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
+                ),
+                ("DATABASE_URL", Some("sqlite::memory:")),
+                ("ACCEPTED_ASSETS", Some("XLM,USDC")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("no issuer"), "got: {err}");
+                assert!(err.contains("USDC"), "got: {err}");
             },
         );
     }

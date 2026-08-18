@@ -93,6 +93,7 @@ async fn server_with_config_and_health(
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
         task_health,
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -531,7 +532,7 @@ async fn test_idempotency_key_returns_same_payment() {
 
     // Exactly one payment visible to this merchant.
     let list: Value = server
-        .get("/payments")
+        .get("/payments?include_total=true")
         .add_header("Authorization", auth)
         .await
         .json();
@@ -577,7 +578,7 @@ async fn test_different_or_missing_idempotency_key_creates_new_payment() {
     assert_ne!(id_b, id_c);
 
     let list: Value = server
-        .get("/payments")
+        .get("/payments?include_total=true")
         .add_header("Authorization", auth)
         .await
         .json();
@@ -654,14 +655,14 @@ async fn test_merchant_list_scoped_to_own_payments() {
 
     // Each merchant only sees their own payments.
     let list1: Value = server
-        .get("/payments")
+        .get("/payments?include_total=true")
         .add_header("Authorization", format!("Bearer {key1}"))
         .await
         .json();
     assert_eq!(list1["total"], 2, "merchant1 should see 2 payments");
 
     let list2: Value = server
-        .get("/payments")
+        .get("/payments?include_total=true")
         .add_header("Authorization", format!("Bearer {key2}"))
         .await
         .json();
@@ -1087,13 +1088,55 @@ async fn test_list_payments() {
     }
 
     let res = server
-        .get("/payments")
+        .get("/payments?include_total=true")
         .add_header("Authorization", auth)
         .await;
     res.assert_status_ok();
     let body: Value = res.json();
     assert_eq!(body["total"], 3);
     assert_eq!(body["payments"].as_array().unwrap().len(), 3);
+}
+
+/// `total` costs a full `COUNT(*)` scan (issue #320), so the default offset
+/// list must not compute — or send — it. The field must be entirely absent,
+/// not `null`: a caller that never asked for `total` should not be able to
+/// tell "not computed" apart from "computed as zero" if it only checks for
+/// nullness, so this checks the key itself is missing from the object.
+#[tokio::test]
+async fn test_list_payments_default_omits_total() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+
+    let res = server
+        .get("/payments")
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert!(
+        body.as_object().unwrap().get("total").is_none(),
+        "total must be entirely absent from the default response, got: {body}"
+    );
+
+    // include_total=false is likewise "don't compute it" — the default, made
+    // explicit — not merely "any falsy value is fine to include as null".
+    let res = server
+        .get("/payments?include_total=false")
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status_ok();
+    assert!(res
+        .json::<Value>()
+        .as_object()
+        .unwrap()
+        .get("total")
+        .is_none());
 }
 
 #[tokio::test]
@@ -1108,14 +1151,14 @@ async fn test_list_filter_by_status() {
         .await;
 
     let res = server
-        .get("/payments?status=completed")
+        .get("/payments?status=completed&include_total=true")
         .add_header("Authorization", auth.clone())
         .await;
     res.assert_status_ok();
     assert_eq!(res.json::<Value>()["total"], 0);
 
     let res = server
-        .get("/payments?status=pending")
+        .get("/payments?status=pending&include_total=true")
         .add_header("Authorization", auth)
         .await;
     assert_eq!(res.json::<Value>()["total"], 1);
@@ -1150,7 +1193,7 @@ async fn test_list_filters_by_underpaid_status() {
         .unwrap();
 
     let res = server
-        .get("/payments?status=underpaid")
+        .get("/payments?status=underpaid&include_total=true")
         .add_header("Authorization", auth)
         .await;
     res.assert_status_ok();
@@ -1216,7 +1259,7 @@ async fn test_filterable_statuses_match_producible_statuses() {
         }
 
         let res = server
-            .get(&format!("/payments?status={status}"))
+            .get(&format!("/payments?status={status}&include_total=true"))
             .add_header("Authorization", auth.clone())
             .await;
         res.assert_status_ok();

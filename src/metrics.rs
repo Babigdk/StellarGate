@@ -207,11 +207,80 @@ impl Default for AuthMetrics {
     }
 }
 
+/// Outcome counters for the Horizon poller's cycles, so throttling or
+/// sustained failure is a queryable fact on the `/metrics` scrape rather than
+/// only a `warn!` line indistinguishable from a one-off blip (issue #313).
+#[derive(Clone)]
+pub struct HorizonMetrics {
+    inner: Arc<HorizonMetricsInner>,
+}
+
+struct HorizonMetricsInner {
+    /// Cycles that completed without error (whether or not anything settled).
+    success: AtomicU64,
+    /// Cycles that failed on a `429`/`503` from Horizon.
+    rate_limited: AtomicU64,
+    /// Cycles that failed for any other reason.
+    error: AtomicU64,
+}
+
+impl Default for HorizonMetricsInner {
+    fn default() -> Self {
+        Self {
+            success: AtomicU64::new(0),
+            rate_limited: AtomicU64::new(0),
+            error: AtomicU64::new(0),
+        }
+    }
+}
+
+impl HorizonMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(HorizonMetricsInner::default()),
+        }
+    }
+
+    pub fn record_success(&self) {
+        self.inner.success.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_rate_limited(&self) {
+        self.inner.rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_error(&self) {
+        self.inner.error.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Snapshot accessors ────────────────────────────────────────────────
+
+    pub fn success(&self) -> u64 {
+        self.inner.success.load(Ordering::Relaxed)
+    }
+    pub fn rate_limited(&self) -> u64 {
+        self.inner.rate_limited.load(Ordering::Relaxed)
+    }
+    pub fn error(&self) -> u64 {
+        self.inner.error.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for HorizonMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery, auth outcome, and background-task metrics as a
-/// Prometheus-compatible plain-text snapshot. Called by `GET /metrics`.
-pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, tasks: &crate::TaskHealth) -> String {
+/// Render webhook delivery, auth outcome, background-task, and Horizon poll
+/// metrics as a Prometheus-compatible plain-text snapshot. Called by
+/// `GET /metrics`.
+pub fn render(
+    webhook: &WebhookMetrics,
+    auth: &AuthMetrics,
+    tasks: &crate::TaskHealth,
+    horizon: &HorizonMetrics,
+) -> String {
     let mut out = String::with_capacity(1024);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
@@ -368,6 +437,38 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, tasks: &crate::TaskH
             if snap.disabled_reason.is_some() { 1 } else { 0 }
         ));
     }
+
+    // stellargate_horizon_poll_cycles_total — counter vec by outcome (#313)
+    out.push_str(
+        "# HELP stellargate_horizon_poll_cycles_total Total Horizon poll cycles by outcome.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_poll_cycles_total counter\n");
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"success\"}} {}\n",
+        horizon.success()
+    ));
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"rate_limited\"}} {}\n",
+        horizon.rate_limited()
+    ));
+    out.push_str(&format!(
+        "stellargate_horizon_poll_cycles_total{{outcome=\"error\"}} {}\n",
+        horizon.error()
+    ));
+
+    /* Reuses TaskHealth's last-success timestamp rather than tracking a
+    second one: `note_success()` is already called at the end of every
+    successful `poll_once` (and by the stream listener), so it is already the
+    authoritative "on-chain detection last made progress" instant that
+    /ready's cursor-freshness check reads. */
+    out.push_str(
+        "# HELP stellargate_horizon_last_successful_poll_timestamp_seconds Unix timestamp of the last successful Horizon poll or stream event.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_last_successful_poll_timestamp_seconds gauge\n");
+    out.push_str(&format!(
+        "stellargate_horizon_last_successful_poll_timestamp_seconds {}\n",
+        tasks.last_success_unix()
+    ));
 
     out
 }

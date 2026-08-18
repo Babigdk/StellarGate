@@ -951,6 +951,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         &state.webhook_metrics,
         &state.auth_metrics,
         &state.task_health,
+        &state.horizon_metrics,
     );
     (
         StatusCode::OK,

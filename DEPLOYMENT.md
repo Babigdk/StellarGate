@@ -317,6 +317,74 @@ config change: the sqlx queries and migrations are SQLite-specific today.
 **Vertical scaling** is the supported lever — the free ARM shape goes to 4
 OCPUs and 24 GB, editable on a running instance.
 
+### Measured write-path ceiling
+
+The single-writer lock is the thing to reason about when asking "how much
+traffic can this take?" — every write this service makes (payment creation,
+settlement, webhook delivery bookkeeping, the throttled `last_used_at`
+refresh) serializes through it.
+
+`tests/write_throughput_bench.rs` (`cargo test --release --test
+write_throughput_bench -- --ignored --nocapture`) drives 16 concurrent tasks
+inserting payments back-to-back for 10 seconds against a file-backed SQLite
+pool opened with the exact PRAGMAs production uses (WAL, `synchronous =
+NORMAL`, the tuned `wal_autocheckpoint`/`journal_size_limit` above). On the
+2-vCPU CI/dev container this was measured on:
+
+```
+payments/sec = 4464.0  (completed=44721, errors=0, concurrency=16, elapsed=10.02s)
+```
+
+Read this as an **order-of-magnitude floor on the write path itself**, not an
+end-to-end request-handling SLA:
+
+- It measures `db::create_payment` directly — no HTTP, no JSON, no auth, no
+  rate limiting, and critically none of settlement's extra writes
+  (`processed_transactions` insert, the payment status `UPDATE`) or webhook
+  dispatch. A settled payment costs more write-lock time than a bare create.
+- It ran on 2 vCPUs in a shared CI environment. The target deployment (the
+  free-tier Oracle ARM shape referenced above) has more cores and dedicated
+  I/O; real numbers there will differ in either direction depending on disk
+  latency.
+- Zero errors at this concurrency and duration — `busy_timeout` absorbed
+  every lock wait without a caller-visible failure. That is the number that
+  would start degrading first under sustained overload: watch `SQLITE_BUSY`
+  errors surfacing as `500`s before watching raw throughput.
+
+Even generously discounting this for settlement/webhook overhead and slower
+disks, it is comfortably above the request volume a single small-VM
+deployment is expected to see. If your merchant volume approaches four
+figures of payment creations *per second*, sustained, this is the number to
+re-benchmark against your actual hardware before assuming headroom.
+
+### Why there is no Postgres backend yet
+
+Issue #321 asks for two things beyond the write-pressure reductions above:
+a database access layer that isn't SQLite-specific, and a Postgres backend
+(or a documented decision explaining why not). This is that decision.
+
+`src/db.rs` is SQLite-specific throughout — `strftime`, `pragma_table_info`,
+`INSERT OR IGNORE`, `sqlx::sqlite::SqliteRow` in `row_to_payment`, `PRAGMA`
+statements — not merely because nobody has abstracted it, but because
+`db::migrate` **is** the schema, applied as idempotent `CREATE TABLE IF NOT
+EXISTS` / `ALTER TABLE ... ADD COLUMN` statements re-run on every boot, with
+no schema-version table (issue #268). A repository trait behind which a
+Postgres implementation could live is a mechanical exercise; a *second*
+migration path that reaches the same schema on a database with different
+`ALTER TABLE` semantics, different upsert syntax, and no `pragma_table_info`
+introspection, re-derived by hand from the same ad hoc sequence, is not — it
+would need to be re-verified column-by-column against the SQLite path on
+every future schema change, indefinitely, which is exactly the kind of
+drift-prone duplication a real migration tool exists to prevent.
+
+Building that on top of the current schema mechanism would mean committing
+to maintain two hand-written schema definitions in lockstep, which is worse
+than the single SQLite-specific one that exists today. Issue #268 (a real,
+versioned migration tool) is the prerequisite this needs, and is planned as
+separate, prior work. Once it lands, a repository-trait abstraction and a
+Postgres implementation behind it become a scoped, independently reviewable
+change rather than one that has to solve schema versioning as a side effect.
+
 ---
 
 ## Other platforms

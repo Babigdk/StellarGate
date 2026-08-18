@@ -34,6 +34,37 @@ servers:
     description: Local development
 
 paths:
+  /:
+    get:
+      operationId: root
+      summary: Service root
+      description: >-
+        Content-negotiated on `Accept`, not User-Agent: a browser (`Accept:
+        text/html`) is redirected to the operator dashboard, and every other
+        caller — `fetch()`, `curl`, the dashboard's own version lookup, an
+        uptime check — gets the plain-text version string. This exists so a
+        hosting platform's "open in browser" link lands somewhere useful
+        instead of a bare line of text with no hint that a UI exists one path
+        away.
+      security: []
+      responses:
+        "200":
+          description: Not a browser request (or no Accept header) — plain-text version string
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: StellarGate API v0.1.0
+        "307":
+          description: >-
+            Browser request (`Accept` contains `text/html`) — temporary
+            redirect to /dashboard
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /dashboard
+
   /health:
     get:
       operationId: health
@@ -53,11 +84,250 @@ paths:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
 
-  # ---------------------------------------------------------------------------
-  # Canonical surface (/v1). Use these for all new integrations.
-  # ---------------------------------------------------------------------------
+  /ready:
+    get:
+      operationId: ready
+      summary: Readiness probe
+      description: >-
+        Distinct from /health: this is what an orchestrator's readiness probe
+        should target, not /health, which returns 200 unconditionally as long
+        as the process is up (#103). Returns 200 only when the database
+        responds AND (if a Horizon gateway is configured) Horizon is reachable
+        AND the payment-detection cursor has advanced recently. A pod that
+        cannot detect on-chain payments should not receive traffic even though
+        the process itself is alive.
+      security: []
+      responses:
+        "200":
+          description: Database reachable, and Horizon + cursor freshness checks pass (or no gateway is configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+        "503":
+          description: Not ready — the database is unreachable, Horizon is unreachable, or the detection cursor has stalled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyResponse"
+              examples:
+                database_unreachable:
+                  summary: Database unreachable
+                  value:
+                    status: unavailable
+                    reason: database unreachable
+                cursor_stalled:
+                  summary: Payment detection stalled
+                  value:
+                    status: unavailable
+                    reason: >-
+                      payment detection stalled: no successful poll or stream
+                      event in 900s (limit 300s)
 
-  /v1/payments:
+  /metrics:
+    get:
+      operationId: metrics
+      summary: Prometheus-compatible metrics snapshot
+      description: >-
+        Text-exposition-format counters and gauges covering webhook delivery,
+        authentication, and background task health. Currently unauthenticated
+        — see issue #250 for the access-control decision tracked against that.
+      security: []
+      responses:
+        "200":
+          description: Metrics snapshot
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+
+  /merchants:
+    post:
+      operationId: provisionMerchant
+      summary: Provision a new merchant
+      description: >-
+        There is no self-service signup; minting a merchant and its first
+        credential is an operator action gated by the X-Admin-Secret header.
+        The response's `api_key` is shown exactly once — the server stores
+        only a hash, so this is the only time the raw key is ever recoverable.
+        An unset ADMIN_PROVISIONING_SECRET disables this route entirely
+        (every request gets 401), rather than leaving it open.
+      security:
+        - adminSecret: []
+      responses:
+        "201":
+          description: Merchant provisioned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProvisionMerchantResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+
+  /merchants/{id}/keys:
+    post:
+      operationId: issueApiKey
+      summary: Issue an additional API key
+      description: >-
+        Rotation is issue-then-revoke, not replace-in-place: the new key is
+        live immediately while the old one keeps working, so a merchant can
+        deploy the new credential and never has a window with no valid key.
+        The response's `api_key` is shown exactly once, the same as
+        provisioning.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IssueKeyRequest"
+      responses:
+        "201":
+          description: Key issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IssueKeyResponse"
+        "400":
+          description: Label exceeds 100 characters, or the request body has an unrecognised field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_label:
+                  summary: Label too long
+                  value:
+                    error: label exceeds max length of 100 characters
+                    code: invalid_label
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No merchant with that ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+
+    get:
+      operationId: listApiKeys
+      summary: List a merchant's API keys
+      description: >-
+        Metadata only — never the secret, which is unrecoverable by design.
+        `prefix` is enough for an operator to identify which key to revoke.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The merchant's keys
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListApiKeysResponse"
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No merchant with that ID
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+
+  /merchants/{id}/keys/{key_id}:
+    delete:
+      operationId: revokeApiKey
+      summary: Revoke an API key
+      description: >-
+        Refuses to revoke a merchant's last active key — this API has no
+        self-service recovery, so that would turn a routine revocation into an
+        incident. Issue a replacement first.
+      security:
+        - adminSecret: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Merchant ID
+          schema:
+            type: string
+            format: uuid
+        - name: key_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevokeApiKeyResponse"
+        "400":
+          description: This is the merchant's only active key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                last_active_key:
+                  summary: Only active key
+                  value:
+                    error: >-
+                      cannot revoke a merchant's only active key — issue a
+                      replacement first
+                    code: last_active_key
+        "401":
+          $ref: "#/components/responses/AdminUnauthorized"
+        "404":
+          description: No such merchant, or no active key with that ID for this merchant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                merchant_not_found:
+                  summary: Merchant not found
+                  value:
+                    error: merchant not found
+                    code: merchant_not_found
+                key_not_found:
+                  summary: Key not found
+                  value:
+                    error: no active key with that id for this merchant
+                    code: key_not_found
+
+  /payments:
     post:
       operationId: createPayment
       summary: Create a payment intent
@@ -133,10 +403,43 @@ paths:
       security:
         - bearerAuth: []
       parameters:
-        - $ref: "#/components/parameters/StatusFilter"
-        - $ref: "#/components/parameters/LimitParam"
-        - $ref: "#/components/parameters/OffsetParam"
-        - $ref: "#/components/parameters/CursorParam"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/PaymentStatus"
+          description: Filter by status
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+          description: Rows to skip (offset pagination)
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
+        - name: include_total
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: >-
+            Offset pagination only; has no effect with cursor set. `total`
+            costs a full COUNT(*) scan over every matching row — SQLite has no
+            cached row count — so it is computed only when this is `true`,
+            and the `total` field is otherwise absent from the response
+            entirely (not `null`). Keyset (cursor) pagination is the
+            recommended approach and has never returned `total`.
       responses:
         "200":
           description: Paginated list of payments
@@ -688,6 +991,23 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
 
+    AdminUnauthorized:
+      description: >-
+        Missing, wrong, or unconfigured X-Admin-Secret. Uses the standard
+        error envelope with code `unauthorized`. An unset
+        ADMIN_PROVISIONING_SECRET produces this on every request rather than
+        leaving the route open.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing_or_invalid_admin_secret:
+              summary: Missing or invalid X-Admin-Secret
+              value:
+                error: missing or invalid admin secret
+                code: unauthorized
+
   schemas:
     HealthResponse:
       type: object
@@ -696,6 +1016,121 @@ components:
         status:
           type: string
           example: ok
+
+    ReadyResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        reason:
+          type: string
+          description: Present only when status is unavailable
+          example: database unreachable
+
+    ProvisionMerchantResponse:
+      type: object
+      required: [merchant_id, api_key, key_id]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        api_key:
+          type: string
+          example: sg_1a2b3c4d5e6f...
+          description: >-
+            Shown exactly once. The server persists only a hash, so this value
+            cannot be retrieved again through any endpoint — store it
+            immediately. If it's lost, issue a new key
+            (POST /merchants/{id}/keys) and revoke this one.
+        key_id:
+          type: string
+          format: uuid
+          description: ID of the API key created alongside the merchant
+
+    IssueKeyRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+          maxLength: 100
+          description: Optional free-text label to help identify this key later
+          example: rotation-2026-08
+
+    IssueKeyResponse:
+      type: object
+      required: [key_id, api_key]
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        api_key:
+          type: string
+          example: sg_9f8e7d6c5b4a...
+          description: >-
+            Shown exactly once, the same as POST /merchants — the server
+            persists only a hash, so this value cannot be retrieved again.
+        prefix:
+          type: string
+          description: First characters of the key, safe to display in a list
+          example: sg_9f8e7d6c
+        label:
+          type: string
+          nullable: true
+
+    ApiKeySummary:
+      type: object
+      required: [key_id, prefix, created_at, active]
+      description: A key as exposed to an operator. Never carries the secret.
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        prefix:
+          type: string
+          example: sg_9f8e7d6c
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        active:
+          type: boolean
+          description: true when revoked_at is null
+
+    ListApiKeysResponse:
+      type: object
+      required: [merchant_id, keys]
+      properties:
+        merchant_id:
+          type: string
+          format: uuid
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeySummary"
+
+    RevokeApiKeyResponse:
+      type: object
+      required: [key_id, revoked]
+      properties:
+        key_id:
+          type: string
+          format: uuid
+        revoked:
+          type: boolean
+          example: true
 
     PaymentStatus:
       type: string
@@ -808,7 +1243,12 @@ components:
             $ref: "#/components/schemas/Payment"
         total:
           type: integer
-          description: Total matching rows (offset pagination only)
+          description: >-
+            Total matching rows. Offset pagination only, and only present when
+            the request set `include_total=true` — computing it is a full
+            `COUNT(*)` scan, so it is opt-in rather than sent on every
+            request. Omitted from the response (not `null`) when not
+            requested.
         limit:
           type: integer
         offset:
@@ -884,6 +1324,7 @@ components:
             invalid_request, unknown_field, unsupported_asset, invalid_amount,
             invalid_webhook_url, invalid_status, invalid_cursor,
             payment_not_found, delivery_not_found, rate_limit_exceeded,
-            not_found, webhook_target_blocked, webhook_delivery_failed, and
-            idempotency_conflict.
+            not_found, webhook_target_blocked, webhook_delivery_failed,
+            idempotency_conflict, merchant_not_found, invalid_label,
+            last_active_key, and key_not_found.
           example: invalid_amount

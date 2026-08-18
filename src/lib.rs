@@ -296,6 +296,12 @@ impl TaskHealth {
     pub fn last_success_age_secs(&self) -> i64 {
         unix_now_secs().saturating_sub(self.inner.last_success_unix.load(Ordering::Relaxed))
     }
+
+    /// The raw Unix timestamp `note_success` last recorded (`0` if it never
+    /// has). Exposed as a gauge on `/metrics` (issue #313).
+    pub fn last_success_unix(&self) -> i64 {
+        self.inner.last_success_unix.load(Ordering::Relaxed)
+    }
 }
 
 /// Current Unix time in whole seconds.
@@ -328,6 +334,10 @@ pub struct AppState {
     /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
     /// clients are visible without grepping logs.
     pub auth_metrics: metrics::AuthMetrics,
+    /// Horizon poll cycle outcome counters: success/rate_limited/error.
+    /// Exposed via `GET /metrics` so sustained throttling is a queryable fact
+    /// rather than indistinguishable `warn!` lines (issue #313).
+    pub horizon_metrics: metrics::HorizonMetrics,
     /// Background task health: per-task liveness (drives `/health`), the last
     /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
     /// and started/stopped/failure/restart counts for monitoring and alerting.

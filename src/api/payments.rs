@@ -431,6 +431,12 @@ pub struct ListQuery {
     pub limit: Option<i64>,
     pub offset: Option<i64>,
     pub cursor: Option<String>,
+    /// Opt in to a `total` field on the offset-paginated response. Defaults to
+    /// omitted: SQLite has no cached row count, so computing it is a full
+    /// `COUNT(*)` scan over every matching row, on every request — including
+    /// the first page — for a field most callers never read (issue #320).
+    /// Has no effect in cursor (keyset) mode, which has never returned `total`.
+    pub include_total: Option<bool>,
 }
 
 const DEFAULT_LIMIT: i64 = 20;
@@ -496,7 +502,7 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
-        let (payments, total) = db::list_payments(
+        let payments = db::list_payments(
             &state.pool,
             &merchant_id,
             q.status.as_deref(),
@@ -518,13 +524,22 @@ pub async fn list(
             None
         };
 
-        Ok(Json(json!({
+        let mut body = json!({
             "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
-            "total": total,
             "limit": limit,
             "offset": offset,
             "next_cursor": next_cursor,
-        })))
+        });
+
+        // `total` costs a full COUNT(*) scan (issue #320) — computed only when
+        // asked for, and entirely absent from the response otherwise rather
+        // than sent as null, so a caller can tell "not computed" from "zero".
+        if q.include_total == Some(true) {
+            let total = db::count_payments(&state.pool, &merchant_id, q.status.as_deref()).await?;
+            body["total"] = json!(total);
+        }
+
+        Ok(Json(body))
     }
 }
 
@@ -697,11 +712,6 @@ pub async fn list_webhooks(
 }
 
 // ── Dead-letter view (issue #319) ────────────────────────────────────────────
-
-/// Delivery statuses worth filtering on, and therefore the only ones accepted.
-/// Same allow-list treatment as the payment `status` filter: anything else is a
-/// guaranteed-empty result and is rejected rather than silently returning none.
-const VALID_DELIVERY_STATUSES: [&str; 3] = ["failed", "pending", "delivered"];
 
 #[derive(Deserialize)]
 pub struct ListDeliveriesQuery {

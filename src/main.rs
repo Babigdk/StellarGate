@@ -12,7 +12,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, WebhookMetrics},
+    metrics::{AuthMetrics, HorizonMetrics, WebhookMetrics},
     retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
         webhook_http: http_client(Duration::from_secs(cfg.webhook_timeout_secs))?,
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
+        horizon_metrics: HorizonMetrics::new(),
         task_health: TaskHealth::new(),
         config: cfg,
     });
@@ -165,12 +166,31 @@ async fn main() -> Result<()> {
 
 /// Open the SQLite pool in WAL mode so a single writer and many readers can
 /// proceed concurrently.
+///
+/// `wal_autocheckpoint` and `journal_size_limit` are set explicitly rather
+/// than left at SQLite's compiled-in defaults (issue #274):
+///
+/// - `wal_autocheckpoint = 1000` (SQLite's own default, made explicit here
+///   as a documented choice rather than an inherited one) triggers a
+///   `PASSIVE` checkpoint after roughly 1000 pages (~4 MB at the default
+///   4 KiB page size) accumulate in the WAL following a commit.
+/// - `journal_size_limit = 67108864` (64 MiB) is the backstop `PASSIVE`
+///   checkpointing alone does not provide: a `PASSIVE` checkpoint skips
+///   rather than blocks when it cannot get the read lock it needs, so a
+///   long-lived reader can defer it indefinitely and let the WAL grow
+///   without bound under sustained write load. `journal_size_limit` caps
+///   how large the `-wal` file is allowed to grow before SQLite truncates
+///   it back down on the next checkpoint that *does* run, regardless of how
+///   much of the WAL that checkpoint actually flushed — so the on-disk
+///   footprint has a hard ceiling even when checkpoints are being starved.
 async fn open_pool(cfg: &Config) -> Result<db::Db> {
     let opts = SqliteConnectOptions::from_str(&cfg.database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms));
+        .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms))
+        .pragma("wal_autocheckpoint", "1000")
+        .pragma("journal_size_limit", "67108864");
 
     Ok(SqlitePoolOptions::new()
         .max_connections(cfg.db_pool_max_connections)

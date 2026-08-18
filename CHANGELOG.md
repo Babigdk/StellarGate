@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
+  (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
+  `verify()` treated that shape as native XLM — a customer could settle a USDC
+  invoice by sending XLM. Boot now refuses any non-`XLM` entry without an
+  issuer, and a native payment cannot settle a USDC intent even if that
+  misconfiguration is constructed by hand (issue #221).
+
 - **Background tasks report *why* they exited.** `spawn_task` counted a start,
   and counted a stop when the future returned — with no way to tell "returned
   because shutdown was signalled" from "returned early because something went
@@ -23,7 +30,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported once at boot and is terminal, and neither is confused with an
   ordinary stop (issue #317).
 
+- **`GET /payments` no longer runs a full `COUNT(*)` by default.** The offset
+  branch issued a second query — `SELECT COUNT(*) FROM payments WHERE
+  merchant_id = ?` (plus `AND status = ?` when filtering) — on every call,
+  purely to fill `total`. SQLite has no cached row count, so this scanned
+  every matching row every time, including the first page, for a field most
+  clients never read (they render "next page" from `next_cursor` alone).
+  `total` is now computed only when the request sets `?include_total=true`,
+  and is entirely absent from the response — not `null` — otherwise. Keyset
+  (cursor) pagination is unaffected; it has never returned `total` and
+  remains the recommended approach (issue #320).
+
 ### Added
+
+- **Explicit WAL checkpoint/growth tuning, a measured write-throughput
+  ceiling, and a documented decision on Postgres.** `wal_autocheckpoint` and
+  `journal_size_limit` are now set explicitly at pool-open time instead of
+  left at SQLite's compiled-in defaults — the latter caps on-disk `-wal` file
+  growth even when a long-lived reader defers `PASSIVE` checkpointing
+  indefinitely. `tests/write_throughput_bench.rs` (`--ignored`, not part of
+  CI) measures the single-writer path directly and DEPLOYMENT.md now states
+  the result plus why a Postgres backend isn't in this change: `db::migrate`
+  is a hand-written, unversioned schema (issue #268 is the prerequisite for a
+  second backend to track in lockstep without drifting) (issue #321).
 
 - **Expected-versus-live worker counts on `/health` and `/metrics`.** After boot
   there was no way to answer "how many workers should be running, and how many

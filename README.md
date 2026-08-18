@@ -240,7 +240,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_NETWORK` | `testnet` or `public` | `testnet` |
 | `STELLAR_HORIZON_URL` | Horizon endpoint | testnet Horizon |
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
-| `ACCEPTED_ASSETS` | Comma-separated. `CODE` for native (`XLM`) or `CODE:ISSUER` (`USDC:GA…`). Adding an asset is config-only — but see [Trustlines](#trustlines). Each issuer is strkey-validated at boot. Duplicate codes are refused: Stellar codes are not unique across issuers, and two entries sharing a code used to settle each other's intents (issue #222). | `XLM,USDC:<testnet issuer>` |
+| `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
 
 ### Trustlines
@@ -313,6 +313,16 @@ XLM free to cover one per asset.
 Intents are expired in bounded batches (`EXPIRY_BATCH_SIZE`) so a large
 backlog drains over several sweeps instead of one long write lock — SQLite has
 a single writer.
+
+A poll cycle that fails no longer retries at the fixed `POLL_INTERVAL_SECS`
+cadence that may have caused it. A `429`/`503` from Horizon backs off for at
+least the `Retry-After` it sends; any other failure, or a rate limit with no
+`Retry-After`, backs off exponentially with jitter (1s up to 120s), reset to
+`POLL_INTERVAL_SECS` by the next successful cycle. Each cycle's catch-up loop
+is also capped at 25 pages (5,000 records), so a backlog built up while
+throttled cannot immediately re-trip the same limit — it drains over
+subsequent cycles instead. See `stellargate_horizon_poll_cycles_total` under
+[Observability](#observability) to track this.
 
 ### Webhooks
 
@@ -826,6 +836,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | `limit` | Page size, 1–100 | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`) | `0` |
+| `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
 **`200 OK`** — cursor mode (no `cursor` parameter on the first request)
 
@@ -842,7 +853,6 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 ```json
 {
   "payments": [ { "id": "...", "status": "pending" } ],
-  "total": 42,
   "limit": 20,
   "offset": 0,
   "next_cursor": "3230..."
@@ -852,7 +862,30 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 Both modes order rows identically (`created_at DESC`, then `id DESC` to break
 the whole-second `created_at` ties), so a `next_cursor` returned by an offset
 page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
-of either mode. Offset mode additionally returns `total` and `offset`.
+of either mode. Offset mode additionally returns `offset`.
+
+> **`total` is opt-in (`?include_total=true`), not sent by default.** SQLite
+> has no cached row count, so computing `total` is a full `COUNT(*)` scan over
+> every matching row — on every list request, including the first page,
+> regardless of how deep into the results the caller actually looks. Most
+> clients render "next page" affordances from `next_cursor` alone and never
+> read `total`, so the default path no longer pays for it. Ask for it
+> explicitly when you need it:
+>
+> ```json
+> {
+>   "payments": [ { "id": "...", "status": "pending" } ],
+>   "total": 42,
+>   "limit": 20,
+>   "offset": 0,
+>   "next_cursor": "3230..."
+> }
+> ```
+>
+> `total` is entirely absent from the response (not `null`) when not
+> requested, so a client can tell "not computed" apart from "computed as
+> zero." Cursor mode has never returned `total` and `include_total` has no
+> effect there.
 
 > **Migration path.** Switch to cursor pagination by sending `cursor` instead
 > of `offset`. Start with a first request that carries **no** `cursor` and
@@ -1260,6 +1293,8 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_tasks_expected` | gauge | Workers this deployment expects to be running, excluding any disabled by configuration |
 | `stellargate_tasks_live` | gauge | Expected workers currently running |
 | `stellargate_task_disabled` | gauge | `1` if the named task exited because configuration gave it nothing to do |
+| `stellargate_horizon_poll_cycles_total` | counter | Horizon poll cycles, labelled by `outcome` (`success`, `rate_limited`, `error`) |
+| `stellargate_horizon_last_successful_poll_timestamp_seconds` | gauge | Unix timestamp of the last successful Horizon poll or stream event |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was
