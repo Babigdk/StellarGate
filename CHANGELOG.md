@@ -9,13 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`GET /payments?offset=…` had no upper bound.** SQLite implements `OFFSET`
-  by producing and discarding every skipped row, so a request like
-  `?offset=50000000` cost `O(offset)` and was answered anyway — a handful of
-  concurrent deep-offset requests could saturate the database that also
-  serves settlement writes. `offset` is now capped at `10000`; requests above
-  it get `400 invalid_offset` naming the limit and pointing at cursor
-  pagination, which is `O(log n)` regardless of depth (issue #303).
+- **`openapi.yaml`'s `POST /payments` operation didn't say where the merchant
+  comes from.** `CreatePaymentRequest` already had no `merchant_id` property
+  (and already rejected one with `400 unknown_field`), but the operation
+  itself carried no `description` saying so — a reader of the spec alone had
+  no way to know tenancy is derived from the bearer token. Added an operation
+  `description`, and a test (`tests/openapi_drift_tests.rs`) that locks the
+  spec's `CreatePaymentRequest` properties to the Rust struct's fields
+  field-for-field, so the two cannot silently drift apart again the way they
+  did when `merchant_id` was still documented there (issue #307).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
