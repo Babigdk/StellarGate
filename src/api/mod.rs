@@ -314,7 +314,13 @@ async fn require_admin_secret(
 /// Requires the `X-Admin-Secret` header (see `require_admin_secret`).
 async fn provision_merchant(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let source_ip =
+        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+    let req_id = request_id(&headers);
+
     let merchant_id = uuid::Uuid::new_v4().to_string();
     let (raw_key, prefix) = db::generate_api_key();
 
@@ -329,6 +335,23 @@ async fn provision_merchant(
                 Json(json!({ "error": "internal server error", "code": "internal_error" })),
             )
         })?;
+
+    /* Successful provisioning is the single most privileged operation in the
+    system — it mints a credential — and previously left no trace at all
+    while a *failed* one did (issue #305). `audit = true` lets this be routed
+    to a separate sink from ordinary operational logs; see the "Audit events"
+    section of the README for the full field schema. */
+    tracing::info!(
+        audit = true,
+        action = "merchant.provision",
+        actor = "admin",
+        outcome = "created",
+        %merchant_id,
+        %key_id,
+        source_ip = %source_ip,
+        request_id = %req_id,
+        "merchant provisioned"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -349,6 +372,8 @@ async fn provision_merchant(
 async fn issue_api_key(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     OptionalJsonBody(body): OptionalJsonBody<IssueKeyRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
@@ -378,7 +403,19 @@ async fn issue_api_key(
     )
     .await?;
 
-    tracing::info!(%merchant_id, %key_id, "api key issued");
+    let source_ip =
+        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+    tracing::info!(
+        audit = true,
+        action = "api_key.issue",
+        actor = "admin",
+        outcome = "issued",
+        %merchant_id,
+        %key_id,
+        source_ip = %source_ip,
+        request_id = %request_id(&headers),
+        "api key issued"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -430,6 +467,8 @@ async fn list_api_keys(
 async fn revoke_api_key(
     State(state): State<Arc<AppState>>,
     Path((merchant_id, key_id)): Path<(String, String)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -452,7 +491,19 @@ async fn revoke_api_key(
         ));
     }
 
-    tracing::warn!(%merchant_id, %key_id, "api key revoked");
+    let source_ip =
+        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+    tracing::warn!(
+        audit = true,
+        action = "api_key.revoke",
+        actor = "admin",
+        outcome = "revoked",
+        %merchant_id,
+        %key_id,
+        source_ip = %source_ip,
+        request_id = %request_id(&headers),
+        "api key revoked"
+    );
     Ok((
         StatusCode::OK,
         Json(json!({ "key_id": key_id, "revoked": true })),
@@ -653,7 +704,23 @@ const CLIENT_IP_UNKNOWN: &str = "unknown";
 /// - No peer address available: fail closed to a single shared key
 ///   ([`CLIENT_IP_UNKNOWN`]) with a one-time warning, regardless of headers.
 fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
-    let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<SocketAddr>>() else {
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr);
+    client_ip_key_from_parts(peer, req.headers(), trusted_proxies)
+}
+
+/// The part of [`client_ip_key`] that doesn't need a whole [`Request`] —
+/// split out so handlers that only have a [`ConnectInfo`] extractor and a
+/// [`HeaderMap`] (rather than the raw request) can compute the same
+/// attributed source IP for audit logging (issue #305).
+pub(crate) fn client_ip_key_from_parts(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[IpNet],
+) -> String {
+    let Some(addr) = peer else {
         warn_missing_connect_info_once();
         return CLIENT_IP_UNKNOWN.to_string();
     };
@@ -667,11 +734,7 @@ fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
 
     // Trusted peer: walk X-Forwarded-For from the rightmost hop, skipping hops
     // that are themselves trusted proxies, and take the first remaining value.
-    if let Some(value) = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         for hop in value.split(',').map(str::trim).rev() {
             if hop.is_empty() {
                 continue;
@@ -691,7 +754,7 @@ fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
 
     // No X-Forwarded-For, or every hop was a trusted proxy: fall back to the
     // single-value X-Real-IP header, also gated on the trusted peer.
-    if let Some(value) = req.headers().get("x-real-ip").and_then(|v| v.to_str().ok()) {
+    if let Some(value) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
         if let Ok(ip) = value.trim().parse::<IpAddr>() {
             if !trusted_proxies.iter().any(|net| net.contains(&ip)) {
                 return ip.to_string();
@@ -700,6 +763,18 @@ fn client_ip_key(req: &Request, trusted_proxies: &[IpNet]) -> String {
     }
 
     peer_ip.to_string()
+}
+
+/// Extracts `X-Request-Id`, set on every request by `SetRequestIdLayer`
+/// before it reaches a handler. Falls back to `"-"` for the (untestable in
+/// production, but real in unit tests that call a handler directly) case
+/// where the layer didn't run.
+pub(crate) fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("-")
+        .to_string()
 }
 
 /// Warn once (per process) when a request has no peer address, i.e. the router

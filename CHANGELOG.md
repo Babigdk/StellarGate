@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Audit events for every state-changing operation.** Authentication
+  outcomes and key issuance/revocation were already logged with
+  `merchant_id`/`source_ip`, but payment creation, webhook redelivery
+  (single and bulk), and merchant provisioning logged nothing — and
+  provisioning, the one action that mints a credential, logged only its
+  *failures*. Each now emits a structured `tracing` event carrying a stable
+  `audit = true` marker plus `action`, `actor` (`merchant`/`admin`),
+  `merchant_id`, `source_ip`, `request_id`, `outcome`, and the affected
+  resource id, documented in a new "Audit events" section of the README.
+  `client_ip_key` (the fail-closed IP attribution already used for rate
+  limiting and auth logs) is now reusable from any handler via
+  `client_ip_key_from_parts`, so every audit event uses the same source
+  attribution as everything else (issue #305).
+
 ### Fixed
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`

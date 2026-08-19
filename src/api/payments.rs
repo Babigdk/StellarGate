@@ -1,13 +1,14 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{Extension, FromRequest, Path, Query, Request, State},
+    extract::{ConnectInfo, Extension, FromRequest, Path, Query, Request, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -193,6 +194,7 @@ fn default_asset() -> String {
 pub async fn create(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     JsonBody(body): JsonBody<CreatePaymentRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
@@ -353,6 +355,30 @@ pub async fn create(
         },
     )
     .await?;
+
+    /* A merchant disputing a charge, or investigating a burst of unexpected
+    intents, starts from "which merchant created this and from where" — which
+    previously had no answer in the logs at all (issue #305). `audit = true`
+    lets this be routed to a separate sink from ordinary operational logs;
+    see the "Audit events" section of the README for the full field schema. */
+    let source_ip = crate::api::client_ip_key_from_parts(
+        Some(peer),
+        &headers,
+        &state.config.trusted_proxy_cidrs,
+    );
+    tracing::info!(
+        audit = true,
+        action = "payment.create",
+        actor = "merchant",
+        outcome = "created",
+        %merchant_id,
+        payment_id = %payment.id,
+        amount = %payment.amount,
+        asset = %payment.asset,
+        source_ip = %source_ip,
+        request_id = %crate::api::request_id(&headers),
+        "payment created"
+    );
 
     Ok((StatusCode::CREATED, Json(to_json(&payment))))
 }
@@ -809,6 +835,8 @@ const MAX_BULK_DELIVERY_IDS: usize = 100;
 pub async fn redeliver_webhooks_bulk(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     OptionalJsonBody(body): OptionalJsonBody<RedeliverBulkRequest>,
 ) -> Result<Json<Value>, AppError> {
     let ids = body.and_then(|b| b.delivery_ids).unwrap_or_default();
@@ -823,7 +851,22 @@ pub async fn redeliver_webhooks_bulk(
     }
 
     let requeued = db::requeue_failed_deliveries(&state.pool, &merchant_id, &ids).await?;
-    tracing::info!(%merchant_id, requeued, "failed webhook deliveries requeued for redrive");
+    let source_ip = crate::api::client_ip_key_from_parts(
+        Some(peer),
+        &headers,
+        &state.config.trusted_proxy_cidrs,
+    );
+    tracing::info!(
+        audit = true,
+        action = "webhook.redeliver_bulk",
+        actor = "merchant",
+        outcome = "requeued",
+        %merchant_id,
+        requeued,
+        source_ip = %source_ip,
+        request_id = %crate::api::request_id(&headers),
+        "failed webhook deliveries requeued for redrive"
+    );
 
     Ok(Json(json!({
         "requeued": requeued,
@@ -853,6 +896,8 @@ pub async fn redeliver_webhook(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path((payment_id, delivery_id)): Path<(String, String)>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, AppError> {
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one.
@@ -929,6 +974,28 @@ pub async fn redeliver_webhook(
 
     db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
         .await?;
+
+    /* A burst of redeliveries previously had no attributable origin in the
+    logs at all (issue #305). Logged regardless of outcome — `outcome` here
+    is the delivery result, not whether the redelivery *request* succeeded;
+    the request itself always reached this point. */
+    let source_ip = crate::api::client_ip_key_from_parts(
+        Some(peer),
+        &headers,
+        &state.config.trusted_proxy_cidrs,
+    );
+    tracing::info!(
+        audit = true,
+        action = "webhook.redeliver",
+        actor = "merchant",
+        outcome = %new_status,
+        %merchant_id,
+        payment_id = %payment_id,
+        delivery_id = %delivery_id,
+        source_ip = %source_ip,
+        request_id = %crate::api::request_id(&headers),
+        "webhook redelivery triggered"
+    );
 
     if new_status == "delivered" {
         Ok(StatusCode::OK)
