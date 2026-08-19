@@ -289,6 +289,16 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    /// How long (seconds) the Horizon SSE stream listener may go without
+    /// receiving any bytes before it treats the connection as dead and
+    /// reconnects. Horizon sends periodic keep-alive comment lines on its SSE
+    /// endpoints, so an idle window is a reliable liveness signal — without
+    /// it, a half-open connection (a NAT or load balancer dropping idle state
+    /// without sending `RST`, or an upstream stall) leaves `stream.next()`
+    /// waiting forever, silently degrading detection to the interval poller's
+    /// cadence with no log line and no metric (issue #312). Defaults to 30
+    /// seconds.
+    pub stream_idle_timeout_secs: u64,
     /// CIDR blocks whose `X-Forwarded-For` / `X-Real-IP` headers are honoured
     /// for rate-limit bucketing and auth-log source attribution (issue #330).
     ///
@@ -408,6 +418,7 @@ impl Config {
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
+            stream_idle_timeout_secs: parse_env("STREAM_IDLE_TIMEOUT_SECS", 30)?,
             trusted_proxy_cidrs: parse_cidrs(
                 &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
             )?,
@@ -627,6 +638,14 @@ impl Config {
             ));
         }
 
+        if self.stream_idle_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would make the stream listener reconnect \
+                 continuously instead of tolerating any gap between events."
+            ));
+        }
+
         if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
             return Err(anyhow::anyhow!(
                 "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
@@ -776,6 +795,7 @@ impl std::fmt::Debug for Config {
             )
             .field("admin_provisioning_secret", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("stream_idle_timeout_secs", &self.stream_idle_timeout_secs)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("max_payment_amount", &self.max_payment_amount)
             .field("min_payment_amount", &self.min_payment_amount)
@@ -872,6 +892,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
             max_payment_amount: AmountLimit::default(),
             min_payment_amount: AmountLimit::default(),
@@ -954,6 +975,7 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
             max_payment_amount: AmountLimit::default(),
             min_payment_amount: AmountLimit::default(),
@@ -1399,6 +1421,14 @@ mod tests {
         cfg.poll_interval_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_stream_idle_timeout() {
+        let mut cfg = timing_config();
+        cfg.stream_idle_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
     }
 
     #[test]

@@ -422,47 +422,142 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
     Ok(missing.iter().map(|a| a.code.clone()).collect())
 }
 
+/// How many pages [`starting_cursor`] will walk backward, at most, while
+/// searching for a baseline that covers every currently open intent (issue
+/// #311). Bounds the worst case — an account with a large payment history and
+/// an old open intent — to a fixed number of Horizon requests at boot rather
+/// than an unbounded backward scan. `MAX_BASELINE_PAGES * PAGE_LIMIT` (5,000
+/// records) is the same order of magnitude as [`MAX_PAGES_PER_CYCLE`]'s
+/// per-cycle budget.
+const MAX_BASELINE_PAGES: usize = 25;
+
 /// Resolve the cursor this cycle should start paging from.
 ///
-/// On the very first run (no persisted cursor) we baseline at the account's
-/// most recent payment so we don't replay its entire history; from then on we
-/// resume from the saved token. If the account has no payments yet, we start
-/// from `"0"` so the first payment that ever arrives is still captured.
+/// From the second run onward this simply resumes from the saved token. On
+/// the very first run (no persisted cursor) it deliberately baselines with
+/// overlap rather than adopting the account's single most recent payment
+/// exactly, which used to skip two kinds of payment silently:
+///
+/// - **Reused account.** Pointing a fresh instance at an account that already
+///   received payments — a redeploy after losing the volume, a migration
+///   between hosts — would adopt whatever the account's newest payment
+///   happened to be as the floor, hiding every payment for an intent created
+///   before that point even though it is still open.
+/// - **Startup race.** A payment that lands between Horizon answering the
+///   baselining query and the first forward poll can sort at or below the
+///   single-record baseline (e.g. read-replica lag on Horizon's side), and
+///   was silently skipped.
+///
+/// Neither produces an error: the intent just stays `pending` until the
+/// sweeper expires it, with no record connecting the customer's on-chain
+/// payment to anything. Re-processing an already-settled transaction is a
+/// no-op through `processed_transactions` (issue #78), so the cost of
+/// over-scanning is a few wasted queries — cheap insurance against silently
+/// under-scanning.
+///
+/// The baseline is chosen by paging backward (`order=desc`) from the tip
+/// until the oldest record seen is older than every currently open intent's
+/// `created_at` (a payment cannot be relevant to an intent it predates), or
+/// until [`MAX_BASELINE_PAGES`] is reached, or until Horizon has no more
+/// history. When nothing is currently open (a genuinely fresh deployment),
+/// one page of backward overlap is taken anyway, purely to cover the startup
+/// race. If the account has no payments at all, baselining starts from `"0"`
+/// so the first payment that ever arrives is still captured.
 async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
     if let Some(cursor) = db::get_state(&state.pool, PAYMENT_CURSOR_KEY).await? {
         return Ok(cursor);
     }
 
-    let url = format!(
-        "{}/accounts/{}/payments?order=desc&limit=1",
-        state.config.horizon_url.trim_end_matches('/'),
-        state.config.gateway_public,
-    );
-    let page: PaymentsPage = state
-        .http
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
+    /* `list_pending` returns oldest-first, so the first row (if any) is the
+    earliest `created_at` we must not scan past. A payment settling this
+    intent cannot have landed before the intent existed. */
+    let earliest_open = db::list_pending(&state.pool)
         .await?
-        .error_for_status()?
-        .json()
-        .await?;
+        .into_iter()
+        .next()
+        .map(|p| p.created_at);
 
-    match page
-        .embedded
-        .records
-        .first()
-        .and_then(|p| p.paging_token.clone())
-    {
-        Some(token) => {
-            /* Persist immediately so a crash before the first page still leaves
-            us baselined rather than replaying history next time. */
-            db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
-            info!(cursor = %token, "Horizon poller baselined at latest payment");
-            Ok(token)
+    let mut next_cursor: Option<String> = None;
+    let mut skipped = 0usize;
+    let mut pages = 0usize;
+
+    let token = loop {
+        let url = format!(
+            "{}/accounts/{}/payments?order=desc&limit={}{}",
+            state.config.horizon_url.trim_end_matches('/'),
+            state.config.gateway_public,
+            PAGE_LIMIT,
+            next_cursor
+                .as_ref()
+                .map(|c| format!("&cursor={c}"))
+                .unwrap_or_default(),
+        );
+        let page: PaymentsPage = state
+            .http
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        pages += 1;
+
+        let Some(oldest) = page.embedded.records.last() else {
+            /* Horizon has no more history behind us — we have walked all the
+            way back to the account's first-ever payment (or it has none at
+            all). Either way, "0" is the maximally safe baseline: nothing is
+            skipped, at the cost of a full replay on the next forward poll. */
+            return Ok("0".to_string());
+        };
+        skipped += page.embedded.records.len();
+        let token = oldest.paging_token.clone().unwrap_or_default();
+        next_cursor = Some(token.clone());
+
+        let covers_every_open_intent = match &earliest_open {
+            // Nothing open yet — one page of overlap is enough to cover the
+            // startup race; there is no older business state to protect.
+            None => true,
+            /* Strictly older, not `<=`: the boundary record itself must be
+            excluded from "covered", because the persisted cursor becomes the
+            *exclusive* start of the next forward poll. Stopping at `<=` could
+            land the cursor exactly on (or after) the earliest open intent's
+            creation instant and exclude a payment that landed in the same
+            instant — reintroducing the exact race this baselining exists to
+            close. An unparseable or absent `created_at` is treated as "not
+            proven older" so the walk keeps going rather than risk stopping
+            too early. */
+            Some(earliest) => oldest
+                .created_at
+                .as_deref()
+                .map(|ts| ts < earliest.as_str())
+                .unwrap_or(false),
+        };
+
+        if covers_every_open_intent {
+            break token;
         }
-        None => Ok("0".to_string()),
-    }
+        if pages >= MAX_BASELINE_PAGES {
+            warn!(
+                pages,
+                skipped_records = skipped,
+                "Horizon baseline walk hit its page cap before clearing every open \
+                 intent's creation time; baselining with the overlap found so far"
+            );
+            break token;
+        }
+    };
+
+    /* Persist immediately so a crash right after this scan still leaves us
+    baselined rather than repeating a potentially multi-page walk next time. */
+    db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &token).await?;
+    info!(
+        cursor = %token,
+        skipped_records = skipped,
+        pages,
+        "Horizon poller baselined with overlap"
+    );
+    Ok(token)
 }
 
 /// Requests a single `poll_once` call will issue before yielding back to the
@@ -863,11 +958,23 @@ pub async fn run_stream_listener(
     let mut backoff = base_backoff;
     // Start at the live edge; subsequent reconnects resume from the last event.
     let mut cursor = "now".to_string();
+    let idle_timeout = Duration::from_secs(state.config.stream_idle_timeout_secs);
+    let mut first_connection = true;
 
     loop {
+        if !first_connection {
+            /* Every pass through the loop body after the first is a reconnect —
+            whether the previous connection closed cleanly, errored, or (issue
+            #312) went idle past `idle_timeout` with no error at all. A
+            persistently-reconnecting stream is the alertable signal that a
+            half-open connection keeps disabling live payment detection. */
+            state.horizon_metrics.record_stream_reconnect();
+        }
+        first_connection = false;
+
         let cursor_before = cursor.clone();
         tokio::select! {
-            result = stream_once(&state, &client, &mut cursor) => {
+            result = stream_once(&state, &client, &mut cursor, idle_timeout) => {
                 match result {
                     Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
                     Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
@@ -894,12 +1001,25 @@ pub async fn run_stream_listener(
     }
 }
 
-/// Open one SSE connection and process events until the stream ends or errors.
-/// Advances `cursor` to the latest event `id` so a reconnect resumes cleanly.
+/// Open one SSE connection and process events until the stream ends, errors,
+/// or goes `idle_timeout` without delivering a single byte. Advances `cursor`
+/// to the latest event `id` so a reconnect resumes cleanly.
+///
+/// The dedicated stream client (built by [`run_stream_listener`]) carries no
+/// overall request timeout — the connection is meant to live indefinitely —
+/// so nothing else bounds a half-open socket that stops delivering bytes
+/// without closing: a NAT or load balancer dropping idle state without
+/// sending `RST`, or an upstream stall. Horizon sends periodic keep-alive
+/// comment lines on its SSE endpoints, so an idle window with no bytes at all
+/// is a reliable liveness signal (issue #312): every await on the next chunk
+/// is itself bounded by `idle_timeout`, and running past it is reported as an
+/// error so the caller's existing reconnect-with-backoff path picks it up
+/// exactly as it would a dropped connection.
 async fn stream_once(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     cursor: &mut String,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/accounts/{}/payments?cursor={}&join=transactions",
@@ -920,8 +1040,18 @@ async fn stream_once(
     split across chunk boundaries are never corrupted. */
     let mut buf: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
-        buf.extend_from_slice(&chunk?);
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "no data received on Horizon stream for {idle_timeout:?}; \
+                     treating the connection as dead"
+                ));
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk?,
+        };
+        buf.extend_from_slice(&chunk);
 
         /* Dispatch every complete event (terminated by a blank line) in the
         buffer, leaving any partial trailing event for the next chunk. */

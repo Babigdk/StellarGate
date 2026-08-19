@@ -222,6 +222,11 @@ struct HorizonMetricsInner {
     rate_limited: AtomicU64,
     /// Cycles that failed for any other reason.
     error: AtomicU64,
+    /// Times the SSE stream listener reconnected — a closed connection, an
+    /// HTTP error, or (issue #312) an idle timeout with no error at all. A
+    /// persistently-reconnecting stream is the alertable signal that a
+    /// half-open connection is repeatedly disabling live payment detection.
+    stream_reconnects: AtomicU64,
 }
 
 impl Default for HorizonMetricsInner {
@@ -230,6 +235,7 @@ impl Default for HorizonMetricsInner {
             success: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             error: AtomicU64::new(0),
+            stream_reconnects: AtomicU64::new(0),
         }
     }
 }
@@ -250,6 +256,9 @@ impl HorizonMetrics {
     pub fn record_error(&self) {
         self.inner.error.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_stream_reconnect(&self) {
+        self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
+    }
 
     // ── Snapshot accessors ────────────────────────────────────────────────
 
@@ -261,6 +270,9 @@ impl HorizonMetrics {
     }
     pub fn error(&self) -> u64 {
         self.inner.error.load(Ordering::Relaxed)
+    }
+    pub fn stream_reconnects(&self) -> u64 {
+        self.inner.stream_reconnects.load(Ordering::Relaxed)
     }
 }
 
@@ -454,6 +466,16 @@ pub fn render(
     out.push_str(&format!(
         "stellargate_horizon_poll_cycles_total{{outcome=\"error\"}} {}\n",
         horizon.error()
+    ));
+
+    // stellargate_horizon_stream_reconnects_total — counter (#312)
+    out.push_str(
+        "# HELP stellargate_horizon_stream_reconnects_total Total times the Horizon SSE stream listener reconnected.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_stream_reconnects_total counter\n");
+    out.push_str(&format!(
+        "stellargate_horizon_stream_reconnects_total {}\n",
+        horizon.stream_reconnects()
     ));
 
     /* Reuses TaskHealth's last-success timestamp rather than tracking a

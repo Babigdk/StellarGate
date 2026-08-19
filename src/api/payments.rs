@@ -477,6 +477,11 @@ pub struct ListQuery {
 
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
+/// Offset pagination is `O(offset)` in SQLite — it produces and discards
+/// every skipped row. This ceiling (generous for any real UI) keeps a deep,
+/// expensive scan-and-skip from being answered at all; the keyset (`cursor`)
+/// path stays `O(log n)` regardless of depth (issue #303).
+const MAX_OFFSET: i64 = 10_000;
 /// Statuses a payment can actually hold, and therefore the only ones worth
 /// filtering on: `pending` at creation, `completed`/`underpaid` from
 /// settlement (`horizon::settle`), and `expired` from the TTL sweeper
@@ -538,6 +543,15 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
+        if offset > MAX_OFFSET {
+            return Err(AppError::bad_request(
+                "invalid_offset",
+                format!(
+                    "offset exceeds maximum of {MAX_OFFSET}; use cursor pagination instead \
+                     (see the `cursor` parameter and `next_cursor` in the response)"
+                ),
+            ));
+        }
         let payments = db::list_payments(
             &state.pool,
             &merchant_id,
@@ -583,10 +597,28 @@ fn encode_cursor(ts: &str, id: &str) -> String {
     hex::encode(format!("{ts}\t{id}"))
 }
 
+/// A legitimate cursor is the hex encoding of `"{rfc3339}\t{uuid}"` — 57
+/// bytes, so 114 hex characters. This ceiling is deliberately generous, not
+/// tight, so it rejects only what could not possibly be a real cursor.
+const MAX_CURSOR_HEX_LEN: usize = 256;
+
 fn decode_cursor(raw: &str) -> Option<(String, String)> {
-    let bytes = hex::decode(raw).ok()?;
-    let s = String::from_utf8(bytes).ok()?;
+    // Cheap rejections first: an oversized or non-hex string is rejected
+    // before it is ever allocated or decoded (issue #304).
+    if raw.len() > MAX_CURSOR_HEX_LEN || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let s = String::from_utf8(hex::decode(raw).ok()?).ok()?;
     let (ts, id) = s.split_once('\t')?;
+    /* Both halves have known shapes — validate rather than trusting them.
+    `ts` is always `strftime('%Y-%m-%dT%H:%M:%SZ', ...)`, exactly 20 bytes.
+    `id` is a payment or webhook-delivery primary key: always non-empty and,
+    in practice, a UUID — but this helper backs cursors over both tables, and
+    nothing schema-enforces UUID shape on either, so a bounded length check is
+    the strongest assumption that holds for every caller. */
+    if ts.len() != 20 || id.is_empty() || id.len() > 64 {
+        return None;
+    }
     Some((ts.to_string(), id.to_string()))
 }
 
@@ -974,5 +1006,70 @@ pub async fn redeliver_webhook(
             "webhook_delivery_failed",
             "webhook delivery failed",
         ))
+    }
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    /// A cursor minted by `encode_cursor` must always decode back to the same
+    /// `(timestamp, id)` pair (issue #304).
+    #[test]
+    fn decode_cursor_round_trips_encode_cursor() {
+        let ts = "2026-01-01T00:00:00Z";
+        let id = Uuid::new_v4().to_string();
+        let cursor = encode_cursor(ts, &id);
+        assert_eq!(decode_cursor(&cursor), Some((ts.to_string(), id)));
+    }
+
+    #[test]
+    fn decode_cursor_rejects_oversized_input() {
+        let huge = "a".repeat(MAX_CURSOR_HEX_LEN + 1);
+        assert_eq!(decode_cursor(&huge), None);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_non_hex_input() {
+        assert_eq!(decode_cursor("not-valid-hex!!"), None);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_malformed_timestamp() {
+        // Valid hex, valid UTF-8, valid UUID — but the timestamp half is the
+        // wrong length.
+        let id = Uuid::new_v4().to_string();
+        let cursor = encode_cursor("2026-01-01", &id);
+        assert_eq!(decode_cursor(&cursor), None);
+    }
+
+    #[test]
+    fn decode_cursor_accepts_non_uuid_ids() {
+        // Webhook-delivery cursors share this helper, and delivery ids are
+        // not schema-enforced to be UUIDs (test fixtures use short ids like
+        // "delivery-1") — only a bounded length is required.
+        let cursor = encode_cursor("2026-01-01T00:00:00Z", "delivery-1");
+        assert_eq!(
+            decode_cursor(&cursor),
+            Some(("2026-01-01T00:00:00Z".to_string(), "delivery-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn decode_cursor_rejects_empty_id() {
+        let cursor = encode_cursor("2026-01-01T00:00:00Z", "");
+        assert_eq!(decode_cursor(&cursor), None);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_oversized_id() {
+        let cursor = encode_cursor("2026-01-01T00:00:00Z", &"x".repeat(65));
+        assert_eq!(decode_cursor(&cursor), None);
+    }
+
+    #[test]
+    fn decode_cursor_rejects_missing_separator() {
+        let cursor = hex::encode("no-tab-in-here");
+        assert_eq!(decode_cursor(&cursor), None);
     }
 }

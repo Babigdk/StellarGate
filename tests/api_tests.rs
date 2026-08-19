@@ -54,6 +54,7 @@ fn make_config() -> Config {
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
         max_payment_amount: Default::default(),
         min_payment_amount: Default::default(),
@@ -1546,6 +1547,39 @@ async fn test_list_cursor_invalid() {
         .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+/// Regression for #303: `offset` beyond the documented ceiling must be
+/// rejected rather than answered with a full scan-and-skip.
+#[tokio::test]
+async fn test_list_offset_above_max_is_rejected() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?offset=10001")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "invalid_offset");
+    assert!(
+        body["error"].as_str().unwrap().contains("cursor"),
+        "error message should point callers at cursor pagination, got: {}",
+        body["error"]
+    );
+}
+
+/// The ceiling itself must still be answered normally — only values *above*
+/// it are rejected.
+#[tokio::test]
+async fn test_list_offset_at_max_is_accepted() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?offset=10000")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::OK);
 }
 
 #[tokio::test]
