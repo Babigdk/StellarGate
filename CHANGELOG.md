@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`decode_cursor` hex-decoded an arbitrary-length string before validating
+  it.** A legitimate cursor is 114 hex characters; nothing enforced that, so
+  a caller could force a multi-kilobyte hex-decode-plus-UTF-8-validate on an
+  authenticated endpoint by sending an oversized `cursor`. Cheap checks
+  (length, hex-only) now run before any allocation, and the decoded
+  timestamp/id are shape-validated rather than merely split (issue #304).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

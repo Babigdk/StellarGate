@@ -1446,6 +1446,21 @@ async fn test_list_cursor_invalid() {
     res.assert_status(StatusCode::BAD_REQUEST);
 }
 
+/// Regression for #304: an oversized cursor must be rejected the same way a
+/// malformed one is, with `400 invalid_cursor` — not accepted for decoding.
+#[tokio::test]
+async fn test_list_cursor_oversized_is_rejected() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let oversized = "a".repeat(1024);
+    let res = server
+        .get(&format!("/payments?cursor={oversized}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
+}
+
 #[tokio::test]
 async fn test_unknown_route_returns_json_404() {
     let res = test_server().await.get("/nope").await;
