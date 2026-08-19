@@ -1180,26 +1180,57 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | Event | Fired when |
 |---|---|
 | `payment.completed` | Cumulative received equals the requested amount |
-| `payment.overpaid` | Cumulative received exceeds it (`delta` = excess) |
-| `payment.underpaid` | Payment received but short (`delta` = shortfall) |
+| `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
+| `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+
+### Payload detail
+
+`WEBHOOK_PAYLOAD_DETAIL` controls how much the body carries. HMAC signing
+(below) proves the body is authentic; it says nothing about who else can read
+it in transit, and on any network other than `public`,
+`ALLOWED_WEBHOOK_SCHEMES` may permit plain `http` — see [SECURITY.md](SECURITY.md#webhook-payload-exposure)
+for the full exposure model.
+
+**`minimal` (the default)** — enough to know something happened and look it
+up; no tenant or financial detail:
 
 ```json
 {
   "event": "payment.overpaid",
   "payment_id": "a1b2c3d4-...",
+  "status": "completed",
+  "updated_at": "2026-01-01T00:00:01Z"
+}
+```
+
+**`full`** — the previous rich payload, opt in with `WEBHOOK_PAYLOAD_DETAIL=full`:
+
+```json
+{
+  "event": "payment.overpaid",
+  "payment_id": "a1b2c3d4-...",
+  "status": "completed",
+  "updated_at": "2026-01-01T00:00:01Z",
   "merchant_id": "your-merchant-id",
   "tx_hash": "abc123...",
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
   "asset_issuer": null,
-  "status": "completed",
   "delta": "2.5"
 }
 ```
 
-`delta` is present only on `payment.overpaid` and `payment.underpaid`.
+`delta` is present only on `payment.overpaid` and `payment.underpaid`, and
+only under `full` detail. A receiver that needs the fields `minimal` omits
+already holds an API key and can call `GET /v1/payments/:id` for the full
+record instead.
+
+> **Migrating from the previous default.** Every field prior versions sent is
+> still available — set `WEBHOOK_PAYLOAD_DETAIL=full` to keep receiving
+> exactly the payload shown above. There is no forced cutover: `full` is
+> supported indefinitely, not a deprecated compatibility mode.
 
 ### Verifying Signatures
 

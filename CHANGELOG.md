@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limiting and auth logs) is now reusable from any handler via
   `client_ip_key_from_parts`, so every audit event uses the same source
   attribution as everything else (issue #305).
+- **Webhook payload minimisation, and a startup warning for plaintext
+  delivery.** `build_payload` put `merchant_id` and full financial detail
+  (`amount`, `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, `delta`) in
+  every webhook body. HMAC signing proves authenticity, not confidentiality,
+  and on any network other than `public`, `ALLOWED_WEBHOOK_SCHEMES` may still
+  permit plain `http` — so that detail could transit in cleartext, and
+  `merchant_id` in particular adds nothing for the legitimate recipient
+  (it's *their* id) while making an intercepted payload immediately
+  attributable. `WEBHOOK_PAYLOAD_DETAIL` (default `minimal`) now sends only
+  `event`, `payment_id`, `status`, and `updated_at`; the full payload is
+  available by setting it to `full`, and a receiver that needs the omitted
+  fields can call `GET /v1/payments/:id` with its API key instead. Separately,
+  boot now logs a `warn` whenever `ALLOWED_WEBHOOK_SCHEMES` includes `http`,
+  on every network, not just when it would be unsafe — so enabling plaintext
+  delivery is never a silent choice. Documented in a new "Webhook Payload
+  Exposure" section of SECURITY.md and the README's "Payload detail"
+  subsection, with a migration note for existing `full`-payload receivers
+  (issue #306).
 
 ### Fixed
 

@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
-    config::{AcceptedAsset, Config, ListenerMode},
+    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
     db,
     horizon::{self, HorizonPayment, TransactionRef},
     webhook, AppState,
@@ -40,6 +40,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -411,7 +412,12 @@ async fn pending_delivery_is_redriven_after_restart() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "stuck-delivery",
@@ -465,7 +471,12 @@ async fn failed_delivery_below_max_attempts_is_retried_by_redrive() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "exhausted-delivery",
@@ -514,7 +525,12 @@ async fn redrive_skips_deliveries_still_within_grace_window() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "fresh-delivery",
@@ -557,7 +573,12 @@ async fn redrive_marks_delivery_failed_after_exhausting_max_attempts() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "last-chance-delivery",

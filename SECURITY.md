@@ -89,3 +89,34 @@ For context when triaging reports, StellarGate already implements:
 
 If you find a way around any of the above, that's exactly what this policy
 is for — please report it privately.
+
+## Webhook Payload Exposure
+
+HMAC signing (above) proves a webhook body is authentic and unmodified. It
+says nothing about confidentiality — anyone who can observe the connection
+can read the body, and on any network other than `STELLAR_NETWORK=public`,
+`ALLOWED_WEBHOOK_SCHEMES` may be configured to allow plain `http`, so that
+connection is not necessarily encrypted. (`public` enforces HTTPS
+unconditionally, independent of `ALLOWED_WEBHOOK_SCHEMES`.)
+
+**What the default payload exposes.** `WEBHOOK_PAYLOAD_DETAIL` defaults to
+`minimal`: `event`, `payment_id`, `status`, and `updated_at`. None of that is
+sensitive on its own — a payment id without its amount or owning merchant
+tells an observer only that *some* event happened to *some* payment.
+
+**What `WEBHOOK_PAYLOAD_DETAIL=full` additionally exposes.** `merchant_id`,
+`amount`, `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, and (on
+over/underpaid events) `delta`. `merchant_id` identifies which tenant the
+event belongs to; the amounts reveal transaction size; `tx_hash` links the
+event to a specific Stellar ledger entry. An operator who sets
+`WEBHOOK_PAYLOAD_DETAIL=full` — or who allows `http` on a non-`public`
+network — is choosing to let this detail be readable by anyone who can
+observe the connection (or, if `http`, by any network intermediary at all).
+Boot logs a `warn` when `ALLOWED_WEBHOOK_SCHEMES` includes `http`, on every
+network, so this is never a silent choice.
+
+**Getting the detail back safely.** A receiver that needs the fields
+`minimal` omits already holds an API key (it's how the merchant integrated in
+the first place) and can call `GET /v1/payments/:id` over that authenticated,
+presumably-HTTPS channel instead of receiving it unauthenticated in the
+webhook body.
