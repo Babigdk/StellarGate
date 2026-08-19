@@ -9,19 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **A configurable maximum (and minimum) payment amount.** `parse_stroops`
-  rejected an amount only when it overflowed `i64` — roughly 922 billion
-  units of any asset — which is an implementation artifact, not a business
-  rule, and produced a misleading `invalid_amount` error for an amount that
-  was perfectly well-formed and simply too large. An intent above it was
-  unpayable yet still occupied the memo space and the poller's scan until its
-  TTL elapsed, and any real payment against it fired `payment.underpaid` with
-  a delta in the hundreds of billions. `MAX_PAYMENT_AMOUNT` and
-  `MIN_PAYMENT_AMOUNT` are now configurable, optionally per asset (e.g.
-  `MAX_PAYMENT_AMOUNT=100000,USDC:50000`), validated at boot (an asset whose
-  effective minimum exceeds its effective maximum fails startup), and
-  exceeding either now returns a distinct `amount_out_of_range` code naming
-  the configured limit instead of reusing `invalid_amount` (issue #310).
+- **Test pools now use a genuinely shared in-memory SQLite database.** Every
+  test suite built its pool from the DSN `sqlite::memory:` while allowing
+  more than one pooled connection (the default). A bare `sqlite::memory:`
+  DSN gives each connection its own **private** database, so which data a
+  query saw depended on which pooled connection it happened to get — the
+  suite passed by connection-reuse luck, not by construction.
+  `tests/concurrency_tests.rs` was the sharpest instance: it exists to prove
+  the single-settlement guarantee under *concurrent* reconciliation (issue
+  #78), which only means something if concurrent tasks can land on genuinely
+  different pooled connections talking to the *same* database. Every test
+  pool now connects with `sqlite:file:<random-name>?mode=memory&cache=shared`
+  plus `min_connections(1)` (so the shared database survives for the pool's
+  lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
+  fixture is genuinely shared and that the old bare-DSN form is not, so the
+  footgun can't be silently reintroduced (issue #309).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and

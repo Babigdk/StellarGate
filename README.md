@@ -1426,8 +1426,12 @@ CI enforces all four on every pull request, plus a [`cargo audit`](https://githu
 | `tests/rate_limit_tests.rs` | Per-bucket limiting |
 | `tests/webhook_dispatch_tests.rs` | Signing, retries, redrive |
 | `tests/trustline_tests.rs` | Asset trustline checks |
+| `tests/db_shared_memory_tests.rs` | Proves the shared-cache in-memory SQLite fixture (below) is actually shared across pooled connections |
 
 Integration tests run against an in-memory SQLite database and a [wiremock](https://github.com/LukeMathWalker/wiremock-rs) HTTP server — no network access or external services required.
+
+> [!IMPORTANT]
+> Every test pool connects with `sqlite:file:<random-name>?mode=memory&cache=shared` plus `min_connections(1)`, never bare `sqlite::memory:`. A bare `sqlite::memory:` DSN gives **each pooled connection its own private database** — with the multi-connection pools these tests build (the default is more than one connection), a query can silently land on a connection that never saw an earlier query's writes in the same test. `tests/concurrency_tests.rs` is the sharpest case: it exists to prove single-settlement under *concurrent* reconciliation (issue #78), which only means something if concurrent tasks can land on genuinely different pooled connections talking to the *same* database. `cache=shared` fixes this; a random name per pool keeps parallel test binaries from colliding, and `min_connections(1)` keeps the shared database alive for the pool's lifetime (SQLite drops it once every connection closes). `tests/db_shared_memory_tests.rs` proves both halves of this directly — the fixture is shared, and a bare `sqlite::memory:` DSN is not — so don't reintroduce the bare form (issue #309).
 
 ---
 

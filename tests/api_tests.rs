@@ -10,13 +10,26 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database. A bare
+/// `sqlite::memory:` DSN gives each pooled connection its own private
+/// database — with the default multi-connection pool these tests build, a
+/// query could land on a connection that has never seen data written by an
+/// earlier query in the same test, and the suite would only pass by
+/// connection-reuse luck (issue #309). The random name keeps parallel test
+/// binaries from colliding with each other.
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
 
 fn make_config() -> Config {
     Config {
         port: 0,
-        database_url: "sqlite::memory:".into(),
+        database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
@@ -80,11 +93,10 @@ async fn server_with_config_and_health(
     task_health: stellargate::TaskHealth,
 ) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

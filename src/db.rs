@@ -1504,11 +1504,28 @@ pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    /// A fresh, uniquely-named in-memory SQLite database with `cache=shared`,
+    /// so every connection the pool opens talks to the SAME database rather
+    /// than each getting its own private one, which a bare `sqlite::memory:`
+    /// DSN would do under this pool's default multi-connection size (issue
+    /// #309).
+    fn shared_memory_dsn() -> String {
+        format!(
+            "sqlite:file:{}?mode=memory&cache=shared",
+            uuid::Uuid::new_v4()
+        )
+    }
 
     async fn memory_db() -> Db {
         let pool = SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+            // A shared-cache in-memory database is dropped once its last
+            // connection closes — keep exactly one open for the pool's
+            // lifetime.
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
             .await
             .unwrap();
         migrate(&pool).await.unwrap();
@@ -1525,7 +1542,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_single_key_merchants_survive_the_api_keys_migration() {
         let pool = SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
             .await
             .unwrap();
 
