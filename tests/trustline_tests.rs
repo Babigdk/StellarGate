@@ -78,6 +78,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
         },
         http: reqwest::Client::new(),
