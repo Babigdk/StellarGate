@@ -242,6 +242,7 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
 | `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
+| `STREAM_IDLE_TIMEOUT_SECS` | How long the Horizon SSE stream listener may go without receiving any bytes before it treats the connection as dead and reconnects. Horizon sends periodic keep-alive comment lines, so this bounds how long a half-open connection (dropped by a NAT/load balancer without a `RST`, or an upstream stall) can silently disable the stream listener before it reconnects (issue #312). | `30` |
 
 ### Trustlines
 
