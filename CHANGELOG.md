@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Test pools now use a genuinely shared in-memory SQLite database.** Every
+  test suite built its pool from the DSN `sqlite::memory:` while allowing
+  more than one pooled connection (the default). A bare `sqlite::memory:`
+  DSN gives each connection its own **private** database, so which data a
+  query saw depended on which pooled connection it happened to get — the
+  suite passed by connection-reuse luck, not by construction.
+  `tests/concurrency_tests.rs` was the sharpest instance: it exists to prove
+  the single-settlement guarantee under *concurrent* reconciliation (issue
+  #78), which only means something if concurrent tasks can land on genuinely
+  different pooled connections talking to the *same* database. Every test
+  pool now connects with `sqlite:file:<random-name>?mode=memory&cache=shared`
+  plus `min_connections(1)` (so the shared database survives for the pool's
+  lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
+  fixture is genuinely shared and that the old bare-DSN form is not, so the
+  footgun can't be silently reintroduced (issue #309).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

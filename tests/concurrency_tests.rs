@@ -33,6 +33,7 @@ use stellargate::{
     horizon::{reconcile_payment, HorizonPayment, TransactionRef},
     AppState,
 };
+use uuid::Uuid;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -41,14 +42,25 @@ use wiremock::{
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a minimal in-memory SQLite pool with migrations applied.
+///
+/// The pool is deliberately multi-connection (`max_connections(5)`) because
+/// these tests exist to prove the single-settlement guarantee under
+/// *concurrent* reconciliation (issue #78) — that only means something if
+/// concurrent tasks can genuinely land on different pooled connections. A
+/// bare `sqlite::memory:` DSN gives each connection its own private,
+/// unrelated database, so two "concurrent" writers could each own a private
+/// copy of the row and the guarantee this suite exists to test would never
+/// actually be exercised (issue #309). `cache=shared` (plus a unique name per
+/// call, so parallel test binaries don't collide, and `min_connections(1)` to
+/// keep the shared database alive for the pool's lifetime) makes every
+/// connection in the pool talk to the same database, which is what makes
+/// "concurrent" here mean what it says.
 async fn memory_pool() -> db::Db {
+    let dsn = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4());
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect_with(
-            SqliteConnectOptions::from_str("sqlite::memory:")
-                .unwrap()
-                .create_if_missing(true),
-        )
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

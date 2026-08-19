@@ -13,21 +13,30 @@ use stellargate::{
     config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GATEWAY: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 const USDC_ISSUER: &str = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
 
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database rather than
+/// each getting its own private one, which a bare `sqlite::memory:` DSN
+/// would do with this pool's default multi-connection size (issue #309).
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
+
 /// Build an `AppState` whose Horizon client points at `horizon_url` and which
 /// accepts XLM plus USDC issued by `USDC_ISSUER`.
 async fn make_state(horizon_url: String) -> Arc<AppState> {
+    let dsn = shared_memory_dsn();
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str("sqlite::memory:")
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -36,7 +45,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
         pool,
         config: Config {
             port: 0,
-            database_url: "sqlite::memory:".into(),
+            database_url: dsn,
             network: "testnet".into(),
             horizon_url,
             gateway_public: GATEWAY.into(),

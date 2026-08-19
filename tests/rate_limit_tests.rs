@@ -14,11 +14,20 @@ use stellargate::{
     config::{Config, ListenerMode},
     db, AppState,
 };
+use uuid::Uuid;
+
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database rather than
+/// each getting its own private one, which a bare `sqlite::memory:` DSN
+/// would do with this pool's default multi-connection size (issue #309).
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
 
 fn make_config(rate_limit_requests_per_sec: u32) -> Config {
     Config {
         port: 0,
-        database_url: "sqlite::memory:".into(),
+        database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
@@ -59,11 +68,10 @@ const TEST_ADMIN_SECRET: &str = "test-admin-secret";
 
 async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();

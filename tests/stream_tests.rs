@@ -20,15 +20,24 @@ use stellargate::{
     config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
+use uuid::Uuid;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database rather than
+/// each getting its own private one, which a bare `sqlite::memory:` DSN
+/// would do with this pool's default multi-connection size (issue #309).
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
+
 fn make_config(horizon_url: &str) -> Config {
     Config {
         port: 0,
-        database_url: "sqlite::memory:".into(),
+        database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: horizon_url.into(),
         gateway_public: "GDESTINATION".into(),
@@ -68,11 +77,10 @@ fn make_config(horizon_url: &str) -> Config {
 async fn setup_state(horizon_url: &str) -> Arc<AppState> {
     let cfg = make_config(horizon_url);
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -478,11 +486,8 @@ async fn unconfigured_gateway_exits_disabled_by_config() {
     cfg.gateway_public = String::new(); // unconfigured
 
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str("sqlite::memory:")
-                .unwrap()
-                .create_if_missing(true),
-        )
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
