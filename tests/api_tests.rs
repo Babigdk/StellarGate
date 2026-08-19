@@ -42,6 +42,7 @@ fn make_config() -> Config {
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,

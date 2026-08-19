@@ -51,8 +51,9 @@ axum-test = "15"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
-# Captures `tracing` output per-test so audit-log tests can assert on the
-# fields a handler actually emitted, rather than only on its HTTP response.
+# Captures `tracing` output per-test: audit-log tests assert on the fields a
+# handler actually emitted (not just its HTTP response), and a config test
+# asserts the plaintext-webhook startup warning is actually logged.
 # `no-env-filter`: an integration test in tests/ compiles into its own crate,
 # so tracing-test's default per-crate filter (which matches on *that* crate's
 # name) would filter out every event actually emitted from the stellargate

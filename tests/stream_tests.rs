@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
-    config::{AcceptedAsset, Config, ListenerMode},
+    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
     db, horizon, AppState,
 };
 use uuid::Uuid;
@@ -47,6 +47,7 @@ fn make_config(horizon_url: &str) -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 5,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,

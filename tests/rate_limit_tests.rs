@@ -37,6 +37,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,

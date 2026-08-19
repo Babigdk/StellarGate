@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
-    config::{AcceptedAsset, AmountLimit, Config, ListenerMode},
+    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
     db, horizon, AppState,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,8 +59,7 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            max_payment_amount: AmountLimit::default(),
-            min_payment_amount: AmountLimit::default(),
+            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,

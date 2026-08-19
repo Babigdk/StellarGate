@@ -13,6 +13,47 @@ pub enum ListenerMode {
     Poll,
 }
 
+/// How much detail an outbound webhook payload carries.
+///
+/// `Minimal` (the default) sends just `event`, `payment_id`, `status`, and
+/// `updated_at`. `Full` additionally sends `merchant_id`, `amount`,
+/// `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, and `delta`.
+///
+/// The receiver already knows its own `merchant_id` — it's *their* id — so
+/// including it adds nothing for a legitimate recipient while making an
+/// intercepted or misdirected payload immediately attributable, and the same
+/// reasoning applies to the amounts. HMAC signing proves authenticity, not
+/// confidentiality, and on any network other than `public`,
+/// `ALLOWED_WEBHOOK_SCHEMES` may still include `http` — so a rich payload can
+/// transit in cleartext. A receiver that needs the detail can fetch it over
+/// the authenticated `GET /v1/payments/:id` channel instead (issue #306).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebhookPayloadDetail {
+    Minimal,
+    Full,
+}
+
+impl WebhookPayloadDetail {
+    /// Parse `WEBHOOK_PAYLOAD_DETAIL` from a raw env-var value.
+    ///
+    /// - Empty / unset → defaults to `Minimal` (no error).
+    /// - `"minimal"` or `"full"` (case-insensitive) → the chosen level.
+    /// - Any other non-empty value → `Err`, which aborts boot with a clear
+    ///   message rather than silently falling back to a different level.
+    fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(Self::Minimal),
+            "minimal" => Ok(Self::Minimal),
+            "full" => Ok(Self::Full),
+            other => Err(anyhow::anyhow!(
+                "WEBHOOK_PAYLOAD_DETAIL={other:?} is not a recognised value. \
+                 Valid values are \"minimal\" or \"full\". \
+                 Fix the environment variable or remove it to use the default (\"minimal\")."
+            )),
+        }
+    }
+}
+
 impl ListenerMode {
     /// Parse `STELLAR_LISTENER_MODE` from a raw env-var value.
     ///
@@ -182,6 +223,10 @@ pub struct Config {
     /// arbitrarily far out and keep a settlement waiting on it.
     pub webhook_retry_max_delay_ms: u64,
     pub allowed_webhook_schemes: Vec<String>,
+    /// Controls how much detail `webhook::build_payload` includes. See
+    /// [`WebhookPayloadDetail`]. Configure via `WEBHOOK_PAYLOAD_DETAIL`
+    /// (`"minimal"`, the default, or `"full"`).
+    pub webhook_payload_detail: WebhookPayloadDetail,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
     /// hold up the retry loop (or the reconciler) for more than this value.
@@ -341,6 +386,25 @@ impl Config {
                 .collect()
         };
 
+        /* Independent of network: HTTPS is enforced unconditionally on
+        `public` regardless of this list (see `api::payments::create`), but on
+        any other network an operator who has widened this allow-list to
+        include `http` is choosing to let webhook payloads — which may carry
+        tenant and financial detail, see `WebhookPayloadDetail` — transit in
+        cleartext. That should never be silent (issue #306). */
+        if allowed_webhook_schemes.iter().any(|s| s == "http") {
+            tracing::warn!(
+                "ALLOWED_WEBHOOK_SCHEMES includes \"http\": webhook deliveries to a \
+                 plaintext endpoint are not encrypted in transit. See the \"Webhook \
+                 payload exposure\" section of SECURITY.md for what a webhook body \
+                 can expose to a network observer."
+            );
+        }
+
+        let webhook_payload_detail = WebhookPayloadDetail::parse(
+            &std::env::var("WEBHOOK_PAYLOAD_DETAIL").unwrap_or_default(),
+        )?;
+
         let cors_allowed_origins: Vec<String> = {
             let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
                 .unwrap_or_default()
@@ -387,6 +451,7 @@ impl Config {
             },
             webhook_secret,
             allowed_webhook_schemes,
+            webhook_payload_detail,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
             webhook_retry_max_delay_ms: parse_env("WEBHOOK_RETRY_MAX_DELAY_MS", 60_000)?,
@@ -869,6 +934,7 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
+            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -952,6 +1018,7 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
+            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -1698,6 +1765,99 @@ mod tests {
                     err.contains("CURSOR_STALENESS_MULTIPLE"),
                     "boot should abort on a non-numeric value; got: {err}"
                 );
+            },
+        );
+    }
+
+    // ── WebhookPayloadDetail::parse (issue #306) ─────────────────────────────
+
+    #[test]
+    fn webhook_payload_detail_empty_defaults_to_minimal() {
+        assert_eq!(
+            WebhookPayloadDetail::parse("").unwrap(),
+            WebhookPayloadDetail::Minimal
+        );
+    }
+
+    #[test]
+    fn webhook_payload_detail_minimal_parses() {
+        assert_eq!(
+            WebhookPayloadDetail::parse("minimal").unwrap(),
+            WebhookPayloadDetail::Minimal
+        );
+        assert_eq!(
+            WebhookPayloadDetail::parse("MINIMAL").unwrap(),
+            WebhookPayloadDetail::Minimal
+        );
+    }
+
+    #[test]
+    fn webhook_payload_detail_full_parses() {
+        assert_eq!(
+            WebhookPayloadDetail::parse("full").unwrap(),
+            WebhookPayloadDetail::Full
+        );
+        assert_eq!(
+            WebhookPayloadDetail::parse("FULL").unwrap(),
+            WebhookPayloadDetail::Full
+        );
+    }
+
+    #[test]
+    fn webhook_payload_detail_invalid_aborts_boot() {
+        let err = WebhookPayloadDetail::parse("rich").unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_PAYLOAD_DETAIL"),
+            "error should name the variable; got: {err}"
+        );
+        assert!(
+            err.contains("rich"),
+            "error should echo the bad value; got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_env_defaults_to_minimal_webhook_payload_detail() {
+        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.webhook_payload_detail, WebhookPayloadDetail::Minimal);
+        });
+    }
+
+    // ── Plaintext webhook scheme startup warning (issue #306) ────────────────
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn allowing_http_webhook_scheme_warns_at_boot_on_any_network() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("https,http")),
+            ],
+            || {
+                Config::from_env().unwrap();
+                assert!(
+                    logs_contain("ALLOWED_WEBHOOK_SCHEMES"),
+                    "including http in ALLOWED_WEBHOOK_SCHEMES must log a warning, \
+                     even on a non-public network"
+                );
+            },
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn https_only_webhook_schemes_do_not_warn() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("ALLOWED_WEBHOOK_SCHEMES", Some("https")),
+            ],
+            || {
+                Config::from_env().unwrap();
+                assert!(!logs_contain("ALLOWED_WEBHOOK_SCHEMES"));
             },
         );
     }
