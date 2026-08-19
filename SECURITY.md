@@ -61,7 +61,7 @@ In scope:
 - The StellarGate API server (`src/`), including payment creation/lookup,
   webhook signing and delivery, the Horizon listener/poller, merchant
   provisioning, and configuration/validation logic.
-- The database schema and migrations (`migrations/`).
+- The database schema and migrations (`db::migrate` in `src/db.rs` — there is no `migrations/` directory).
 - Supply-chain issues in this repository (e.g. `Cargo.lock`, CI workflows).
 
 Out of scope:
