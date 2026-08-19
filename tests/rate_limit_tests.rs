@@ -51,6 +51,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
     }
 }

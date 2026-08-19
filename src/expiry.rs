@@ -104,6 +104,7 @@ mod tests {
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
         }
     }
