@@ -79,6 +79,8 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),

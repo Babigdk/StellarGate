@@ -342,6 +342,11 @@ paths:
                   value:
                     error: "unsupported asset 'EURC'; supported: XLM, USDC"
                     code: unsupported_asset
+                amount_out_of_range:
+                  summary: Amount outside the configured MAX_PAYMENT_AMOUNT / MIN_PAYMENT_AMOUNT bound
+                  value:
+                    error: amount exceeds the configured maximum of 100000 XLM for this asset
+                    code: amount_out_of_range
         "401":
           $ref: "#/components/responses/Unauthorized"
         "429":
@@ -953,7 +958,11 @@ components:
       properties:
         amount:
           type: string
-          description: Positive decimal, up to 7 decimal places
+          description: >-
+            Positive decimal, up to 7 decimal places. May also be bounded by
+            the deployment's MAX_PAYMENT_AMOUNT / MIN_PAYMENT_AMOUNT
+            configuration (optionally per asset); exceeding a configured
+            bound returns 400 amount_out_of_range naming the limit.
           example: "10.00"
         asset:
           type: string
@@ -1130,9 +1139,9 @@ components:
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
             invalid_request, unknown_field, unsupported_asset, invalid_amount,
-            invalid_webhook_url, invalid_status, invalid_cursor,
-            payment_not_found, delivery_not_found, rate_limit_exceeded,
-            not_found, webhook_target_blocked, webhook_delivery_failed,
-            idempotency_conflict, merchant_not_found, invalid_label,
-            last_active_key, and key_not_found.
+            amount_out_of_range, invalid_webhook_url, invalid_status,
+            invalid_cursor, payment_not_found, delivery_not_found,
+            rate_limit_exceeded, not_found, webhook_target_blocked,
+            webhook_delivery_failed, idempotency_conflict, merchant_not_found,
+            invalid_label, last_active_key, and key_not_found.
           example: invalid_amount

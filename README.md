@@ -242,6 +242,8 @@ All configuration is via environment variables, read once at startup. **Invalid 
 | `STELLAR_GATEWAY_PUBLIC` | Gateway wallet public key (`G…`), validated as a strkey at startup. The listener stays idle until this is set. | — |
 | `ACCEPTED_ASSETS` | Comma-separated. Only native XLM may be written as a bare `CODE`. Every other asset is `CODE:ISSUER` (`USDC:GA…`). A typo like `ACCEPTED_ASSETS=XLM,USDC` used to treat native XLM as settling USDC intents; boot now refuses it (issue #221). Duplicate codes are also refused (issue #222). Each issuer is strkey-validated. Adding an asset is config-only — but see [Trustlines](#trustlines). | `XLM,USDC:<testnet issuer>` |
 | `REQUEST_TIMEOUT_SECS` | Whole-request timeout; exceeding it returns `408` | `30` |
+| `MAX_PAYMENT_AMOUNT` | Maximum amount `POST /payments` accepts, in the asset's own units. A bare number (`100000`) applies to every asset; `CODE:AMOUNT` (`USDC:50000`) pins a bound to one asset specifically and always wins over the default; mix both with commas (`100000,USDC:50000`). Exceeding it returns `400 amount_out_of_range` naming the configured limit — distinct from `invalid_amount`, which means the value itself is malformed. Unset means no bound beyond `i64` overflow in `parse_stroops` (issue #310). | unset |
+| `MIN_PAYMENT_AMOUNT` | Minimum amount, configured the same way as `MAX_PAYMENT_AMOUNT`. Boot refuses a configuration where an asset's effective minimum exceeds its effective maximum. | unset |
 
 ### Trustlines
 

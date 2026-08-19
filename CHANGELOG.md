@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A configurable maximum (and minimum) payment amount.** `parse_stroops`
+  rejected an amount only when it overflowed `i64` — roughly 922 billion
+  units of any asset — which is an implementation artifact, not a business
+  rule, and produced a misleading `invalid_amount` error for an amount that
+  was perfectly well-formed and simply too large. An intent above it was
+  unpayable yet still occupied the memo space and the poller's scan until its
+  TTL elapsed, and any real payment against it fired `payment.underpaid` with
+  a delta in the hundreds of billions. `MAX_PAYMENT_AMOUNT` and
+  `MIN_PAYMENT_AMOUNT` are now configurable, optionally per asset (e.g.
+  `MAX_PAYMENT_AMOUNT=100000,USDC:50000`), validated at boot (an asset whose
+  effective minimum exceeds its effective maximum fails startup), and
+  exceeding either now returns a distinct `amount_out_of_range` code naming
+  the configured limit instead of reusing `invalid_amount` (issue #310).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

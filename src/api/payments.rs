@@ -222,11 +222,47 @@ pub async fn create(
         }
     };
     let asset_issuer = accepted_asset.issuer.as_deref();
-    if !money::is_valid_amount(&body.amount) {
-        return Err(AppError::bad_request(
+    let stroops = money::parse_stroops(&body.amount).ok_or_else(|| {
+        AppError::bad_request(
             "invalid_amount",
             "amount must be a positive number with at most 7 decimal places",
-        ));
+        )
+    })?;
+    /* The overflow bound `parse_stroops` already enforces is an implementation
+    artifact (roughly 922 billion units of any asset), not a business rule —
+    an intent above it is unpayable and misleadingly reported as malformed.
+    These configured bounds are optional and asset-specific (issue #310). */
+    if let Some(max) = state
+        .config
+        .max_payment_amount
+        .for_asset(&accepted_asset.code)
+    {
+        if stroops > max {
+            return Err(AppError::bad_request(
+                "amount_out_of_range",
+                format!(
+                    "amount exceeds the configured maximum of {} {} for this asset",
+                    money::stroops_to_string(max),
+                    accepted_asset.code
+                ),
+            ));
+        }
+    }
+    if let Some(min) = state
+        .config
+        .min_payment_amount
+        .for_asset(&accepted_asset.code)
+    {
+        if stroops < min {
+            return Err(AppError::bad_request(
+                "amount_out_of_range",
+                format!(
+                    "amount is below the configured minimum of {} {} for this asset",
+                    money::stroops_to_string(min),
+                    accepted_asset.code
+                ),
+            ));
+        }
     }
     if let Some(url) = &body.webhook_url {
         if url.len() > 2048 {

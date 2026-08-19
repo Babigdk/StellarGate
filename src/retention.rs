@@ -181,6 +181,8 @@ mod tests {
             admin_provisioning_secret: "admin".into(),
             request_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
         }
     }
 
