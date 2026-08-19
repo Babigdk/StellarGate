@@ -829,7 +829,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
 | `limit` | Page size, 1–100 | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
-| `offset` | Rows to skip (legacy; prefer `cursor`) | `0` |
+| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
 **`200 OK`** — cursor mode (no `cursor` parameter on the first request)
@@ -890,6 +890,12 @@ of either mode. Offset mode additionally returns `offset`.
 > mixed within one scan. Offset mode is retained for backward compatibility
 > and is deprecated: like any offset paging, it can skip or repeat rows if
 > data changes mid-scan.
+>
+> **`offset` is capped at `10000`.** SQLite implements `OFFSET` by producing
+> and discarding every skipped row, so cost grows with depth; a request past
+> the cap returns `400 invalid_offset` instead of paying for the scan. Cursor
+> pagination has no such limit — it stays `O(log n)` regardless of depth — so
+> this is another reason to prefer it over deep offset paging.
 
 ---
 

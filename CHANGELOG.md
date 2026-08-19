@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /payments?offset=…` had no upper bound.** SQLite implements `OFFSET`
+  by producing and discarding every skipped row, so a request like
+  `?offset=50000000` cost `O(offset)` and was answered anyway — a handful of
+  concurrent deep-offset requests could saturate the database that also
+  serves settlement writes. `offset` is now capped at `10000`; requests above
+  it get `400 invalid_offset` naming the limit and pointing at cursor
+  pagination, which is `O(log n)` regardless of depth (issue #303).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

@@ -441,6 +441,11 @@ pub struct ListQuery {
 
 const DEFAULT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
+/// Offset pagination is `O(offset)` in SQLite — it produces and discards
+/// every skipped row. This ceiling (generous for any real UI) keeps a deep,
+/// expensive scan-and-skip from being answered at all; the keyset (`cursor`)
+/// path stays `O(log n)` regardless of depth (issue #303).
+const MAX_OFFSET: i64 = 10_000;
 /// Statuses a payment can actually hold, and therefore the only ones worth
 /// filtering on: `pending` at creation, `completed`/`underpaid` from
 /// settlement (`horizon::settle`), and `expired` from the TTL sweeper
@@ -502,6 +507,15 @@ pub async fn list(
     } else {
         // Legacy offset pagination — kept for backward compatibility.
         let offset = q.offset.unwrap_or(0).max(0);
+        if offset > MAX_OFFSET {
+            return Err(AppError::bad_request(
+                "invalid_offset",
+                format!(
+                    "offset exceeds maximum of {MAX_OFFSET}; use cursor pagination instead \
+                     (see the `cursor` parameter and `next_cursor` in the response)"
+                ),
+            ));
+        }
         let payments = db::list_payments(
             &state.pool,
             &merchant_id,
