@@ -9,25 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **The Horizon SSE stream listener now detects a half-open connection.**
-  `stream_once` awaited `stream.next()` with nothing bounding it, and the
-  stream client is deliberately built without an overall request timeout
-  (the connection is meant to live indefinitely). A connection that stopped
-  delivering bytes without closing — a NAT or load balancer dropping idle
-  state without sending `RST`, or a silently stalled upstream — parked the
-  listener forever: the reconnect-with-backoff loop in `run_stream_listener`
-  is only reached when `stream_once` returns, so it never ran. Nothing
-  external could see it either — `/health` stayed `200` and the poller kept
-  settling payments on its slower cadence, so detection silently degraded
-  from near-real-time to `POLL_INTERVAL_SECS` with no log line and no metric.
-  Every await on the next chunk is now bounded by the new
-  `STREAM_IDLE_TIMEOUT_SECS` (default 30s) — Horizon sends periodic
-  keep-alive comment lines on its SSE endpoints, so an idle window with no
-  bytes at all is a reliable liveness signal. Running past it reconnects
-  through the existing backoff path, and every reconnect (idle timeout,
-  error, or a clean server-side close) now increments the new
-  `stellargate_horizon_stream_reconnects_total` counter on `/metrics` (issue
-  #312).
+- **First-run Horizon cursor baselining no longer silently skips payments.**
+  On a database with no persisted cursor, the poller used to adopt the
+  account's single most recent payment (`order=desc&limit=1`) as the floor
+  for forward polling. That is only safe if no payment relevant to this
+  gateway predates it, which fails for a reused account (a redeploy after
+  losing the volume, a migration between hosts, with an open intent whose
+  payment sits behind the account's newer traffic) and for a startup race (a
+  payment landing between the baselining query and the first forward poll
+  that sorts at or below the single-record baseline). Neither produced an
+  error — the intent just stayed `pending` until the sweeper expired it, with
+  no record connecting the customer's on-chain payment to anything. The
+  poller now pages backward from the tip until it has cleared every currently
+  open intent's `created_at`, deliberately over-scanning (a no-op via
+  `processed_transactions`) rather than risk under-scanning, bounded to 25
+  pages, and logs the chosen baseline and skipped-record count at `info`
+  (issue #311).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
