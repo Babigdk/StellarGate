@@ -65,7 +65,10 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
+        max_payment_amount: Default::default(),
+        min_payment_amount: Default::default(),
     }
 }
 

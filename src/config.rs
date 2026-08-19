@@ -81,6 +81,80 @@ impl AcceptedAsset {
     }
 }
 
+/// A configured payment-amount bound (`MAX_PAYMENT_AMOUNT` / `MIN_PAYMENT_AMOUNT`),
+/// stored in stroops. Parsed like `ACCEPTED_ASSETS`: comma-separated entries
+/// of either a bare amount (the default applied to every asset without its
+/// own entry) or `CODE:AMOUNT` pinning a bound to one specific asset code,
+/// which always wins over the default. Unset (the empty string, the default)
+/// means no bound at all — the previous behaviour, where the only ceiling was
+/// `i64` overflow in `parse_stroops` (issue #310).
+///
+/// `MAX_PAYMENT_AMOUNT=100000,USDC:50000` caps every asset at 100,000 units
+/// except USDC, which is capped at 50,000.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AmountLimit {
+    default_stroops: Option<i64>,
+    per_asset_stroops: std::collections::HashMap<String, i64>,
+}
+
+impl AmountLimit {
+    /// Parse a raw `MAX_PAYMENT_AMOUNT`/`MIN_PAYMENT_AMOUNT` value. `pub` (not
+    /// `pub(crate)`) so integration tests can build a specific bound directly,
+    /// the same way they build other `Config` fields without going through
+    /// `Config::from_env`.
+    pub fn parse(raw: &str, var_name: &str) -> Result<Self> {
+        let mut default_stroops = None;
+        let mut per_asset_stroops = std::collections::HashMap::new();
+
+        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let (code, amount_str) = match entry.split_once(':') {
+                Some((c, a)) => (Some(c.trim().to_uppercase()), a.trim()),
+                None => (None, entry),
+            };
+            let stroops = crate::money::parse_stroops(amount_str).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{var_name} entry {entry:?} is not a valid positive amount with at \
+                     most 7 decimal places."
+                )
+            })?;
+            match code {
+                Some(code) => {
+                    if per_asset_stroops.insert(code.clone(), stroops).is_some() {
+                        return Err(anyhow::anyhow!(
+                            "{var_name} has more than one entry for asset {code}. \
+                             Keep exactly one per code."
+                        ));
+                    }
+                }
+                None => {
+                    if default_stroops.replace(stroops).is_some() {
+                        return Err(anyhow::anyhow!(
+                            "{var_name} has more than one bare (default) entry — \
+                             only a single default applies to every asset without its \
+                             own CODE:AMOUNT entry."
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            default_stroops,
+            per_asset_stroops,
+        })
+    }
+
+    /// The bound in stroops that applies to `asset_code`, if any: the
+    /// asset-specific entry when present, else the bare default entry, else
+    /// no bound at all.
+    pub fn for_asset(&self, asset_code: &str) -> Option<i64> {
+        self.per_asset_stroops
+            .get(&asset_code.to_ascii_uppercase())
+            .copied()
+            .or(self.default_stroops)
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
@@ -215,6 +289,16 @@ pub struct Config {
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
     /// a connection indefinitely. Defaults to 30 seconds.
     pub request_timeout_secs: u64,
+    /// How long (seconds) the Horizon SSE stream listener may go without
+    /// receiving any bytes before it treats the connection as dead and
+    /// reconnects. Horizon sends periodic keep-alive comment lines on its SSE
+    /// endpoints, so an idle window is a reliable liveness signal — without
+    /// it, a half-open connection (a NAT or load balancer dropping idle state
+    /// without sending `RST`, or an upstream stall) leaves `stream.next()`
+    /// waiting forever, silently degrading detection to the interval poller's
+    /// cadence with no log line and no metric (issue #312). Defaults to 30
+    /// seconds.
+    pub stream_idle_timeout_secs: u64,
     /// CIDR blocks whose `X-Forwarded-For` / `X-Real-IP` headers are honoured
     /// for rate-limit bucketing and auth-log source attribution (issue #330).
     ///
@@ -224,6 +308,17 @@ pub struct Config {
     /// means no proxy is trusted and the headers are always ignored — the
     /// safe default for a directly-exposed gateway.
     pub trusted_proxy_cidrs: Vec<IpNet>,
+    /// Maximum amount (in the asset's own units) `POST /payments` will accept,
+    /// optionally per asset. Configure via `MAX_PAYMENT_AMOUNT` — a bare
+    /// number applies to every asset, `CODE:AMOUNT` pins a bound to one asset
+    /// specifically, and a comma-separated mix of both is allowed. Unset (the
+    /// default) means no bound; the only ceiling is `i64` overflow in
+    /// `parse_stroops` (issue #310).
+    pub max_payment_amount: AmountLimit,
+    /// Minimum amount `POST /payments` will accept, configured the same way
+    /// as [`Self::max_payment_amount`]. Unset means no bound beyond
+    /// `parse_stroops` already rejecting non-positive amounts.
+    pub min_payment_amount: AmountLimit,
 }
 
 impl Config {
@@ -323,12 +418,22 @@ impl Config {
             webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
             admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
+            stream_idle_timeout_secs: parse_env("STREAM_IDLE_TIMEOUT_SECS", 30)?,
             trusted_proxy_cidrs: parse_cidrs(
                 &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
+            )?,
+            max_payment_amount: AmountLimit::parse(
+                &std::env::var("MAX_PAYMENT_AMOUNT").unwrap_or_default(),
+                "MAX_PAYMENT_AMOUNT",
+            )?,
+            min_payment_amount: AmountLimit::parse(
+                &std::env::var("MIN_PAYMENT_AMOUNT").unwrap_or_default(),
+                "MIN_PAYMENT_AMOUNT",
             )?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
+        config.validate_amount_limits()?;
         Ok(config)
     }
 
@@ -383,6 +488,32 @@ impl Config {
                     "ACCEPTED_ASSETS has duplicate code {code}. Stellar asset codes are not \
                      unique across issuers; pin each code to a single issuer."
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Reject a configured `MIN_PAYMENT_AMOUNT` that is greater than the
+    /// effective `MAX_PAYMENT_AMOUNT` for the same asset — such a bound pair
+    /// would make every amount for that asset invalid, which is never the
+    /// intent of a min/max pair (issue #310). Checked over every accepted
+    /// asset's code, since that is the set of codes `POST /payments` can
+    /// actually be asked to validate against; an entry naming a code that
+    /// isn't accepted is inert and not checked here.
+    fn validate_amount_limits(&self) -> Result<()> {
+        for asset in &self.accepted_assets {
+            let max = self.max_payment_amount.for_asset(&asset.code);
+            let min = self.min_payment_amount.for_asset(&asset.code);
+            if let (Some(max), Some(min)) = (max, min) {
+                if min > max {
+                    return Err(anyhow::anyhow!(
+                        "MIN_PAYMENT_AMOUNT ({}) is greater than MAX_PAYMENT_AMOUNT ({}) for \
+                         asset {}. Every amount would be rejected as out of range.",
+                        crate::money::stroops_to_string(min),
+                        crate::money::stroops_to_string(max),
+                        asset.code,
+                    ));
+                }
             }
         }
         Ok(())
@@ -504,6 +635,14 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.stream_idle_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would make the stream listener reconnect \
+                 continuously instead of tolerating any gap between events."
             ));
         }
 
@@ -656,7 +795,10 @@ impl std::fmt::Debug for Config {
             )
             .field("admin_provisioning_secret", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("stream_idle_timeout_secs", &self.stream_idle_timeout_secs)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
+            .field("max_payment_amount", &self.max_payment_amount)
+            .field("min_payment_amount", &self.min_payment_amount)
             .finish()
     }
 }
@@ -750,7 +892,10 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: AmountLimit::default(),
+            min_payment_amount: AmountLimit::default(),
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -830,7 +975,10 @@ mod tests {
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: AmountLimit::default(),
+            min_payment_amount: AmountLimit::default(),
         }
     }
 
@@ -911,6 +1059,138 @@ mod tests {
         ];
         let err = cfg.validate_addresses().unwrap_err().to_string();
         assert!(err.contains("duplicate code"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    // ── AmountLimit / MAX_PAYMENT_AMOUNT / MIN_PAYMENT_AMOUNT (issue #310) ──
+
+    #[test]
+    fn amount_limit_empty_string_has_no_bound() {
+        let limit = AmountLimit::parse("", "MAX_PAYMENT_AMOUNT").unwrap();
+        assert_eq!(limit.for_asset("XLM"), None);
+    }
+
+    #[test]
+    fn amount_limit_bare_entry_is_the_default_for_every_asset() {
+        let limit = AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+        assert_eq!(limit.for_asset("XLM"), Some(1_000_000_000));
+        assert_eq!(limit.for_asset("USDC"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn amount_limit_per_asset_entry_overrides_the_default() {
+        let limit = AmountLimit::parse("100,USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
+        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
+        assert_eq!(limit.for_asset("XLM"), Some(1_000_000_000));
+    }
+
+    #[test]
+    fn amount_limit_per_asset_entry_without_a_default_bounds_only_that_asset() {
+        let limit = AmountLimit::parse("USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
+        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
+        assert_eq!(limit.for_asset("XLM"), None);
+    }
+
+    #[test]
+    fn amount_limit_asset_code_is_case_insensitive() {
+        let limit = AmountLimit::parse("usdc:50", "MAX_PAYMENT_AMOUNT").unwrap();
+        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
+    }
+
+    #[test]
+    fn amount_limit_rejects_a_malformed_amount() {
+        let err = AmountLimit::parse("abc", "MAX_PAYMENT_AMOUNT")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("MAX_PAYMENT_AMOUNT"), "got: {err}");
+        assert!(err.contains("abc"), "got: {err}");
+    }
+
+    #[test]
+    fn amount_limit_rejects_a_zero_amount() {
+        // parse_stroops rejects non-positive amounts — a zero-amount bound is
+        // meaningless (it would reject every payment) and caught the same way
+        // a malformed value is.
+        assert!(AmountLimit::parse("0", "MAX_PAYMENT_AMOUNT").is_err());
+    }
+
+    #[test]
+    fn amount_limit_rejects_duplicate_entries_for_the_same_asset() {
+        let err = AmountLimit::parse("USDC:50,USDC:60", "MAX_PAYMENT_AMOUNT")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    #[test]
+    fn amount_limit_rejects_more_than_one_default_entry() {
+        let err = AmountLimit::parse("100,200", "MAX_PAYMENT_AMOUNT")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("default"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_amount_limits_passes_when_min_is_below_max() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        cfg.max_payment_amount = AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+        cfg.min_payment_amount = AmountLimit::parse("1", "MIN_PAYMENT_AMOUNT").unwrap();
+        assert!(cfg.validate_amount_limits().is_ok());
+    }
+
+    #[test]
+    fn validate_amount_limits_rejects_min_greater_than_max() {
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "XLM".into(),
+            issuer: None,
+        }];
+        cfg.max_payment_amount = AmountLimit::parse("10", "MAX_PAYMENT_AMOUNT").unwrap();
+        cfg.min_payment_amount = AmountLimit::parse("20", "MIN_PAYMENT_AMOUNT").unwrap();
+        let err = cfg.validate_amount_limits().unwrap_err().to_string();
+        assert!(err.contains("MIN_PAYMENT_AMOUNT"), "got: {err}");
+        assert!(err.contains("MAX_PAYMENT_AMOUNT"), "got: {err}");
+        assert!(err.contains("XLM"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_amount_limits_checks_per_asset_bounds_independently() {
+        // XLM has a max but no min; USDC has a min but no max. Neither asset
+        // has both bounds set, so there is nothing to compare and no error —
+        // only a same-asset min > max is rejected.
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![
+            AcceptedAsset {
+                code: "XLM".into(),
+                issuer: None,
+            },
+            AcceptedAsset {
+                code: "USDC".into(),
+                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+            },
+        ];
+        cfg.max_payment_amount = AmountLimit::parse("XLM:10", "MAX_PAYMENT_AMOUNT").unwrap();
+        cfg.min_payment_amount = AmountLimit::parse("USDC:20", "MIN_PAYMENT_AMOUNT").unwrap();
+        assert!(cfg.validate_amount_limits().is_ok());
+    }
+
+    #[test]
+    fn validate_amount_limits_applies_the_default_max_to_an_asset_without_its_own_entry() {
+        // USDC has no entry of its own in MAX_PAYMENT_AMOUNT, so it inherits
+        // the bare default (10) — and that conflicts with its specific,
+        // higher min (20), exactly as if USDC had been given "10" directly.
+        let mut cfg = sample_config();
+        cfg.accepted_assets = vec![AcceptedAsset {
+            code: "USDC".into(),
+            issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
+        }];
+        cfg.max_payment_amount = AmountLimit::parse("10", "MAX_PAYMENT_AMOUNT").unwrap();
+        cfg.min_payment_amount = AmountLimit::parse("USDC:20", "MIN_PAYMENT_AMOUNT").unwrap();
+        let err = cfg.validate_amount_limits().unwrap_err().to_string();
         assert!(err.contains("USDC"), "got: {err}");
     }
 
@@ -1141,6 +1421,14 @@ mod tests {
         cfg.poll_interval_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
         assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_stream_idle_timeout() {
+        let mut cfg = timing_config();
+        cfg.stream_idle_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
     }
 
     #[test]
