@@ -1338,6 +1338,35 @@ Structured logs (via `tracing`) carry an `x-request-id` on every request, propag
 
 Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=debug`.
 
+### Audit events
+
+Every state-changing operation emits a structured `tracing` event at `info`
+(or `warn`, for revocation) carrying `audit = true`, so audit records can be
+filtered or routed to a separate sink from ordinary operational logs — e.g.
+`RUST_LOG` doesn't distinguish them, but a JSON-formatted log pipeline can
+select on the `audit` field.
+
+| Field | Meaning |
+|---|---|
+| `audit` | Always `true`. The marker field to select on. |
+| `action` | What happened, as `resource.verb` — see the table below. |
+| `actor` | `"merchant"` (acting via their API key) or `"admin"` (acting via `X-Admin-Secret`). |
+| `merchant_id` | The merchant that owns the credential used, or (for `merchant.provision`) the merchant just created. |
+| `source_ip` | The same attributed client IP used for rate limiting and auth logs — see "Client IP attribution" above. |
+| `request_id` | The request's `X-Request-Id`, so an audit event can be correlated with the access log line and response header for the same request. |
+| `outcome` | What happened to the resource: `created`, `delivered`/`failed` (redelivery), `requeued`, `issued`, `revoked`. |
+
+Plus an id for whatever the event is about (`payment_id`, `delivery_id`, `key_id`).
+
+| `action` | Emitted from | Notes |
+|---|---|---|
+| `payment.create` | `POST /payments` | Also carries `amount` and `asset`. |
+| `webhook.redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `outcome` is the delivery result (`delivered`/`failed`), not whether the redelivery request itself was accepted. |
+| `webhook.redeliver_bulk` | `POST /payments/webhooks/redeliver` | Carries `requeued`, the count of deliveries reset to `pending`. |
+| `merchant.provision` | `POST /merchants` | Previously logged only on failure — the single most privileged operation (it mints a credential) now leaves a trace on success too. |
+| `api_key.issue` | `POST /merchants/:id/keys` | |
+| `api_key.revoke` | `DELETE /merchants/:id/keys/:key_id` | Logged at `warn`, not `info` — a revocation is rarer and more consequential than routine issuance. |
+
 ---
 
 ## Deployment

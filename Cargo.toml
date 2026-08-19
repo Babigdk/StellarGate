@@ -51,3 +51,10 @@ axum-test = "15"
 tokio = { version = "1", features = ["full"] }
 time = { version = "0.3", features = ["parsing"] }
 wiremock = "0.6.5"
+# Captures `tracing` output per-test so audit-log tests can assert on the
+# fields a handler actually emitted, rather than only on its HTTP response.
+# `no-env-filter`: an integration test in tests/ compiles into its own crate,
+# so tracing-test's default per-crate filter (which matches on *that* crate's
+# name) would filter out every event actually emitted from the stellargate
+# library.
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
