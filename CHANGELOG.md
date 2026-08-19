@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **First-run Horizon cursor baselining no longer silently skips payments.**
+  On a database with no persisted cursor, the poller used to adopt the
+  account's single most recent payment (`order=desc&limit=1`) as the floor
+  for forward polling. That is only safe if no payment relevant to this
+  gateway predates it, which fails for a reused account (a redeploy after
+  losing the volume, a migration between hosts, with an open intent whose
+  payment sits behind the account's newer traffic) and for a startup race (a
+  payment landing between the baselining query and the first forward poll
+  that sorts at or below the single-record baseline). Neither produced an
+  error — the intent just stayed `pending` until the sweeper expired it, with
+  no record connecting the customer's on-chain payment to anything. The
+  poller now pages backward from the tip until it has cleared every currently
+  open intent's `created_at`, deliberately over-scanning (a no-op via
+  `processed_transactions`) rather than risk under-scanning, bounded to 25
+  pages, and logs the chosen baseline and skipped-record count at `info`
+  (issue #311).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

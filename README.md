@@ -324,6 +324,34 @@ throttled cannot immediately re-trip the same limit — it drains over
 subsequent cycles instead. See `stellargate_horizon_poll_cycles_total` under
 [Observability](#observability) to track this.
 
+**First-run cursor baselining.** The very first time the poller runs (no
+`horizon_payment_cursor` persisted yet), it does not scan the gateway
+account's entire payment history — that would replay everything on every
+fresh deployment. Nor does it naively adopt the account's single most recent
+payment as the floor: that is only safe if no payment relevant to this
+gateway predates it, which fails for a **reused account** (a redeploy after
+losing the database volume, a migration between hosts, where the account
+already has payment history from before this instance ever started) and for
+a **startup race** (a payment landing between the baselining query and the
+first forward poll, which can sort at or below a single-record baseline on
+read-replica lag). Neither failure produces an error — the intent just stays
+`pending` until it expires, with no record connecting the customer's on-chain
+payment to anything.
+
+Instead, the poller pages backward (`order=desc`) from the tip until the
+oldest record it has seen is older than every currently open (`pending` /
+`underpaid`) intent's `created_at` — a payment cannot be relevant to an
+intent it predates — deliberately over-scanning rather than under-scanning.
+Re-processing an already-settled transaction is a no-op via
+`processed_transactions`, so the cost of the overlap is a few extra Horizon
+requests at boot. The walk is capped at 25 pages (5,000 records); if it hits
+the cap before clearing every open intent's creation time, it baselines with
+whatever overlap it found and logs a warning. When nothing is currently open,
+one page of backward overlap is still taken, purely to cover the startup
+race. An account with no payment history at all baselines at `"0"`, so its
+first-ever payment is captured. The chosen baseline and the number of records
+skipped are logged at `info` on every first run.
+
 ### Webhooks
 
 | Variable | Description | Default |
