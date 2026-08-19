@@ -1447,19 +1447,37 @@ async fn test_list_cursor_invalid() {
     res.assert_status(StatusCode::BAD_REQUEST);
 }
 
-/// Regression for #304: an oversized cursor must be rejected the same way a
-/// malformed one is, with `400 invalid_cursor` — not accepted for decoding.
+/// Regression for #303: `offset` beyond the documented ceiling must be
+/// rejected rather than answered with a full scan-and-skip.
 #[tokio::test]
-async fn test_list_cursor_oversized_is_rejected() {
+async fn test_list_offset_above_max_is_rejected() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
-    let oversized = "a".repeat(1024);
     let res = server
-        .get(&format!("/payments?cursor={oversized}"))
+        .get("/payments?offset=10001")
         .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
+    let body: Value = res.json();
+    assert_eq!(body["code"], "invalid_offset");
+    assert!(
+        body["error"].as_str().unwrap().contains("cursor"),
+        "error message should point callers at cursor pagination, got: {}",
+        body["error"]
+    );
+}
+
+/// The ceiling itself must still be answered normally — only values *above*
+/// it are rejected.
+#[tokio::test]
+async fn test_list_offset_at_max_is_accepted() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?offset=10000")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::OK);
 }
 
 #[tokio::test]
