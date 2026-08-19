@@ -13,7 +13,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
     api,
-    config::{AmountLimit, Config, ListenerMode},
+    config::{Config, ListenerMode},
     db, AppState,
 };
 use tracing_test::traced_test;
@@ -33,9 +33,6 @@ fn make_config() -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
-        stream_idle_timeout_secs: 30,
-        max_payment_amount: AmountLimit::default(),
-        min_payment_amount: AmountLimit::default(),
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,

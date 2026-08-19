@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use stellargate::{
-    config::{AcceptedAsset, AmountLimit, Config, ListenerMode},
+    config::{AcceptedAsset, Config, ListenerMode},
     db, horizon, AppState,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -56,9 +56,6 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            stream_idle_timeout_secs: 30,
-            max_payment_amount: AmountLimit::default(),
-            min_payment_amount: AmountLimit::default(),
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
