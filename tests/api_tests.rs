@@ -56,6 +56,8 @@ fn make_config() -> Config {
         request_timeout_secs: 30,
         stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
+        max_payment_amount: Default::default(),
+        min_payment_amount: Default::default(),
     }
 }
 
@@ -819,6 +821,106 @@ async fn test_create_invalid_amount() {
         .json(&json!({ "amount": "-1", "asset": "XLM" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+// ── Configurable min/max payment amount (issue #310) ───────────────────────
+
+/// An amount over the configured `MAX_PAYMENT_AMOUNT` is rejected with a
+/// distinct code and a message naming the configured limit — not the
+/// overflow-derived `invalid_amount` used for genuinely malformed input.
+#[tokio::test]
+async fn test_create_amount_over_configured_max_is_rejected() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "100.0000001", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "amount_out_of_range");
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("100"),
+        "message must name the configured limit: {message}"
+    );
+}
+
+/// The boundary itself — exactly the configured maximum — is accepted, not
+/// rejected: the limit is inclusive.
+#[tokio::test]
+async fn test_create_amount_at_configured_max_is_accepted() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "100", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// An amount under the configured `MIN_PAYMENT_AMOUNT` is rejected the same
+/// way, and the boundary itself is accepted.
+#[tokio::test]
+async fn test_create_amount_under_configured_min_is_rejected() {
+    let mut cfg = make_config();
+    cfg.min_payment_amount =
+        stellargate::config::AmountLimit::parse("1", "MIN_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "0.9999999", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// A per-asset override (`USDC:50`) wins over the bare default (`100`) for
+/// that asset specifically, while every other asset still uses the default.
+#[tokio::test]
+async fn test_create_amount_per_asset_override_wins_over_default() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100,USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    // USDC: the specific 50 cap applies, not the 100 default.
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "60", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
+
+    // XLM has no specific entry, so the 100 default applies — 60 is fine.
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "60", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
 }
 
 #[tokio::test]

@@ -9,15 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`openapi.yaml`'s `POST /payments` operation didn't say where the merchant
-  comes from.** `CreatePaymentRequest` already had no `merchant_id` property
-  (and already rejected one with `400 unknown_field`), but the operation
-  itself carried no `description` saying so — a reader of the spec alone had
-  no way to know tenancy is derived from the bearer token. Added an operation
-  `description`, and a test (`tests/openapi_drift_tests.rs`) that locks the
-  spec's `CreatePaymentRequest` properties to the Rust struct's fields
-  field-for-field, so the two cannot silently drift apart again the way they
-  did when `merchant_id` was still documented there (issue #307).
+- **A configurable maximum (and minimum) payment amount.** `parse_stroops`
+  rejected an amount only when it overflowed `i64` — roughly 922 billion
+  units of any asset — which is an implementation artifact, not a business
+  rule, and produced a misleading `invalid_amount` error for an amount that
+  was perfectly well-formed and simply too large. An intent above it was
+  unpayable yet still occupied the memo space and the poller's scan until its
+  TTL elapsed, and any real payment against it fired `payment.underpaid` with
+  a delta in the hundreds of billions. `MAX_PAYMENT_AMOUNT` and
+  `MIN_PAYMENT_AMOUNT` are now configurable, optionally per asset (e.g.
+  `MAX_PAYMENT_AMOUNT=100000,USDC:50000`), validated at boot (an asset whose
+  effective minimum exceeds its effective maximum fails startup), and
+  exceeding either now returns a distinct `amount_out_of_range` code naming
+  the configured limit instead of reusing `invalid_amount` (issue #310).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and

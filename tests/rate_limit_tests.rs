@@ -53,6 +53,8 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         request_timeout_secs: 30,
         stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
+        max_payment_amount: Default::default(),
+        min_payment_amount: Default::default(),
     }
 }
 
