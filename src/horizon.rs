@@ -863,11 +863,23 @@ pub async fn run_stream_listener(
     let mut backoff = base_backoff;
     // Start at the live edge; subsequent reconnects resume from the last event.
     let mut cursor = "now".to_string();
+    let idle_timeout = Duration::from_secs(state.config.stream_idle_timeout_secs);
+    let mut first_connection = true;
 
     loop {
+        if !first_connection {
+            /* Every pass through the loop body after the first is a reconnect —
+            whether the previous connection closed cleanly, errored, or (issue
+            #312) went idle past `idle_timeout` with no error at all. A
+            persistently-reconnecting stream is the alertable signal that a
+            half-open connection keeps disabling live payment detection. */
+            state.horizon_metrics.record_stream_reconnect();
+        }
+        first_connection = false;
+
         let cursor_before = cursor.clone();
         tokio::select! {
-            result = stream_once(&state, &client, &mut cursor) => {
+            result = stream_once(&state, &client, &mut cursor, idle_timeout) => {
                 match result {
                     Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
                     Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
@@ -894,12 +906,25 @@ pub async fn run_stream_listener(
     }
 }
 
-/// Open one SSE connection and process events until the stream ends or errors.
-/// Advances `cursor` to the latest event `id` so a reconnect resumes cleanly.
+/// Open one SSE connection and process events until the stream ends, errors,
+/// or goes `idle_timeout` without delivering a single byte. Advances `cursor`
+/// to the latest event `id` so a reconnect resumes cleanly.
+///
+/// The dedicated stream client (built by [`run_stream_listener`]) carries no
+/// overall request timeout — the connection is meant to live indefinitely —
+/// so nothing else bounds a half-open socket that stops delivering bytes
+/// without closing: a NAT or load balancer dropping idle state without
+/// sending `RST`, or an upstream stall. Horizon sends periodic keep-alive
+/// comment lines on its SSE endpoints, so an idle window with no bytes at all
+/// is a reliable liveness signal (issue #312): every await on the next chunk
+/// is itself bounded by `idle_timeout`, and running past it is reported as an
+/// error so the caller's existing reconnect-with-backoff path picks it up
+/// exactly as it would a dropped connection.
 async fn stream_once(
     state: &Arc<AppState>,
     client: &reqwest::Client,
     cursor: &mut String,
+    idle_timeout: Duration,
 ) -> anyhow::Result<()> {
     let url = format!(
         "{}/accounts/{}/payments?cursor={}&join=transactions",
@@ -920,8 +945,18 @@ async fn stream_once(
     split across chunk boundaries are never corrupted. */
     let mut buf: Vec<u8> = Vec::new();
 
-    while let Some(chunk) = stream.next().await {
-        buf.extend_from_slice(&chunk?);
+    loop {
+        let chunk = match tokio::time::timeout(idle_timeout, stream.next()).await {
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "no data received on Horizon stream for {idle_timeout:?}; \
+                     treating the connection as dead"
+                ));
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk?,
+        };
+        buf.extend_from_slice(&chunk);
 
         /* Dispatch every complete event (terminated by a blank line) in the
         buffer, leaving any partial trailing event for the next chunk. */

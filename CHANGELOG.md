@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Horizon SSE stream listener now detects a half-open connection.**
+  `stream_once` awaited `stream.next()` with nothing bounding it, and the
+  stream client is deliberately built without an overall request timeout
+  (the connection is meant to live indefinitely). A connection that stopped
+  delivering bytes without closing — a NAT or load balancer dropping idle
+  state without sending `RST`, or a silently stalled upstream — parked the
+  listener forever: the reconnect-with-backoff loop in `run_stream_listener`
+  is only reached when `stream_once` returns, so it never ran. Nothing
+  external could see it either — `/health` stayed `200` and the poller kept
+  settling payments on its slower cadence, so detection silently degraded
+  from near-real-time to `POLL_INTERVAL_SECS` with no log line and no metric.
+  Every await on the next chunk is now bounded by the new
+  `STREAM_IDLE_TIMEOUT_SECS` (default 30s) — Horizon sends periodic
+  keep-alive comment lines on its SSE endpoints, so an idle window with no
+  bytes at all is a reliable liveness signal. Running past it reconnects
+  through the existing backoff path, and every reconnect (idle timeout,
+  error, or a clean server-side close) now increments the new
+  `stellargate_horizon_stream_reconnects_total` counter on `/metrics` (issue
+  #312).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

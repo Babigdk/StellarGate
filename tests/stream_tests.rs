@@ -61,6 +61,7 @@ fn make_config(horizon_url: &str) -> Config {
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
     }
 }
