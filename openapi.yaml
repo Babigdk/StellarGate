@@ -402,8 +402,13 @@ paths:
           schema:
             type: integer
             minimum: 0
+            maximum: 10000
             default: 0
-          description: Rows to skip (offset pagination)
+          description: >-
+            Rows to skip (offset pagination, deprecated in favour of
+            `cursor`). SQLite implements OFFSET by producing and discarding
+            every skipped row, so cost grows with depth; values above 10000
+            are rejected with `400 invalid_offset` rather than answered.
         - name: cursor
           in: query
           schema:
@@ -434,6 +439,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_status:
+                  summary: Invalid status filter
+                  value:
+                    error: "invalid status 'foo'; valid: pending, completed, underpaid, expired"
+                    code: invalid_status
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_offset:
+                  summary: Offset beyond the maximum
+                  value:
+                    error: "offset exceeds maximum of 10000; use cursor pagination instead (see the `cursor` parameter and `next_cursor` in the response)"
+                    code: invalid_offset
         "401":
           $ref: "#/components/responses/Unauthorized"
 
