@@ -355,6 +355,81 @@ async fn test_task_health_is_exported_on_metrics() {
     );
 }
 
+/// End-to-end regression for the property the supervisor/TaskHealth/metrics
+/// chain exists to guarantee: a background task panic must be visible on the
+/// live `GET /metrics` scrape before the process ever shuts down, not only
+/// once shutdown's `join_task` runs. Unlike
+/// `test_task_health_is_exported_on_metrics` above (which sets the counters
+/// directly), this drives a real `supervise::supervise_with` task through an
+/// actual panic and reads the counter back over HTTP while the supervisor is
+/// still running — proving the counter is live mid-flight, not just at drain
+/// time.
+#[tokio::test]
+async fn test_real_panic_is_visible_on_metrics_before_shutdown() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    let health = stellargate::TaskHealth::new();
+    health.require("probe");
+    let (server, _pool) = server_with_config_and_health(make_config(), health.clone()).await;
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let backoff = stellargate::supervise::Backoff {
+        initial: Duration::from_millis(5),
+        max: Duration::from_millis(20),
+        stability: Duration::from_secs(60),
+    };
+    let runs = Arc::new(AtomicU64::new(0));
+    let runs_inner = runs.clone();
+    let child_shutdown = shutdown_rx.clone();
+    let handle = stellargate::supervise::supervise_with(
+        health.clone(),
+        "probe",
+        shutdown_rx,
+        move || {
+            let runs = runs_inner.clone();
+            let mut shutdown = child_shutdown.clone();
+            async move {
+                let n = runs.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    panic!("deliberate test panic");
+                }
+                let _ = shutdown.changed().await;
+                stellargate::supervise::TaskExit::ShutdownRequested
+            }
+        },
+        backoff,
+    );
+
+    // Poll the live HTTP endpoint (not the in-process counter directly) until
+    // the panic is reflected there.
+    let body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let body = server.get("/metrics").await.text();
+            if body.contains("stellargate_tasks_failed_total 1") {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("panic was never reflected on GET /metrics before shutdown");
+
+    assert!(
+        body.contains("stellargate_task_restarts_total{task=\"probe\"} 1"),
+        "got: {body}"
+    );
+
+    // Only now does the process shut down — the assertions above ran while
+    // it was still live.
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("supervisor did not stop")
+        .expect("supervisor task panicked");
+}
+
 /// A stale detection cursor must make /ready fail even though Horizon itself
 /// is reachable — reachable dependencies plus a dead poller is not readiness
 /// (issue #315).
