@@ -197,6 +197,20 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(pool)
     .await?;
 
+    /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
+    identity). NULL means "use the configured default"; a merchant only gets
+    a row value once an operator sets one explicitly. */
+    let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_rate_limit_per_sec == 0 {
+        sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
+            .execute(pool)
+            .await?;
+    }
+
     /* API keys, one row per credential rather than one per merchant, so a key
     can be rotated (issue a second, revoke the first) and revoked individually
     without disturbing the merchant record.
@@ -1205,12 +1219,23 @@ fn hash_api_key(raw: &str) -> String {
 /// constraint on databases created before `api_keys` existed. Nothing reads it
 /// any more — authentication goes through `api_keys` so that rotation and
 /// revocation work — and it is not maintained as keys change.
-pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
+///
+/// `rate_limit_per_sec` is an optional per-merchant override for the
+/// authenticated rate limiter; `None` leaves the merchant on the configured
+/// default quota.
+pub async fn create_merchant(
+    pool: &Db,
+    id: &str,
+    raw_key: &str,
+    prefix: &str,
+    rate_limit_per_sec: Option<i64>,
+) -> Result<String> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+    sqlx::query("INSERT INTO merchants (id, api_key_hash, rate_limit_per_sec) VALUES (?, ?, ?)")
         .bind(id)
         .bind(hash_api_key(raw_key))
+        .bind(rate_limit_per_sec)
         .execute(&mut *tx)
         .await?;
 
@@ -1491,6 +1516,35 @@ pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> 
     Ok(n)
 }
 
+/// The merchant's per-second rate-limit override, if an operator has set one.
+/// `Ok(None)` covers both "merchant has no override" and "merchant does not
+/// exist" — callers that need to distinguish those should check
+/// [`merchant_exists`] first.
+pub async fn get_merchant_rate_limit(pool: &Db, merchant_id: &str) -> Result<Option<i64>> {
+    let value: Option<Option<i64>> =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT rate_limit_per_sec FROM merchants WHERE id = ?")
+            .bind(merchant_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(value.flatten())
+}
+
+/// Set (or clear, with `None`) a merchant's rate-limit override. Returns
+/// `false` if the merchant does not exist.
+pub async fn set_merchant_rate_limit(
+    pool: &Db,
+    merchant_id: &str,
+    rate_limit_per_sec: Option<i64>,
+) -> Result<bool> {
+    let affected = sqlx::query("UPDATE merchants SET rate_limit_per_sec = ? WHERE id = ?")
+        .bind(rate_limit_per_sec)
+        .bind(merchant_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(affected > 0)
+}
+
 /// Whether a merchant exists, so key endpoints can 404 rather than silently
 /// operating on nothing.
 pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
@@ -1580,6 +1634,59 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].prefix, "legacy");
         assert!(keys[0].revoked_at.is_none());
+
+        // The pre-upgrade schema had no rate_limit_per_sec column at all;
+        // migrating must add it and leave existing merchants on the default.
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "legacy-merchant")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A merchant's rate-limit override round-trips: unset by default,
+    /// settable, and clearable back to `None` (the "use the default" state).
+    #[tokio::test]
+    async fn merchant_rate_limit_override_round_trips() {
+        let pool = memory_db().await;
+        let (raw, prefix) = generate_api_key();
+        create_merchant(&pool, "m1", &raw, &prefix, None)
+            .await
+            .unwrap();
+
+        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
+
+        assert!(set_merchant_rate_limit(&pool, "m1", Some(50))
+            .await
+            .unwrap());
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "m1").await.unwrap(),
+            Some(50)
+        );
+
+        assert!(set_merchant_rate_limit(&pool, "m1", None).await.unwrap());
+        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
+
+        // A merchant that doesn't exist reports "nothing updated".
+        assert!(!set_merchant_rate_limit(&pool, "no-such-merchant", Some(10))
+            .await
+            .unwrap());
+    }
+
+    /// A merchant provisioned with an override has it set from creation.
+    #[tokio::test]
+    async fn create_merchant_persists_initial_rate_limit_override() {
+        let pool = memory_db().await;
+        let (raw, prefix) = generate_api_key();
+        create_merchant(&pool, "m2", &raw, &prefix, Some(25))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "m2").await.unwrap(),
+            Some(25)
+        );
     }
 
     /// Revoking a key must take effect immediately for authentication.
@@ -1587,7 +1694,9 @@ mod tests {
     async fn revoked_keys_stop_authenticating() {
         let pool = memory_db().await;
         let (raw, prefix) = generate_api_key();
-        let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
+        let key_id = create_merchant(&pool, "m1", &raw, &prefix, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             find_merchant_by_key(&pool, &raw).await.unwrap(),
