@@ -85,6 +85,8 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
             request_timeout_secs: 30,
             stream_idle_timeout_secs,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
