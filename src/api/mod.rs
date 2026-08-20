@@ -1,4 +1,4 @@
-use crate::api::payments::{AppError, OptionalJsonBody};
+use crate::api::payments::{AppError, JsonBody, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
     extract::{ConnectInfo, Path, Request, State},
@@ -91,11 +91,61 @@ impl RateLimitState {
     }
 }
 
+/// The default per-merchant quota is this multiple of the configured base
+/// `rate_limit_requests_per_sec`, matching the outer IP limiter's own
+/// "default" (read) bucket multiplier. A merchant's authenticated traffic is
+/// a mix of writes and polling reads, so it needs at least that much room to
+/// avoid throttling well-behaved integrators (issue: rate limiter keyed on
+/// IP, not identity).
+const MERCHANT_DEFAULT_QUOTA_MULTIPLIER: u32 = 5;
+
+/// Per-merchant quota state for the authenticated rate limiter. Unlike
+/// [`RateLimitState`], this is keyed on [`AuthenticatedMerchant`] alone —
+/// independent of source IP — so a merchant's quota is a property of who
+/// they are, not where they connect from.
+#[derive(Clone)]
+struct MerchantRateLimitState {
+    pool: db::Db,
+    /// Fallback quota for a merchant with no `rate_limit_per_sec` override.
+    default_rps: u32,
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
+}
+
+impl MerchantRateLimitState {
+    fn new(pool: db::Db, default_rps: u32) -> Self {
+        let limiters = Cache::builder()
+            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            // A time-to-live (rather than only idle eviction) bounds how long
+            // a busy merchant can keep serving a stale, cached quota after an
+            // operator changes `rate_limit_per_sec` — a merchant that never
+            // goes idle would otherwise never pick up the new value.
+            .time_to_live(RATE_LIMITER_IDLE_TTL)
+            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .build();
+        Self {
+            pool,
+            default_rps: default_rps.max(1),
+            limiters,
+        }
+    }
+}
+
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
     let rate_limit = RateLimitState::new(
         state.config.rate_limit_requests_per_sec,
         state.config.trusted_proxy_cidrs.clone(),
+    );
+    /* Built once and shared (moka `Cache` clones point at the same underlying
+    store) across both mounts of `api_v1` below. Built per-call instead, a
+    merchant could double its effective quota by splitting traffic between
+    `/payments` and `/v1/payments` — each mount would track it separately. */
+    let merchant_rate_limit = MerchantRateLimitState::new(
+        state.pool.clone(),
+        state
+            .config
+            .rate_limit_requests_per_sec
+            .saturating_mul(MERCHANT_DEFAULT_QUOTA_MULTIPLIER),
     );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
@@ -118,8 +168,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         exists to prevent (issue #121). Legacy responses carry `Deprecation`
         and `Link` headers pointing at their `/v1` equivalent, so a client can
         discover the move from a response it already parses. */
-        .nest("/v1", api_v1(&state))
-        .merge(api_v1(&state).layer(middleware::from_fn(mark_deprecated)))
+        .nest("/v1", api_v1(&state, merchant_rate_limit.clone()))
+        .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
@@ -143,7 +193,10 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
 /// are deliberately excluded. They are infrastructure rather than contract —
 /// a probe URL that moved with every API revision would break liveness checks
 /// and scrape configs for no benefit.
-fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
+fn api_v1(
+    state: &Arc<AppState>,
+    merchant_rate_limit: MerchantRateLimitState,
+) -> axum::Router<Arc<AppState>> {
     /* Merchant provisioning and API key lifecycle. All admin-gated behind
     ADMIN_PROVISIONING_SECRET: this service has no self-service signup, and
     minting or revoking a credential is an operator action. */
@@ -151,6 +204,10 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
         .route("/", post(provision_merchant))
         .route("/:id/keys", post(issue_api_key).get(list_api_keys))
         .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
+        .route(
+            "/:id/rate-limit",
+            axum::routing::put(set_merchant_rate_limit),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_secret,
@@ -177,6 +234,15 @@ fn api_v1(state: &Arc<AppState>) -> axum::Router<Arc<AppState>> {
             "/:id/webhooks/:delivery_id/redeliver",
             post(payments::redeliver_webhook),
         )
+        /* Per-merchant quota, added as a `route_layer` *inside* `auth_middleware`
+        (see ordering note there) so it keys on `AuthenticatedMerchant` rather
+        than source IP: a merchant's capacity is theirs regardless of where
+        they connect from, and cannot be multiplied by spreading requests
+        across addresses. */
+        .route_layer(middleware::from_fn_with_state(
+            merchant_rate_limit,
+            merchant_rate_limit_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -312,29 +378,53 @@ async fn require_admin_secret(
 
 /// `POST /merchants` — provision a new merchant and return its API key once.
 /// Requires the `X-Admin-Secret` header (see `require_admin_secret`).
+///
+/// Accepts an optional `{ "rate_limit_per_sec": <n> }` body to give this
+/// merchant a per-merchant quota override from the start; omitted or `null`
+/// leaves it on the configured default (issue: rate limiter keyed on IP, not
+/// identity).
 async fn provision_merchant(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    OptionalJsonBody(body): OptionalJsonBody<ProvisionMerchantRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let source_ip =
         client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
     let req_id = request_id(&headers);
 
+    let rate_limit_per_sec = body.and_then(|b| b.rate_limit_per_sec);
+    if let Some(n) = rate_limit_per_sec {
+        if n <= 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": "rate_limit_per_sec must be positive", "code": "invalid_rate_limit" }),
+                ),
+            ));
+        }
+    }
+
     let merchant_id = uuid::Uuid::new_v4().to_string();
     let (raw_key, prefix) = db::generate_api_key();
 
-    let key_id = db::create_merchant(&state.pool, &merchant_id, &raw_key, &prefix)
-        .await
-        .map_err(|e| {
-            // Issue #125: swallowing this left an operator with a 500 and no
-            // way to tell a disk error from a UNIQUE collision.
-            tracing::error!(error = %e, "failed to provision merchant");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "internal server error", "code": "internal_error" })),
-            )
-        })?;
+    let key_id = db::create_merchant(
+        &state.pool,
+        &merchant_id,
+        &raw_key,
+        &prefix,
+        rate_limit_per_sec,
+    )
+    .await
+    .map_err(|e| {
+        // Issue #125: swallowing this left an operator with a 500 and no
+        // way to tell a disk error from a UNIQUE collision.
+        tracing::error!(error = %e, "failed to provision merchant");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "internal server error", "code": "internal_error" })),
+        )
+    })?;
 
     /* Successful provisioning is the single most privileged operation in the
     system — it mints a credential — and previously left no trace at all
@@ -359,8 +449,78 @@ async fn provision_merchant(
             "merchant_id": merchant_id,
             "api_key": raw_key,
             "key_id": key_id,
+            "rate_limit_per_sec": rate_limit_per_sec,
         })),
     ))
+}
+
+/// The optional `POST /merchants` body.
+///
+/// `deny_unknown_fields` for the same reason as `IssueKeyRequest` — a typo in
+/// the field name should surface as a `400`, not silently fall back to the
+/// default quota.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProvisionMerchantRequest {
+    rate_limit_per_sec: Option<i64>,
+}
+
+/// `PUT /merchants/:id/rate-limit` — set or clear a merchant's per-second
+/// quota override for the authenticated rate limiter. `null` (or an absent
+/// field) clears the override and returns the merchant to the configured
+/// default. Admin-gated, like the rest of `/merchants`.
+async fn set_merchant_rate_limit(
+    State(state): State<Arc<AppState>>,
+    Path(merchant_id): Path<String>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    JsonBody(body): JsonBody<SetRateLimitRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if let Some(n) = body.rate_limit_per_sec {
+        if n <= 0 {
+            return Err(AppError::bad_request(
+                "invalid_rate_limit",
+                "rate_limit_per_sec must be positive",
+            ));
+        }
+    }
+
+    if !db::set_merchant_rate_limit(&state.pool, &merchant_id, body.rate_limit_per_sec).await? {
+        return Err(AppError::not_found(
+            "merchant_not_found",
+            "merchant not found",
+        ));
+    }
+
+    let source_ip =
+        client_ip_key_from_parts(Some(peer), &headers, &state.config.trusted_proxy_cidrs);
+    tracing::info!(
+        audit = true,
+        action = "merchant.rate_limit.set",
+        actor = "admin",
+        outcome = "updated",
+        %merchant_id,
+        rate_limit_per_sec = ?body.rate_limit_per_sec,
+        source_ip = %source_ip,
+        request_id = %request_id(&headers),
+        "merchant rate limit updated"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "merchant_id": merchant_id,
+            "rate_limit_per_sec": body.rate_limit_per_sec,
+        })),
+    ))
+}
+
+/// The `PUT /merchants/:id/rate-limit` body. `deny_unknown_fields` so a typo
+/// surfaces as a `400` rather than silently doing nothing.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetRateLimitRequest {
+    rate_limit_per_sec: Option<i64>,
 }
 
 /// `POST /merchants/:id/keys` — issue an additional API key.
@@ -596,6 +756,96 @@ async fn rate_limit_middleware(
     }
 }
 
+/// Enforces a per-merchant quota, independent of client IP, so one merchant
+/// can never exhaust another's capacity and a merchant cannot multiply its
+/// own quota by spreading requests across source addresses.
+///
+/// A `route_layer` mounted *inside* `auth_middleware` (see `api_v1`), so it
+/// runs only once a request is attributed to an [`AuthenticatedMerchant`] and
+/// keys purely on that identity. The coarse IP limiter above it still runs
+/// first and is left untouched — cheap flood rejection before touching the
+/// database is the right instinct, this just adds the identity-aware layer
+/// the issue calls for on top of it.
+///
+/// Requests that clear the quota pass through unmodified; the success-path
+/// `X-RateLimit-*` headers stay owned by the outer IP limiter, which already
+/// sets them on every response. On a rejection, this builds its own `429`
+/// carrying the merchant-scoped `Retry-After` and `X-RateLimit-*` values —
+/// `set_rate_limit_headers` only fills headers that aren't already present,
+/// so the outer layer cannot overwrite them on the way back out.
+async fn merchant_rate_limit_middleware(
+    State(rate_limit): State<MerchantRateLimitState>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let Some(AuthenticatedMerchant(merchant_id)) =
+        req.extensions().get::<AuthenticatedMerchant>().cloned()
+    else {
+        // No authenticated merchant in scope for this route — nothing to key
+        // on, so defer entirely to the outer IP limiter.
+        return next.run(req).await;
+    };
+
+    let limiter = match rate_limit.limiters.get(&merchant_id) {
+        Some(limiter) => limiter,
+        None => {
+            let rps = merchant_quota_rps(&rate_limit, &merchant_id).await;
+            let fresh = Arc::new(
+                governor::RateLimiter::direct(governor::Quota::per_second(
+                    NonZeroU32::new(rps).unwrap(),
+                ))
+                .with_middleware::<StateInformationMiddleware>(),
+            );
+            rate_limit
+                .limiters
+                .insert(merchant_id.clone(), fresh.clone());
+            fresh
+        }
+    };
+
+    match limiter.check() {
+        Ok(_) => next.run(req).await,
+        Err(not_until) => {
+            let wait = not_until.wait_time_from(DefaultClock::default().now());
+            let retry_after = retry_after_secs(wait);
+            let reset = reset_secs(not_until.quota(), 0, wait);
+            let limit = not_until.quota().burst_size().get();
+
+            let mut res = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({
+                    "error": "merchant rate limit exceeded",
+                    "code": "merchant_rate_limit_exceeded"
+                })),
+            )
+                .into_response();
+
+            let headers = res.headers_mut();
+            if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+            set_rate_limit_headers(headers, limit, 0, reset);
+            res
+        }
+    }
+}
+
+/// Resolve the quota a merchant's limiter should be built with: its own
+/// `rate_limit_per_sec` override if an operator has set one, otherwise the
+/// configured default. A lookup failure falls back to the default rather than
+/// failing the request — an operator-set override is an optimization, not a
+/// safety property this path needs to be strict about.
+async fn merchant_quota_rps(rate_limit: &MerchantRateLimitState, merchant_id: &str) -> u32 {
+    match db::get_merchant_rate_limit(&rate_limit.pool, merchant_id).await {
+        Ok(Some(custom)) if custom > 0 => custom.min(u32::MAX as i64) as u32,
+        Ok(_) => rate_limit.default_rps,
+        Err(e) => {
+            tracing::error!(%merchant_id, error = %e, "merchant rate limit lookup failed; using default quota");
+            rate_limit.default_rps
+        }
+    }
+}
+
 /// `Retry-After`, in delta-seconds per RFC 9110.
 ///
 /// Rounded *up*, with a floor of 1. Truncating would hand back a value the
@@ -621,6 +871,11 @@ fn reset_secs(quota: governor::Quota, remaining: u32, wait_for_next: Duration) -
     total.as_secs_f64().ceil() as u64
 }
 
+/// Sets a header only if it isn't already present. The per-merchant limiter
+/// (issue: rate limiter keyed on IP, not identity) runs *inside* this one and
+/// sets these same header names on its own rejections first; using `entry`
+/// here means the outer IP-bucket layer never clobbers the more specific,
+/// identity-bound values with its own.
 fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
     for (name, value) in [
         (X_RATELIMIT_LIMIT, limit as u64),
@@ -628,7 +883,7 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
         (X_RATELIMIT_RESET, reset),
     ] {
         if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
-            headers.insert(name, value);
+            headers.entry(name).or_insert(value);
         }
     }
 }
