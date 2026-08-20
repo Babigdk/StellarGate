@@ -103,6 +103,28 @@ async fn provision_merchant(server: &TestServer) -> String {
     res.json::<Value>()["api_key"].as_str().unwrap().to_string()
 }
 
+/// Like [`provision_merchant`], but also returns the merchant id and accepts
+/// an initial `rate_limit_per_sec` override (`None` leaves the merchant on
+/// the configured default).
+async fn provision_merchant_with_limit(
+    server: &TestServer,
+    rate_limit_per_sec: Option<i64>,
+) -> (String, String) {
+    let mut req = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET);
+    if let Some(n) = rate_limit_per_sec {
+        req = req.json(&json!({ "rate_limit_per_sec": n }));
+    }
+    let res = req.await;
+    res.assert_status(StatusCode::CREATED);
+    let body: Value = res.json();
+    (
+        body["api_key"].as_str().unwrap().to_string(),
+        body["merchant_id"].as_str().unwrap().to_string(),
+    )
+}
+
 #[tokio::test]
 async fn test_rate_limit_exceeded_returns_429() {
     let (server, _pool) = server_with_config(make_config(1)).await;
@@ -369,4 +391,156 @@ async fn test_redeliver_rate_limit_exceeded_returns_429() {
         .await;
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
+}
+
+// ── Per-merchant quota (the rate limiter was keyed on bucket + client IP,
+// not identity: one merchant could exhaust another's capacity, and a single
+// merchant could multiply its own quota by spreading requests across source
+// addresses) ─────────────────────────────────────────────────────────────
+
+/// The core fix: two merchants sharing a client IP — everything in this
+/// process shares one, via `TestServer` — do not share a quota. Draining one
+/// merchant's capacity must not affect the other's.
+#[tokio::test]
+async fn merchant_quota_is_independent_of_other_merchants() {
+    // A generous base so the outer, IP-keyed limiter never fires here — this
+    // test is about the per-merchant layer underneath it.
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    let (key_a, _id_a) = provision_merchant_with_limit(&server, Some(1)).await;
+    let (key_b, _id_b) = provision_merchant_with_limit(&server, None).await;
+
+    // Merchant A drains its own single-request quota.
+    server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key_a}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let throttled = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key_a}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    throttled.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        throttled.json::<Value>()["code"],
+        "merchant_rate_limit_exceeded"
+    );
+
+    // Merchant B — same client IP, no relation to A's quota — is unaffected.
+    server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key_b}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+}
+
+/// An operator can tighten a merchant's quota below the default, and it is
+/// enforced from that merchant's very first authenticated request.
+#[tokio::test]
+async fn admin_can_configure_a_merchants_quota() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+    let (key, merchant_id) = provision_merchant_with_limit(&server, None).await;
+
+    server
+        .put(&format!("/merchants/{merchant_id}/rate-limit"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "rate_limit_per_sec": 1 }))
+        .await
+        .assert_status(StatusCode::OK);
+
+    let auth = format!("Bearer {key}");
+    server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    server
+        .post("/payments")
+        .add_header("Authorization", auth)
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// A merchant's own throttled response reports its own configured quota —
+/// not a stale or generic constant — so a client can actually self-pace.
+#[tokio::test]
+async fn merchant_throttled_response_reports_its_own_quota() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+    let (key, _id) = provision_merchant_with_limit(&server, Some(3)).await;
+    let auth = format!("Bearer {key}");
+
+    for _ in 0..3 {
+        server
+            .post("/payments")
+            .add_header("Authorization", auth.clone())
+            .json(&json!({ "amount": "1", "asset": "XLM" }))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    let throttled = server
+        .post("/payments")
+        .add_header("Authorization", auth)
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    throttled.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header(&throttled, "x-ratelimit-limit"), "3");
+    assert_eq!(header(&throttled, "x-ratelimit-remaining"), "0");
+    let retry_after: u64 = header(&throttled, "retry-after").parse().unwrap();
+    assert!(retry_after >= 1);
+}
+
+/// Setting a quota for a merchant that doesn't exist 404s rather than
+/// silently doing nothing.
+#[tokio::test]
+async fn setting_rate_limit_for_unknown_merchant_404s() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+    server
+        .put("/merchants/does-not-exist/rate-limit")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "rate_limit_per_sec": 5 }))
+        .await
+        .assert_status(StatusCode::NOT_FOUND);
+}
+
+/// The new endpoint is admin-gated like the rest of `/merchants`.
+#[tokio::test]
+async fn rate_limit_endpoint_requires_admin_secret() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+    let (_key, merchant_id) = provision_merchant_with_limit(&server, None).await;
+    server
+        .put(&format!("/merchants/{merchant_id}/rate-limit"))
+        .json(&json!({ "rate_limit_per_sec": 5 }))
+        .await
+        .assert_status(StatusCode::UNAUTHORIZED);
+}
+
+/// A non-positive override is rejected at both the point of provisioning and
+/// the point of updating — a `0` or negative quota would lock a merchant out
+/// entirely, and that should be an explicit choice, not a typo.
+#[tokio::test]
+async fn non_positive_rate_limit_is_rejected() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "rate_limit_per_sec": 0 }))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
+
+    let (_key, merchant_id) = provision_merchant_with_limit(&server, None).await;
+    server
+        .put(&format!("/merchants/{merchant_id}/rate-limit"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "rate_limit_per_sec": -1 }))
+        .await
+        .assert_status(StatusCode::BAD_REQUEST);
 }
