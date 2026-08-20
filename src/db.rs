@@ -1198,6 +1198,38 @@ pub async fn ping(pool: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the on-disk path from a `sqlite:` `DATABASE_URL`, for file-size
+/// metrics. Returns `None` for `sqlite::memory:` or anything else with no
+/// backing file to `stat()`.
+fn sqlite_path(database_url: &str) -> Option<&str> {
+    let rest = database_url.strip_prefix("sqlite:")?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let rest = rest.trim_start_matches("//");
+    if rest.is_empty() || rest == ":memory:" {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Sizes, in bytes, of the main database file and its `-wal`/`-shm`
+/// companions, for the `stellargate_db_file_size_bytes` gauge (issue: missing
+/// DB metrics). Each is `None` when the file doesn't exist yet (a `-wal`
+/// before the first write, or any of them for an in-memory database) rather
+/// than an error — a fresh deployment legitimately has no WAL file.
+///
+/// Returns `(main, wal, shm)`.
+pub fn file_sizes(database_url: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let Some(path) = sqlite_path(database_url) else {
+        return (None, None, None);
+    };
+    let stat = |p: String| std::fs::metadata(p).ok().map(|m| m.len());
+    (
+        stat(path.to_string()),
+        stat(format!("{path}-wal")),
+        stat(format!("{path}-shm")),
+    )
+}
+
 /* ---------------------------------------------------------------------------
 Merchant API-key management
 --------------------------------------------------------------------------- */
@@ -2381,5 +2413,43 @@ mod tests {
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
+    }
+
+    // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────
+
+    #[test]
+    fn file_sizes_is_none_for_in_memory_database() {
+        let (main, wal, shm) = file_sizes("sqlite::memory:");
+        assert_eq!((main, wal, shm), (None, None, None));
+    }
+
+    #[test]
+    fn file_sizes_reports_the_main_file_and_absent_wal_shm() {
+        let contents = b"pretend sqlite header bytes";
+        let path =
+            std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+
+        let url = format!("sqlite:{}", path.display());
+        let (main, wal, shm) = file_sizes(&url);
+        assert_eq!(
+            main,
+            Some(contents.len() as u64),
+            "main file size must be reported"
+        );
+        assert_eq!(wal, None, "no -wal file exists yet");
+        assert_eq!(shm, None, "no -shm file exists yet");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_sizes_strips_query_parameters_before_stat() {
+        // The shared-memory DSN other tests in this module use
+        // (`sqlite:file:<uuid>?mode=memory&cache=shared`) has no on-disk
+        // file, but must not panic or attempt to stat a path still carrying
+        // its `?mode=...` query string.
+        let (main, wal, shm) = file_sizes(&shared_memory_dsn());
+        assert_eq!((main, wal, shm), (None, None, None));
     }
 }

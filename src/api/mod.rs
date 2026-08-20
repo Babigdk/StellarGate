@@ -1,7 +1,7 @@
 use crate::api::payments::{AppError, JsonBody, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, MatchedPath, Path, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
@@ -183,6 +183,14 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
+        ))
+        /* Outermost so it measures the complete request lifecycle — including
+        a 429 from the rate limiter or a 408 from the timeout above — and
+        records the true final status and total latency (issue: missing
+        operational metrics). */
+        .layer(middleware::from_fn_with_state(
+            state.http_metrics.clone(),
+            http_metrics_middleware,
         ))
         .with_state(state)
 }
@@ -1275,13 +1283,59 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
     }
 }
 
+/// Records one completed HTTP request's method, matched route, status, and
+/// latency into [`crate::metrics::HttpMetrics`].
+///
+/// Labelled by the *matched route pattern* (`MatchedPath`, e.g.
+/// `/v1/payments/:id`), never the raw request URI — using the raw path would
+/// let every distinct payment or merchant id mint its own label series, which
+/// is exactly the unbounded-cardinality failure mode Prometheus labels must
+/// avoid. A request that matched no route at all (a genuine 404 on an
+/// unmapped path) is labelled `<unmatched>` for the same reason.
+///
+/// Applied as the outermost layer in [`router`] so the recorded status and
+/// latency reflect the complete request lifecycle, including rejections from
+/// the rate limiter or timeout layers beneath it.
+async fn http_metrics_middleware(
+    State(http_metrics): State<crate::metrics::HttpMetrics>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string());
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    http_metrics.record(&method, &route, response.status().as_u16(), elapsed_ms);
+    response
+}
+
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (main_bytes, wal_bytes, shm_bytes) = db::file_sizes(&state.config.database_url);
+    let db_snapshot = crate::metrics::DbSnapshot {
+        pool_size: state.pool.size(),
+        pool_idle: state.pool.num_idle() as u32,
+        pool_max: state.config.db_pool_max_connections,
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
+    };
+
     let body = crate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
+        &state.http_metrics,
+        &state.payment_metrics,
+        &db_snapshot,
     );
     (
         StatusCode::OK,

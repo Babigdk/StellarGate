@@ -93,6 +93,8 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -192,11 +194,22 @@ async fn stalled_stream_is_detected_and_reconnected() {
         "a detected stall must be counted as a stream reconnect"
     );
 
+    let db_snapshot = stellargate::metrics::DbSnapshot {
+        pool_size: state.pool.size(),
+        pool_idle: state.pool.num_idle() as u32,
+        pool_max: state.config.db_pool_max_connections,
+        main_bytes: None,
+        wal_bytes: None,
+        shm_bytes: None,
+    };
     let rendered = stellargate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
+        &state.http_metrics,
+        &state.payment_metrics,
+        &db_snapshot,
     );
     assert!(
         rendered.contains("stellargate_horizon_stream_reconnects_total"),
