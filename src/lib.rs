@@ -338,6 +338,12 @@ pub struct AppState {
     /// Exposed via `GET /metrics` so sustained throttling is a queryable fact
     /// rather than indistinguishable `warn!` lines (issue #313).
     pub horizon_metrics: metrics::HorizonMetrics,
+    /// Per-asset gateway trustline state, refreshed at boot and on a
+    /// recurring interval thereafter (trustlines can be revoked, or an asset
+    /// added to `ACCEPTED_ASSETS`, at any time after boot). Exposed via
+    /// `GET /metrics` and consulted by `POST /payments` to reject intents in
+    /// an asset currently confirmed unpayable.
+    pub trustline_metrics: metrics::TrustlineMetrics,
     /// Background task health: per-task liveness (drives `/health`), the last
     /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
     /// and started/stopped/failure/restart counts for monitoring and alerting.
