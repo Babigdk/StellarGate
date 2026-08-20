@@ -796,7 +796,9 @@ async fn merchant_rate_limit_middleware(
                 ))
                 .with_middleware::<StateInformationMiddleware>(),
             );
-            rate_limit.limiters.insert(merchant_id.clone(), fresh.clone());
+            rate_limit
+                .limiters
+                .insert(merchant_id.clone(), fresh.clone());
             fresh
         }
     };

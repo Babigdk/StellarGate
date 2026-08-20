@@ -1521,11 +1521,12 @@ pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> 
 /// exist" — callers that need to distinguish those should check
 /// [`merchant_exists`] first.
 pub async fn get_merchant_rate_limit(pool: &Db, merchant_id: &str) -> Result<Option<i64>> {
-    let value: Option<Option<i64>> =
-        sqlx::query_scalar::<_, Option<i64>>("SELECT rate_limit_per_sec FROM merchants WHERE id = ?")
-            .bind(merchant_id)
-            .fetch_optional(pool)
-            .await?;
+    let value: Option<Option<i64>> = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rate_limit_per_sec FROM merchants WHERE id = ?",
+    )
+    .bind(merchant_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(value.flatten())
 }
 
@@ -1669,9 +1670,11 @@ mod tests {
         assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
 
         // A merchant that doesn't exist reports "nothing updated".
-        assert!(!set_merchant_rate_limit(&pool, "no-such-merchant", Some(10))
-            .await
-            .unwrap());
+        assert!(
+            !set_merchant_rate_limit(&pool, "no-such-merchant", Some(10))
+                .await
+                .unwrap()
+        );
     }
 
     /// A merchant provisioned with an override has it set from creation.
