@@ -578,3 +578,21 @@ async fn health_survives_an_exhausted_default_bucket() {
     // /health never touched that bucket, so draining it changes nothing.
     server.get("/health").await.assert_status_ok();
 }
+
+/// Same scenario as `health_survives_an_exhausted_default_bucket`, for the
+/// other two exempt paths.
+#[tokio::test]
+async fn ready_and_metrics_survive_an_exhausted_default_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    for _ in 0..5 {
+        server.get("/payments/nonexistent").await;
+    }
+    server
+        .get("/payments/nonexistent")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    server.get("/ready").await.assert_status_ok();
+    server.get("/metrics").await.assert_status_ok();
+}
