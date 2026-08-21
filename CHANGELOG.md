@@ -61,6 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive
+  limit the system can apply.** `Config::validate_timing` rejects
+  `POLL_INTERVAL_SECS=0`, `PAYMENT_TTL_SECS=0`, `WEBHOOK_RETRY_ATTEMPTS=0`,
+  `WEBHOOK_RETRY_DELAY_MS=0`, and `REQUEST_TIMEOUT_SECS=0` at boot, but
+  `RATE_LIMIT_REQUESTS_PER_SEC=0` was missed — it passed validation and was
+  then silently clamped up to `1` request/sec by `RateLimitState::new`. An
+  operator setting `0` almost always means "disable rate limiting" or "I
+  haven't configured this yet"; either way they got the tightest possible
+  limit instead, with no warning at boot, which looks like an outage. Boot
+  now refuses `RATE_LIMIT_REQUESTS_PER_SEC=0` with the same explanatory style
+  as its siblings, and the `.max(1)` clamp is gone — the effective per-IP
+  rate now always equals the configured one (issue #276).
+
 - **An SSRF-blocked webhook delivery was retried by the redrive worker
   forever, double-counting the failure metric on every pass.** Both
   `dispatch()` and `redrive_one()` correctly marked a delivery blocked by the

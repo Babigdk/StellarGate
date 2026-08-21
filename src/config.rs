@@ -738,6 +738,9 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `RATE_LIMIT_REQUESTS_PER_SEC == 0` → silently clamped up to 1 req/sec
+    ///   by `RateLimitState::new`, the most aggressive limit available, rather
+    ///   than disabling the limiter as an operator setting `0` likely intends
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
@@ -842,6 +845,15 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.rate_limit_requests_per_sec == 0 {
+            return Err(anyhow::anyhow!(
+                "RATE_LIMIT_REQUESTS_PER_SEC must be > 0 (got 0). \
+                 `RateLimitState::new` used to silently clamp a zero configured rate up to \
+                 1 request/sec — the single most aggressive limit the system can apply, not \
+                 the disabled limiter an operator setting 0 most likely intended."
             ));
         }
 
@@ -1844,6 +1856,19 @@ mod tests {
         cfg.webhook_redrive_backoff_initial_secs = 0;
         cfg.webhook_redrive_backoff_max_secs = 0;
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn timing_rejects_zero_rate_limit_requests_per_sec() {
+        let mut cfg = timing_config();
+        cfg.rate_limit_requests_per_sec = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("RATE_LIMIT_REQUESTS_PER_SEC"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_default_rate_limit_requests_per_sec() {
+        assert!(timing_config().validate_timing().is_ok());
     }
 
     #[test]
