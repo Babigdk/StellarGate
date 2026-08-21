@@ -151,6 +151,17 @@ poller that died at startup surfaces as `payment detection stalled` instead of
 leaving the probe green (issue #315). `/health` fails when an expected
 background task is no longer running, naming the dead task in its `reason`.
 
+**`/health`, `/ready` and `/metrics` are never rate-limited.** They used to
+share the same per-IP "default" bucket as ordinary GET traffic, which meant a
+traffic spike that tripped the limiter also handed the orchestrator's own
+probe a `429`. `curl -f` treats a `429` as a failed check, and after
+`retries: 3` the container gets marked unhealthy and restarted — right when it
+is least able to absorb that, since restarting this service means the poller
+re-baselines and the redrive worker runs a full pass on start. Probes are
+cheap, come from a trusted orchestrator, and exist specifically to stay
+answerable under stress, so they're exempt from the limiter entirely rather
+than sharing a bucket with merchant API traffic.
+
 The first build compiles the whole dependency tree and takes several minutes on
 a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
 
