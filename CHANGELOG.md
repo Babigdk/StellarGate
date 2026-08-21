@@ -43,20 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **`/health`, `/ready` and `/metrics` are exempt from the per-IP rate
-  limiter.** Every non-`POST` request, probes included, fell into the same
-  `"default"` bucket as merchant read traffic. Under load that bucket empties,
-  the orchestrator's liveness probe — same source IP as everything else —
-  starts getting `429`s, `curl -f` treats that as a failed check, and the
-  container gets marked unhealthy and restarted right when it can least
-  afford it: this service's poller has to re-baseline and the redrive worker
-  runs a full pass on start, so a restart under load concentrates load on the
-  rest of the fleet instead of relieving it. `rate_limited_bucket` now returns
-  `None` for these three paths, which the middleware already treats as
-  "skip limiting entirely" — probes are cheap, come from a trusted
-  orchestrator, and exist specifically to stay answerable under stress, so
-  they no longer share a bucket with anything else. Documented in
-  DEPLOYMENT.md.
+- **An SSRF-blocked webhook delivery was retried by the redrive worker
+  forever, double-counting the failure metric on every pass.** Both
+  `dispatch()` and `redrive_one()` correctly marked a delivery blocked by the
+  SSRF guard `status = "failed"`, but left `attempts` at its prior value
+  (usually `0`). `list_redrivable_deliveries` selects on `status IN
+  ('pending', 'failed') AND attempts < max_attempts`, so `status = "failed"`
+  alone never removed the row from consideration — only `attempts` reaching
+  the redrive cap does. The background worker picked the same blocked
+  delivery back up on every subsequent pass, re-ran the (still-blocked) SSRF
+  check, and incremented `stellargate_webhook_deliveries_total{outcome
+  ="failed"}` again each time, forever. Both blocked branches now record
+  `attempts` at the configured redrive cap, which is what actually makes the
+  row terminal. New tests in `tests/webhook_dispatch_tests.rs` pin the
+  invariant directly — a second `redrive_once` pass past the grace window
+  attempts nothing, and a blocked `dispatch()` delivery never appears in
+  `list_redrivable_deliveries` at all — rather than asserting specific column
+  values, so they survive a future change of representation.
 
 - **Test pools now use a genuinely shared in-memory SQLite database.** Every
   test suite built its pool from the DSN `sqlite::memory:` while allowing

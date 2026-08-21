@@ -184,7 +184,13 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
             `stellargate_webhook_deliveries_total{outcome="failed"}` and to any
             alert built on it (issues #319, #233). */
             state.webhook_metrics.record_failed();
-            let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery_id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };
@@ -284,6 +290,21 @@ pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
     Duration::from_millis(half + rand::random_range(0..=(ceiling_ms - half)))
 }
 
+/// The `attempts` value to record for a delivery the SSRF guard blocked.
+///
+/// `list_redrivable_deliveries` selects rows where `status IN ('pending',
+/// 'failed') AND attempts < max_attempts` — so `status = "failed"` alone does
+/// not remove a row from consideration; only `attempts` reaching the redrive
+/// cap does. A blocked delivery makes no network attempt, so there is no
+/// natural attempt count to record, but leaving it at its prior value (often
+/// `0`) left `attempts < max_attempts` permanently true: the redrive worker
+/// would pick the same blocked delivery back up on every subsequent pass —
+/// forever, and double-counting the terminal-failure metric each time it did.
+/// Recording the cap itself is what actually makes the row terminal.
+fn blocked_delivery_attempts(state: &AppState) -> i64 {
+    state.config.webhook_redrive_max_attempts as i64
+}
+
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated
 /// address. The client is built with the configured `WEBHOOK_TIMEOUT_SECS`
 /// timeout so that each delivery attempt is independently bounded. Honors
@@ -367,9 +388,13 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
             warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
             // Terminal, so counted — same gap as the inline path above.
             state.webhook_metrics.record_failed();
-            let _ =
-                db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
-                    .await;
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery.id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };

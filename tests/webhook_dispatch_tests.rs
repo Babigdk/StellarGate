@@ -668,3 +668,89 @@ async fn ssrf_blocked_redrive_is_counted_as_a_terminal_failure() {
         "an SSRF-blocked redrive is terminal and must be counted"
     );
 }
+
+/// The invariant this whole suite exists to pin: every delivery eventually
+/// reaches a terminal state. An SSRF-blocked delivery is rejected by an error
+/// return rather than an HTTP response, which is a different shape from every
+/// other test here — and it is exactly the shape that let it slip through
+/// without ever reaching that invariant. `redrive_once` is called *twice*,
+/// past the grace/backoff window each time, and the second pass must attempt
+/// nothing: if a blocked delivery were still eligible, the worker would retry
+/// it forever, and the failure metric would climb once per tick instead of
+/// once ever.
+#[tokio::test]
+async fn ssrf_blocked_redrive_is_never_retried_again() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_allow_private_targets = false;
+    cfg.webhook_redrive_grace_secs = 0;
+    cfg.webhook_redrive_backoff_initial_secs = 0;
+    cfg.webhook_redrive_backoff_max_secs = 0;
+    let state = setup_state(cfg).await;
+
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    db::save_webhook_delivery(
+        &state.pool,
+        "blocked-delivery",
+        &payment.id,
+        "http://127.0.0.1:1/hook",
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+
+    let state = Arc::new(state);
+    assert_eq!(
+        webhook::redrive_once(&state).await,
+        1,
+        "the blocked delivery is attempted once"
+    );
+    assert_eq!(
+        webhook::redrive_once(&state).await,
+        0,
+        "a delivery blocked by the SSRF guard must reach a terminal state, \
+         not remain redrivable forever"
+    );
+
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "the terminal failure must be counted exactly once, not once per \
+         redrive pass"
+    );
+}
+
+/// Same invariant, checked directly against the query the redrive worker
+/// actually uses rather than by running the worker twice — so this survives
+/// even if `redrive_once`'s own bookkeeping changes shape. A delivery that
+/// `dispatch()` gave up on because of the SSRF guard must never come back as
+/// a redrive candidate, no matter how long the grace/backoff window is left
+/// to elapse.
+#[tokio::test]
+async fn ssrf_blocked_dispatch_is_never_a_redrive_candidate() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_allow_private_targets = false;
+    let state = setup_state(cfg).await;
+
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    webhook::dispatch(&state, &payment, "payment.completed", None).await;
+
+    let candidates = db::list_redrivable_deliveries(
+        &state.pool,
+        state.config.webhook_redrive_max_attempts as i64,
+        // Zero grace/backoff: if the row were still eligible in principle,
+        // nothing here would hide it.
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        candidates.is_empty(),
+        "an SSRF-blocked dispatch must never become a redrive candidate, \
+         got {candidates:?}"
+    );
+}
