@@ -596,3 +596,30 @@ async fn ready_and_metrics_survive_an_exhausted_default_bucket() {
     server.get("/ready").await.assert_status_ok();
     server.get("/metrics").await.assert_status_ok();
 }
+
+/// Same exhaustion scenario, but draining a *named* bucket (`payments`) via
+/// an authenticated merchant rather than the shared "default" bucket — the
+/// exemption must hold regardless of which limiter tripped first.
+#[tokio::test]
+async fn probes_survive_an_exhausted_payments_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    server
+        .post("/payments")
+        .add_header("Authorization", auth)
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    server.get("/health").await.assert_status_ok();
+    server.get("/ready").await.assert_status_ok();
+    server.get("/metrics").await.assert_status_ok();
+}
