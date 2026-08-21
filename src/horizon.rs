@@ -382,33 +382,58 @@ pub fn missing_trustlines<'a>(
         .collect()
 }
 
-/// At startup, check that the gateway account holds a trustline for every
-/// accepted non-native asset, and warn about any that are missing.
+/// Fetch and decode the gateway account, factored out of [`check_trustlines`]
+/// purely so its one fallible sequence (request, status check, decode) has a
+/// single `?`-propagated exit for the caller to attribute to
+/// `record_check_failure`.
+async fn fetch_account(state: &Arc<AppState>, url: &str) -> anyhow::Result<AccountResponse> {
+    Ok(state
+        .http
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?)
+}
+
+/// Check that the gateway account holds a trustline for every accepted
+/// non-native asset, and warn about any that are missing.
 ///
 /// An accepted asset without a trustline mints unpayable intents: the gateway
 /// advertises (say) USDC, a customer pays, and the payment bounces on-chain
-/// because the account cannot receive it. Surfacing this at boot turns a silent
-/// runtime failure into an actionable startup warning.
+/// because the account cannot receive it. Surfacing this turns a silent
+/// runtime failure into an actionable warning.
 ///
-/// Best-effort by design: a Horizon error (unreachable, account not yet funded)
-/// is returned to the caller to log, but must not abort boot — the account may
-/// be provisioned shortly after start. Returns the list of accepted asset codes
-/// that are missing a trustline (empty when all are present).
+/// Called both at boot and, from [`run_trustline_checker`], on a recurring
+/// interval — a trustline can be revoked, or an asset added to
+/// `ACCEPTED_ASSETS`, at any time after boot, so a boot-only check would go
+/// stale the moment either happens. Every call — success or failure — updates
+/// `state.trustline_metrics`, which is what `GET /metrics` and `POST
+/// /payments` actually read; the return value exists for the boot-time log
+/// line and tests.
+///
+/// Best-effort by design: a Horizon error (unreachable, account not yet
+/// funded) is returned to the caller to log, but must not abort boot or the
+/// periodic checker — the account may be provisioned shortly after start.
+/// Such a failure bumps `stellargate_trustline_check_failures_total` and
+/// leaves the per-asset gauge untouched, rather than reporting a guess.
+/// Returns the list of accepted asset codes that are missing a trustline
+/// (empty when all are present).
 pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<String>> {
     let url = format!(
         "{}/accounts/{}",
         state.config.horizon_url.trim_end_matches('/'),
         state.config.gateway_public,
     );
-    let account: AccountResponse = state
-        .http
-        .get(&url)
-        .header("Accept", "application/json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+    let account = match fetch_account(state, &url).await {
+        Ok(account) => account,
+        Err(e) => {
+            state.trustline_metrics.record_check_failure();
+            return Err(e);
+        }
+    };
 
     let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
     for asset in &missing {
@@ -419,7 +444,64 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
              this asset will be unpayable until a trustline is established"
         );
     }
-    Ok(missing.iter().map(|a| a.code.clone()).collect())
+    let missing_codes: Vec<String> = missing.iter().map(|a| a.code.clone()).collect();
+    let checked_codes = state
+        .config
+        .accepted_assets
+        .iter()
+        .filter(|a| a.issuer.is_some())
+        .map(|a| a.code.as_str());
+    state
+        .trustline_metrics
+        .record_check(checked_codes, &missing_codes);
+    Ok(missing_codes)
+}
+
+/// Background loop that re-runs [`check_trustlines`] on a recurring interval
+/// for as long as the process runs. Idles (without checking) while no gateway
+/// is configured, matching [`run_poller`] — without a gateway wallet there is
+/// no account to hold trustlines on.
+///
+/// Reuses the retention worker's cadence rather than introducing a dedicated
+/// interval: trustline drift is not latency-sensitive, so a purpose-built
+/// knob would only add configuration surface for no operational benefit.
+/// The boot-time check (`main::report_trustlines`) already covers the first
+/// answer, so — like the retention worker — this waits out the interval
+/// before its first check rather than repeating that one immediately.
+pub async fn run_trustline_checker(
+    state: Arc<AppState>,
+    mut shutdown: watch::Receiver<bool>,
+) -> TaskExit {
+    if !state.config.gateway_configured() {
+        return TaskExit::DisabledByConfig("STELLAR_GATEWAY_PUBLIC is unconfigured");
+    }
+
+    let interval = Duration::from_secs(state.config.retention_interval_secs.max(1));
+    info!(
+        interval_secs = state.config.retention_interval_secs,
+        "trustline checker started"
+    );
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => {
+                info!("trustline checker shutting down");
+                return TaskExit::ShutdownRequested;
+            }
+        }
+
+        match check_trustlines(&state).await {
+            Ok(missing) if missing.is_empty() => {
+                debug!("trustline check: all accepted assets have a trustline")
+            }
+            Ok(missing) => info!(
+                ?missing,
+                "accepted assets with no trustline on the gateway account"
+            ),
+            Err(e) => warn!(error = %e, "could not verify gateway trustlines"),
+        }
+    }
 }
 
 /// How many pages [`starting_cursor`] will walk backward, at most, while

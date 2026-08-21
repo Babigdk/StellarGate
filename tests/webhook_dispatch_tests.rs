@@ -90,6 +90,7 @@ async fn setup_state(cfg: Config) -> AppState {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }
 }

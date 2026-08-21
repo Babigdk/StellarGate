@@ -1282,6 +1282,7 @@ async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoRespons
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
+        &state.trustline_metrics,
     );
     (
         StatusCode::OK,

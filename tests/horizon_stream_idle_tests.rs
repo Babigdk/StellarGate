@@ -93,6 +93,7 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -197,6 +198,7 @@ async fn stalled_stream_is_detected_and_reconnected() {
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
+        &state.trustline_metrics,
     );
     assert!(
         rendered.contains("stellargate_horizon_stream_reconnects_total"),
