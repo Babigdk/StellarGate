@@ -465,7 +465,15 @@ client's payment quota, or vice versa. The client IP is resolved per
 | `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
-| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+| `default` | everything else, including all other `GET` routes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+`/health`, `/ready` and `/metrics` are **not** in any bucket — they are exempt
+from rate limiting entirely, not merely given a generous one. They are cheap,
+come from a trusted orchestrator rather than the public internet, and their
+whole purpose is to stay answerable when the system is under stress; sharing a
+bucket with merchant traffic would mean a load spike that trips the limiter
+could also turn an orchestrator's own liveness probe into a `429` — see
+DEPLOYMENT.md for the failure mode this avoids.
 
 Write and sensitive routes get the base rate; read-only traffic gets a more
 generous allowance so ordinary polling is not throttled. Redelivery is bucketed
