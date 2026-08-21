@@ -210,13 +210,17 @@ async fn throttled_response_carries_a_coherent_retry_hint() {
 /// The bucket multiplier is part of the advertised contract: a read-only route
 /// gets `requests_per_sec × 5`, and `X-RateLimit-Limit` must say so rather than
 /// reporting the base rate the operator configured.
+///
+/// Uses `GET /payments/:id` rather than `/health` — the probe endpoints are
+/// exempt from the limiter entirely (see `probe_responses_carry_no_rate_limit_headers`
+/// below) and so carry no `X-RateLimit-*` headers at all.
 #[tokio::test]
 async fn rate_limit_headers_report_the_effective_bucket_quota() {
     let (server, _pool) = server_with_config(make_config(4)).await;
 
-    // /health is a read-only route → the "default" bucket, ×5 = 20.
-    let res = server.get("/health").await;
-    res.assert_status_ok();
+    // GET /payments/:id is a read-only route → the "default" bucket, ×5 = 20.
+    let res = server.get("/payments/nonexistent").await;
+    res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(header(&res, "x-ratelimit-limit"), "20");
 
     let key = provision_merchant(&server).await;
