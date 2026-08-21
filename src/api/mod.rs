@@ -888,7 +888,8 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
     }
 }
 
-/// Identifies which rate-limit bucket a request falls into.
+/// Identifies which rate-limit bucket a request falls into, or `None` to
+/// exempt it from the limiter entirely.
 ///
 /// Every request is assigned a bucket so all routes are protected by default.
 /// Write and sensitive routes use named buckets that receive the base quota
@@ -896,11 +897,29 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// which receives a more generous quota (`requests_per_sec × 5`) to avoid
 /// throttling normal polling.
 ///
+/// `/health`, `/ready` and `/metrics` are exempt rather than sharing the
+/// `"default"` bucket with merchant API traffic. They used to share it, which
+/// created a feedback loop under load: a traffic spike exhausts the per-IP
+/// quota, the orchestrator's liveness probe — same source IP, same bucket —
+/// gets a `429`, `curl -f` treats that as a failed check, and the instance is
+/// restarted or pulled from rotation right when it's under the most load.
+/// Restarting this service is not free (the poller re-baselines and the
+/// redrive worker runs a full pass on start), so that restart concentrates
+/// load on the remaining instances instead of relieving it. Probes are also
+/// the wrong thing to protect: they're cheap, they come from a trusted
+/// orchestrator rather than the public internet, and their entire purpose is
+/// to stay answerable when the system is stressed. If unauthenticated abuse
+/// of these paths ever becomes a real concern, give them their own generous
+/// bucket rather than folding them back into `"default"`.
+///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
 fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
     let path = req.uri().path();
+    if path == "/health" || path == "/ready" || path == "/metrics" {
+        return None;
+    }
     if req.method() == axum::http::Method::POST {
         return match path {
             "/payments" => Some("payments"),
@@ -911,9 +930,9 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
             _ => Some("default"),
         };
     }
-    // All non-POST requests (GET, etc.) fall into the default bucket so that
-    // payment enumeration, webhook listing, and health/ready probes are all
-    // covered by a baseline limit.
+    // All other non-POST requests (GET, etc.) fall into the default bucket so
+    // that payment enumeration and webhook listing are covered by a baseline
+    // limit.
     Some("default")
 }
 
@@ -1550,5 +1569,37 @@ mod tests {
         let quota = slow_quota(Duration::from_secs(600), 1);
         let wait = Duration::from_secs(600);
         assert!(reset_secs(quota, 0, wait) >= retry_after_secs(wait));
+    }
+
+    // ── rate_limited_bucket — probe exemption ────────────────────────────────
+
+    fn method_req(method: axum::http::Method, path: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn probe_endpoints_bypass_the_rate_limiter() {
+        for path in ["/health", "/ready", "/metrics"] {
+            assert_eq!(
+                rate_limited_bucket(&method_req(axum::http::Method::GET, path)),
+                None,
+                "{path} must return None so rate_limit_middleware skips it entirely"
+            );
+        }
+    }
+
+    /// The exemption is scoped to exactly the three probe paths — it must not
+    /// widen into "every GET is exempt", which would silently undo the
+    /// per-IP protection on payment enumeration and webhook listing.
+    #[test]
+    fn other_get_routes_still_fall_into_the_default_bucket() {
+        assert_eq!(
+            rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
+            Some("default")
+        );
     }
 }
