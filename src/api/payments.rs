@@ -526,8 +526,6 @@ pub struct ListQuery {
     pub include_total: Option<bool>,
 }
 
-const DEFAULT_LIMIT: i64 = 20;
-const MAX_LIMIT: i64 = 100;
 /// Offset pagination is `O(offset)` in SQLite — it produces and discards
 /// every skipped row. This ceiling (generous for any real UI) keeps a deep,
 /// expensive scan-and-skip from being answered at all; the keyset (`cursor`)
@@ -564,7 +562,10 @@ pub async fn list(
         }
     }
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = q
+        .limit
+        .unwrap_or(state.config.pagination_default_limit)
+        .clamp(1, state.config.pagination_max_limit);
 
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
@@ -784,7 +785,10 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = q
+        .limit
+        .unwrap_or(state.config.pagination_default_limit)
+        .clamp(1, state.config.pagination_max_limit);
 
     let cursor = match q.cursor.as_deref() {
         Some(raw_cursor) => {
@@ -866,7 +870,10 @@ pub async fn list_merchant_webhooks(
         ));
     }
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = q
+        .limit
+        .unwrap_or(state.config.pagination_default_limit)
+        .clamp(1, state.config.pagination_max_limit);
 
     let cursor = match &q.cursor {
         Some(raw) => Some(

@@ -1259,20 +1259,20 @@ pub async fn create_merchant(
 Retention
 --------------------------------------------------------------------------- */
 
-/// Rows removed per statement. Deleting in batches keeps each write lock short:
-/// SQLite has a single writer, so one unbounded `DELETE` over a large table
-/// would stall every payment write until it finished.
-pub const PRUNE_BATCH: i64 = 500;
-
 /// Delete one batch of idempotency keys older than `retention_days`.
 ///
 /// A key only has to outlive the window in which a client might retry the
 /// create it guarded. Past that it is dead weight, and the table has no other
 /// bound (issue #110).
 ///
+/// `batch` bounds rows removed per statement — deleting in batches keeps each
+/// write lock short, since SQLite has a single writer and one unbounded
+/// `DELETE` over a large table would stall every payment write until it
+/// finished (configurable via `DB_PRUNE_BATCH_SIZE`, issue #279).
+///
 /// Returns how many rows went; the caller loops until a batch comes back
 /// short.
-pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM idempotency_keys
@@ -1283,7 +1283,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1304,7 +1304,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
 /// Acknowledging or requeueing a delivery clears the exemption, and
 /// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
 /// what a full delivery row costs.
-pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
@@ -1317,7 +1317,7 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1336,7 +1336,11 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
 ///
 /// The `payload <> ''` guard makes this idempotent: a row is compacted once,
 /// not rewritten on every cycle.
-pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn compact_stale_failed_deliveries(
+    pool: &Db,
+    retention_days: i64,
+    batch: i64,
+) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "UPDATE webhook_deliveries
@@ -1351,7 +1355,7 @@ pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> 
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -2034,7 +2038,11 @@ mod tests {
     async fn expire_overdue_drains_large_backlog_across_batches() {
         let pool = memory_db().await;
         let batch = 7;
-        let total = PRUNE_BATCH + 137;
+        // An arbitrary count comfortably larger than a single batch — this
+        // test exercises the expiry sweeper's own EXPIRY_BATCH_SIZE, not the
+        // retention pruner's batch size, so no relationship to the latter is
+        // implied by this number.
+        let total = 500 + 137;
         for i in 0..total {
             create_payment(
                 &pool,
