@@ -897,18 +897,18 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// which receives a more generous quota (`requests_per_sec × 5`) to avoid
 /// throttling normal polling.
 ///
-/// `/health` and `/ready` are exempt rather than sharing the `"default"`
-/// bucket with merchant API traffic. They used to share it, which created a
-/// feedback loop under load: a traffic spike exhausts the per-IP quota, the
-/// orchestrator's liveness probe — same source IP, same bucket — gets a
-/// `429`, and a health check treats that as a failed probe.
+/// `/health`, `/ready` and `/metrics` are exempt rather than sharing the
+/// `"default"` bucket with merchant API traffic. They used to share it, which
+/// created a feedback loop under load: a traffic spike exhausts the per-IP
+/// quota, the orchestrator's liveness probe — same source IP, same bucket —
+/// gets a `429`, and a health check treats that as a failed probe.
 ///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
 fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
     let path = req.uri().path();
-    if path == "/health" || path == "/ready" {
+    if path == "/health" || path == "/ready" || path == "/metrics" {
         return None;
     }
     if req.method() == axum::http::Method::POST {
