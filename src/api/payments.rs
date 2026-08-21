@@ -416,6 +416,7 @@ pub async fn create(
         },
     )
     .await?;
+    state.payment_metrics.record_created();
 
     /* A merchant disputing a charge, or investigating a burst of unexpected
     intents, starts from "which merchant created this and from where" — which

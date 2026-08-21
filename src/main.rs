@@ -12,7 +12,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, HorizonMetrics, TrustlineMetrics, WebhookMetrics},
+    metrics::{AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, WebhookMetrics},
     retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -69,6 +69,8 @@ async fn main() -> Result<()> {
         horizon_metrics: HorizonMetrics::new(),
         trustline_metrics: TrustlineMetrics::new(),
         task_health: TaskHealth::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
         config: cfg,
     });
 

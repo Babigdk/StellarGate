@@ -694,6 +694,9 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             .and_then(elapsed_secs)
         {
             info!(cursor_age_secs, "poller cursor advanced");
+            state
+                .horizon_metrics
+                .record_cursor_age_secs(cursor_age_secs);
         }
 
         /* Checkpoint after the whole page is processed. If we crash mid-page the
@@ -853,6 +856,9 @@ async fn settle(
         ?settlement_latency_secs,
         "payment settled"
     );
+    state
+        .payment_metrics
+        .record_settlement(status, settlement_latency_secs);
 
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
@@ -1179,6 +1185,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
         Ok(hp) => {
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
+                state
+                    .horizon_metrics
+                    .record_cursor_age_secs(cursor_age_secs);
             }
             /* Receiving a payment record means the stream is alive and the
             cursor moved — the same heartbeat /ready's freshness check uses. */
