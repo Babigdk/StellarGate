@@ -1412,7 +1412,17 @@ compare it against. `stellargate_task_disabled` is what separates "switched off
 on purpose" from "not running", which `stellargate_task_running` alone reports
 identically.
 
-Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
+Structured logs (via `tracing`) carry a `request_id` field on every request span, matching the `x-request-id` response header returned to clients. Every log line emitted during a request — including internal errors (`AppError`), audit events, and auth denials — inherits `request_id` automatically from the span context. Operators can search logs directly using the request ID returned in response headers:
+
+```bash
+# Filter JSON logs by request ID quoted by a client:
+jq 'select(.request_id == "7f3a...")' /var/log/stellargate.log
+
+# Grep structured text logs by request ID:
+grep 'request_id=7f3a...' /var/log/stellargate.log
+```
+
+Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 
 Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=debug`.
 

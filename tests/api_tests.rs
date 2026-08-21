@@ -13,6 +13,7 @@ use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use tracing_test::traced_test;
 
 /// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
 /// every connection the pool opens talks to the SAME database. A bare
@@ -3455,4 +3456,40 @@ async fn test_both_mounts_share_the_same_data() {
         .await;
     via_v1.assert_status_ok();
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
+}
+
+/// The request ID returned in the `x-request-id` response header must match the
+/// `request_id` recorded in tracing logs for every request — including handlers
+/// and middleware warnings.
+#[tokio::test]
+#[traced_test]
+async fn test_request_id_tracing_correlation() {
+    let server = test_server().await;
+
+    // 1. Operational endpoint request
+    let res = server.get("/health").await;
+    res.assert_status_ok();
+    let req_id_1 = res
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!req_id_1.is_empty());
+    assert!(logs_contain(&req_id_1));
+
+    // 2. Auth denial request (emits warn! inside auth middleware)
+    let res_unauthed = server.get("/v1/payments").await;
+    res_unauthed.assert_status(StatusCode::UNAUTHORIZED);
+    let req_id_2 = res_unauthed
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id header missing")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(!req_id_2.is_empty());
+    assert_ne!(req_id_1, req_id_2);
+    assert!(logs_contain(&req_id_2));
 }

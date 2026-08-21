@@ -20,7 +20,7 @@ use std::time::Duration;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -172,7 +172,20 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+            let request_id = req
+                .extensions()
+                .get::<RequestId>()
+                .and_then(|id| id.header_value().to_str().ok())
+                .unwrap_or("-");
+            tracing::info_span!(
+                "http",
+                %request_id,
+                method = %req.method(),
+                uri = %req.uri(),
+                version = ?req.version()
+            )
+        }))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
