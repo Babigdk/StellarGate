@@ -43,6 +43,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`/health`, `/ready` and `/metrics` are exempt from the per-IP rate
+  limiter.** Every non-`POST` request, probes included, fell into the same
+  `"default"` bucket as merchant read traffic. Under load that bucket empties,
+  the orchestrator's liveness probe — same source IP as everything else —
+  starts getting `429`s, `curl -f` treats that as a failed check, and the
+  container gets marked unhealthy and restarted right when it can least
+  afford it: this service's poller has to re-baseline and the redrive worker
+  runs a full pass on start, so a restart under load concentrates load on the
+  rest of the fleet instead of relieving it. `rate_limited_bucket` now returns
+  `None` for these three paths, which the middleware already treats as
+  "skip limiting entirely" — probes are cheap, come from a trusted
+  orchestrator, and exist specifically to stay answerable under stress, so
+  they no longer share a bucket with anything else. Documented in
+  DEPLOYMENT.md.
+
 - **Test pools now use a genuinely shared in-memory SQLite database.** Every
   test suite built its pool from the DSN `sqlite::memory:` while allowing
   more than one pooled connection (the default). A bare `sqlite::memory:`
