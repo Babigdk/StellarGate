@@ -39,6 +39,10 @@ impl AppError {
     pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
+
+    pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -224,6 +228,27 @@ pub async fn create(
         }
     };
     let asset_issuer = accepted_asset.issuer.as_deref();
+
+    /* A trustline confirmed missing means any intent minted here will bounce
+    on-chain — reject at creation rather than let the customer pay into a
+    black hole (issue: report_trustlines only ran once, at boot). Native XLM
+    never needs a trustline, so it's exempt. An asset never yet checked, or
+    whose last check errored contacting Horizon, is NOT treated as missing
+    here — `is_missing` returns `None` for either, and a Horizon outage must
+    not fail every payment creation on top of already failing the check. */
+    if asset_issuer.is_some()
+        && state.trustline_metrics.is_missing(&accepted_asset.code) == Some(true)
+    {
+        return Err(AppError::service_unavailable(
+            "trustline_missing",
+            format!(
+                "the gateway account currently has no trustline for {}; payments in this \
+                 asset cannot be received until one is established",
+                accepted_asset.code
+            ),
+        ));
+    }
+
     let stroops = money::parse_stroops(&body.amount).ok_or_else(|| {
         AppError::bad_request(
             "invalid_amount",

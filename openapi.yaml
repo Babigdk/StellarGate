@@ -379,6 +379,27 @@ paths:
                   value:
                     error: rate limit exceeded
                     code: rate_limit_exceeded
+        "503":
+          description: >-
+            The gateway account currently has no trustline for the requested
+            asset, confirmed by the recurring trustline checker (see the
+            Trustlines section of the README) — an intent minted now could
+            only bounce on-chain. An asset that has never been checked yet,
+            or whose last check failed to reach Horizon, is not rejected on
+            that basis alone.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                trustline_missing:
+                  summary: No trustline for this asset
+                  value:
+                    error: >-
+                      the gateway account currently has no trustline for
+                      USDC; payments in this asset cannot be received until
+                      one is established
+                    code: trustline_missing
 
     get:
       operationId: listPayments
@@ -1170,5 +1191,6 @@ components:
             invalid_cursor, payment_not_found, delivery_not_found,
             rate_limit_exceeded, not_found, webhook_target_blocked,
             webhook_delivery_failed, idempotency_conflict, merchant_not_found,
-            invalid_label, last_active_key, and key_not_found.
+            invalid_label, last_active_key, trustline_missing, and
+            key_not_found.
           example: invalid_amount

@@ -12,6 +12,8 @@ services:
       - stellargate_data:/data
     restart: unless-stopped
     healthcheck:
+      # /health is exempt from the per-IP rate limiter (see DEPLOYMENT.md), so
+      # a traffic spike can never turn this into a 429 and restart the container.
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
       interval: 30s
       timeout: 10s

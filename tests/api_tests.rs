@@ -93,6 +93,30 @@ async fn server_with_config_and_health(
     cfg: Config,
     task_health: stellargate::TaskHealth,
 ) -> (TestServer, db::Db) {
+    server_with_all(
+        cfg,
+        task_health,
+        stellargate::metrics::TrustlineMetrics::new(),
+    )
+    .await
+}
+
+/// Like [`server_with_config`], but with an explicitly-provided
+/// [`stellargate::metrics::TrustlineMetrics`] so tests can drive `POST
+/// /payments` and `GET /metrics` against a known trustline state without
+/// going through a real (or mocked) Horizon call.
+async fn server_with_config_and_trustlines(
+    cfg: Config,
+    trustline_metrics: stellargate::metrics::TrustlineMetrics,
+) -> (TestServer, db::Db) {
+    server_with_all(cfg, stellargate::TaskHealth::new(), trustline_metrics).await
+}
+
+async fn server_with_all(
+    cfg: Config,
+    task_health: stellargate::TaskHealth,
+    trustline_metrics: stellargate::metrics::TrustlineMetrics,
+) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
         // A shared-cache in-memory database is dropped once its last
         // connection closes — keep exactly one open for the pool's lifetime.
@@ -778,6 +802,104 @@ async fn test_create_invalid_asset() {
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
     res.assert_contains_header("x-request-id");
+}
+
+// ── Trustline-aware payment creation (this issue) ────────────────────────────
+
+/// A trustline confirmed missing by the trustline checker must reject the
+/// intent rather than mint one that can only bounce on-chain.
+#[tokio::test]
+async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json::<Value>()["code"], "trustline_missing");
+}
+
+/// An asset the checker has confirmed present is unaffected.
+#[tokio::test]
+async fn test_create_accepts_asset_with_confirmed_present_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &[]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// An asset that has never been checked (fresh `TrustlineMetrics`, the state
+/// every deployment starts in before its first check completes) must not be
+/// rejected — `None` means "unknown", not "missing".
+#[tokio::test]
+async fn test_create_accepts_asset_never_checked_for_a_trustline() {
+    let res = server_with_config(make_config()).await.0;
+    let key = provision_merchant(&res).await;
+
+    let res = res
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// Native XLM never needs a trustline, so it's exempt from the check even if
+/// somehow marked missing.
+#[tokio::test]
+async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// `GET /metrics` exposes the current trustline state as a gauge, plus the
+/// counters that distinguish a Horizon outage from a confirmed absence
+/// (acceptance criteria of this issue).
+#[tokio::test]
+async fn test_metrics_expose_trustline_state() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()]);
+    trustlines.record_check_failure();
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"EURC\"} 0"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_failures_total 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_last_success_timestamp_seconds"),
+        "got: {body}"
+    );
 }
 
 // ── Unknown request-body fields (issue #329) ─────────────────────────────────
