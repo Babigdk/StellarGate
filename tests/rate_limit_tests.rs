@@ -88,6 +88,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -210,13 +211,17 @@ async fn throttled_response_carries_a_coherent_retry_hint() {
 /// The bucket multiplier is part of the advertised contract: a read-only route
 /// gets `requests_per_sec × 5`, and `X-RateLimit-Limit` must say so rather than
 /// reporting the base rate the operator configured.
+///
+/// Uses `GET /payments/:id` rather than `/health` — the probe endpoints are
+/// exempt from the limiter entirely (see `probe_responses_carry_no_rate_limit_headers`
+/// below) and so carry no `X-RateLimit-*` headers at all.
 #[tokio::test]
 async fn rate_limit_headers_report_the_effective_bucket_quota() {
     let (server, _pool) = server_with_config(make_config(4)).await;
 
-    // /health is a read-only route → the "default" bucket, ×5 = 20.
-    let res = server.get("/health").await;
-    res.assert_status_ok();
+    // GET /payments/:id is a read-only route → the "default" bucket, ×5 = 20.
+    let res = server.get("/payments/nonexistent").await;
+    res.assert_status(StatusCode::NOT_FOUND);
     assert_eq!(header(&res, "x-ratelimit-limit"), "20");
 
     let key = provision_merchant(&server).await;
@@ -543,4 +548,97 @@ async fn non_positive_rate_limit_is_rejected() {
         .json(&json!({ "rate_limit_per_sec": -1 }))
         .await
         .assert_status(StatusCode::BAD_REQUEST);
+}
+
+// ── Operational probes are exempt from the limiter ───────────────────────────
+//
+// `/health` and `/ready` used to share the "default" bucket with every other
+// GET request. Under load that bucket empties, the orchestrator's probe —
+// same source IP as everything else on that host — starts getting `429`s,
+// `curl -f` treats that as a failed check, and the instance gets restarted or
+// pulled from rotation right when it can least afford it. These tests pin the
+// fix: probes must stay answerable no matter how drained the API's own quota
+// is.
+
+/// The core regression test: exhaust the "default" bucket with ordinary reads
+/// from the same client the probes share, then confirm `/health` is
+/// completely unaffected.
+#[tokio::test]
+async fn health_survives_an_exhausted_default_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    // "default" bucket quota is rate_limit_requests_per_sec × 5 = 5.
+    for _ in 0..5 {
+        server.get("/payments/nonexistent").await;
+    }
+    server
+        .get("/payments/nonexistent")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    // /health never touched that bucket, so draining it changes nothing.
+    server.get("/health").await.assert_status_ok();
+}
+
+/// Same scenario as `health_survives_an_exhausted_default_bucket`, for the
+/// other two exempt paths.
+#[tokio::test]
+async fn ready_and_metrics_survive_an_exhausted_default_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    for _ in 0..5 {
+        server.get("/payments/nonexistent").await;
+    }
+    server
+        .get("/payments/nonexistent")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    server.get("/ready").await.assert_status_ok();
+    server.get("/metrics").await.assert_status_ok();
+}
+
+/// Same exhaustion scenario, but draining a *named* bucket (`payments`) via
+/// an authenticated merchant rather than the shared "default" bucket — the
+/// exemption must hold regardless of which limiter tripped first.
+#[tokio::test]
+async fn probes_survive_an_exhausted_payments_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+    server
+        .post("/payments")
+        .add_header("Authorization", auth)
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    server.get("/health").await.assert_status_ok();
+    server.get("/ready").await.assert_status_ok();
+    server.get("/metrics").await.assert_status_ok();
+}
+
+/// Confirms the probes bypass the limiter entirely, rather than merely
+/// receiving a very generous quota of their own: `rate_limit_middleware`
+/// returns before it ever builds an `X-RateLimit-*` header for them.
+#[tokio::test]
+async fn probe_responses_carry_no_rate_limit_headers() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    for path in ["/health", "/ready", "/metrics"] {
+        let res = server.get(path).await;
+        res.assert_status_ok();
+        assert!(
+            res.headers().get("x-ratelimit-limit").is_none(),
+            "{path} must bypass the rate limiter rather than just receive \
+             a generous quota"
+        );
+    }
 }

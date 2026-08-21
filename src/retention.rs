@@ -203,6 +203,7 @@ mod tests {
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
             horizon_metrics: crate::metrics::HorizonMetrics::new(),
+            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
             task_health: crate::TaskHealth::new(),
         })
     }

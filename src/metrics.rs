@@ -9,8 +9,9 @@
 //! `GET /metrics` returns a plain-text Prometheus-compatible snapshot so any
 //! standard scraper can ingest the data with zero configuration.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Histogram buckets for webhook delivery latency (milliseconds).
 /// Covers the range from sub-10 ms fast paths up to the 10 s default timeout.
@@ -282,6 +283,104 @@ impl Default for HorizonMetrics {
     }
 }
 
+/// Per-asset gateway trustline state, refreshed by every call to
+/// `horizon::check_trustlines` — at boot and, since trustlines can be revoked
+/// or `ACCEPTED_ASSETS` extended at any time after that, on the recurring
+/// trustline-checker task as well.
+///
+/// A Horizon failure while checking must not read the same as a confirmed
+/// absence: [`Self::record_check_failure`] only bumps `check_failures` and
+/// leaves the per-asset map untouched, so a stale "missing" or "present"
+/// entry survives an outage rather than being overwritten by a guess.
+/// `last_success_unix` (0 until the first successful check) is how a scrape
+/// tells "we have never confirmed this" apart from "confirmed and stale".
+#[derive(Clone)]
+pub struct TrustlineMetrics {
+    inner: Arc<TrustlineMetricsInner>,
+}
+
+struct TrustlineMetricsInner {
+    /// Asset code -> confirmed missing (`true`) or confirmed present
+    /// (`false`). Only ever written by a successful check; a code absent from
+    /// the map has simply never been confirmed either way.
+    missing: Mutex<HashMap<String, bool>>,
+    /// Checks that could not reach Horizon or got a non-2xx response.
+    check_failures: AtomicU64,
+    /// Unix timestamp of the last check that got a confirmed answer from
+    /// Horizon; `0` means never.
+    last_success_unix: AtomicI64,
+}
+
+impl Default for TrustlineMetricsInner {
+    fn default() -> Self {
+        Self {
+            missing: Mutex::new(HashMap::new()),
+            check_failures: AtomicU64::new(0),
+            last_success_unix: AtomicI64::new(0),
+        }
+    }
+}
+
+impl TrustlineMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(TrustlineMetricsInner::default()),
+        }
+    }
+
+    /// Record a successful check: `checked` is every non-native accepted
+    /// asset the check evaluated, `missing` the subset with no trustline.
+    /// Replaces the prior state for exactly the assets checked, so an asset
+    /// removed from `ACCEPTED_ASSETS` between checks simply stops being
+    /// reported rather than lingering at its last known value.
+    pub fn record_check<'a>(&self, checked: impl IntoIterator<Item = &'a str>, missing: &[String]) {
+        let mut map = self.inner.missing.lock().unwrap();
+        map.clear();
+        for code in checked {
+            map.insert(code.to_string(), missing.iter().any(|m| m == code));
+        }
+        drop(map);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner.last_success_unix.store(now, Ordering::Relaxed);
+    }
+
+    pub fn record_check_failure(&self) {
+        self.inner.check_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `Some(true)` — confirmed missing. `Some(false)` — confirmed present.
+    /// `None` — never confirmed either way (not yet checked, or dropped from
+    /// `ACCEPTED_ASSETS`).
+    pub fn is_missing(&self, code: &str) -> Option<bool> {
+        self.inner.missing.lock().unwrap().get(code).copied()
+    }
+
+    pub fn check_failures(&self) -> u64 {
+        self.inner.check_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn last_success_unix(&self) -> i64 {
+        self.inner.last_success_unix.load(Ordering::Relaxed)
+    }
+
+    /// Snapshot for rendering, sorted by asset code for deterministic output.
+    pub fn snapshot(&self) -> Vec<(String, bool)> {
+        let map = self.inner.missing.lock().unwrap();
+        let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+}
+
+impl Default for TrustlineMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
 /// Render webhook delivery, auth outcome, background-task, and Horizon poll
@@ -292,6 +391,7 @@ pub fn render(
     auth: &AuthMetrics,
     tasks: &crate::TaskHealth,
     horizon: &HorizonMetrics,
+    trustlines: &TrustlineMetrics,
 ) -> String {
     let mut out = String::with_capacity(1024);
 
@@ -492,5 +592,99 @@ pub fn render(
         tasks.last_success_unix()
     ));
 
+    // stellargate_missing_trustlines — gauge vec by asset (this issue)
+    out.push_str(
+        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no trustline for an accepted asset (1) or confirmed to have one (0). An asset is absent from this metric until the first successful trustline check evaluates it.\n",
+    );
+    out.push_str("# TYPE stellargate_missing_trustlines gauge\n");
+    for (asset, missing) in trustlines.snapshot() {
+        out.push_str(&format!(
+            "stellargate_missing_trustlines{{asset=\"{asset}\"}} {}\n",
+            if missing { 1 } else { 0 }
+        ));
+    }
+
+    out.push_str(
+        "# HELP stellargate_trustline_check_failures_total Total trustline checks that could not reach Horizon or got a non-2xx response. Does not affect stellargate_missing_trustlines, which only reflects confirmed answers.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_check_failures_total counter\n");
+    out.push_str(&format!(
+        "stellargate_trustline_check_failures_total {}\n",
+        trustlines.check_failures()
+    ));
+
+    out.push_str(
+        "# HELP stellargate_trustline_check_last_success_timestamp_seconds Unix timestamp of the last trustline check that got a confirmed answer from Horizon. 0 means never — treat stellargate_missing_trustlines as unknown, not confirmed, until this is nonzero.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_check_last_success_timestamp_seconds gauge\n");
+    out.push_str(&format!(
+        "stellargate_trustline_check_last_success_timestamp_seconds {}\n",
+        trustlines.last_success_unix()
+    ));
+
     out
+}
+
+#[cfg(test)]
+mod trustline_metrics_tests {
+    use super::TrustlineMetrics;
+
+    #[test]
+    fn unchecked_asset_is_unknown() {
+        let m = TrustlineMetrics::new();
+        assert_eq!(m.is_missing("USDC"), None);
+        assert_eq!(m.last_success_unix(), 0);
+    }
+
+    #[test]
+    fn a_successful_check_records_present_and_missing() {
+        let m = TrustlineMetrics::new();
+        m.record_check(["USDC", "EURC"], &["USDC".to_string()]);
+        assert_eq!(m.is_missing("USDC"), Some(true));
+        assert_eq!(m.is_missing("EURC"), Some(false));
+        assert!(m.last_success_unix() > 0);
+    }
+
+    #[test]
+    fn a_failed_check_does_not_overwrite_prior_state() {
+        let m = TrustlineMetrics::new();
+        m.record_check(["USDC"], &["USDC".to_string()]);
+        let ts = m.last_success_unix();
+        m.record_check_failure();
+        assert_eq!(
+            m.is_missing("USDC"),
+            Some(true),
+            "prior confirmed state survives a Horizon failure"
+        );
+        assert_eq!(
+            m.last_success_unix(),
+            ts,
+            "failure must not bump the success timestamp"
+        );
+        assert_eq!(m.check_failures(), 1);
+    }
+
+    #[test]
+    fn a_later_check_drops_assets_no_longer_checked() {
+        let m = TrustlineMetrics::new();
+        m.record_check(["USDC", "EURC"], &["USDC".to_string()]);
+        m.record_check(["EURC"], &[]);
+        assert_eq!(
+            m.is_missing("USDC"),
+            None,
+            "asset removed from ACCEPTED_ASSETS stops being reported"
+        );
+        assert_eq!(m.is_missing("EURC"), Some(false));
+    }
+
+    #[test]
+    fn snapshot_is_sorted_by_asset_code() {
+        let m = TrustlineMetrics::new();
+        m.record_check(["USDC", "EURC", "AAA"], &["USDC".to_string()]);
+        let codes: Vec<_> = m.snapshot().into_iter().map(|(c, _)| c).collect();
+        assert_eq!(
+            codes,
+            vec!["AAA".to_string(), "EURC".to_string(), "USDC".to_string()]
+        );
+    }
 }

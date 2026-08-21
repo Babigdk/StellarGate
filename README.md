@@ -268,7 +268,46 @@ It is a warning, not a boot failure — accepting XLM only is perfectly valid, s
 refusing to start would be wrong. **Read the first lines of the log after your
 first deploy.**
 
-To check what the account currently trusts:
+**The check doesn't stop at boot.** A trustline can be removed at any time
+after startup — by the account operator, or by an issuer revoking
+authorization — and an asset can be added to `ACCEPTED_ASSETS` on a redeploy.
+A background `trustline_checker` task re-runs the same check on the retention
+worker's cadence (`RETENTION_INTERVAL_SECS`, default 1 hour) for as long as
+the gateway wallet is configured, so drift after boot is caught rather than
+only ever logged once.
+
+Current trustline state is on `GET /metrics`, so it's alertable rather than
+grep-only:
+
+```
+# a confirmed-missing trustline
+stellargate_missing_trustlines{asset="USDC"} 1
+
+# how many checks have failed to reach Horizon at all — distinct from a
+# confirmed-absent trustline, which only ever comes from a check that
+# actually got an answer
+stellargate_trustline_check_failures_total 0
+
+# unix timestamp of the last check that got a confirmed answer; 0 means
+# never — treat stellargate_missing_trustlines as unknown, not confirmed,
+# until this is nonzero
+stellargate_trustline_check_last_success_timestamp_seconds 1732000000
+```
+
+A Horizon outage during a check only increments
+`stellargate_trustline_check_failures_total`; it leaves the last confirmed
+`stellargate_missing_trustlines` value alone rather than guessing, so "Horizon
+is unreachable" and "trustline confirmed absent" never look the same on the
+scrape.
+
+Once a trustline is confirmed missing, `POST /payments` for that asset returns
+`503 trustline_missing` instead of minting an intent that can only bounce
+on-chain. An asset that has never been checked yet (or whose last check
+errored) is **not** rejected on that basis alone — an unreachable Horizon
+must not also fail every payment creation for assets it simply hasn't had a
+chance to confirm.
+
+To check what the account currently trusts directly against Horizon:
 
 ```bash
 curl -s "https://horizon-testnet.stellar.org/accounts/$STELLAR_GATEWAY_PUBLIC" \
@@ -465,7 +504,15 @@ client's payment quota, or vice versa. The client IP is resolved per
 | `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
-| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+| `default` | everything else, including all other `GET` routes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+`/health`, `/ready` and `/metrics` are **not** in any bucket — they are exempt
+from rate limiting entirely, not merely given a generous one. They are cheap,
+come from a trusted orchestrator rather than the public internet, and their
+whole purpose is to stay answerable when the system is under stress; sharing a
+bucket with merchant traffic would mean a load spike that trips the limiter
+could also turn an orchestrator's own liveness probe into a `429` — see
+DEPLOYMENT.md for the failure mode this avoids.
 
 Write and sensitive routes get the base rate; read-only traffic gets a more
 generous allowance so ordinary polling is not throttled. Redelivery is bucketed

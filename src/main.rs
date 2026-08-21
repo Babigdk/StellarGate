@@ -12,7 +12,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, HorizonMetrics, WebhookMetrics},
+    metrics::{AuthMetrics, HorizonMetrics, TrustlineMetrics, WebhookMetrics},
     retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -67,6 +67,7 @@ async fn main() -> Result<()> {
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
         horizon_metrics: HorizonMetrics::new(),
+        trustline_metrics: TrustlineMetrics::new(),
         task_health: TaskHealth::new(),
         config: cfg,
     });
@@ -85,6 +86,7 @@ async fn main() -> Result<()> {
     idle by design ("the listener stays idle until this is set"). */
     if state.config.gateway_configured() {
         health.require("poller");
+        health.require("trustline_checker");
         if state.config.listener_mode == ListenerMode::Stream {
             health.require("stream");
         }
@@ -131,6 +133,16 @@ async fn main() -> Result<()> {
             webhook::run_redrive_worker(state.clone(), rx.clone())
         })
     };
+    let trustline_checker = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(
+            health.clone(),
+            "trustline_checker",
+            shutdown_rx.clone(),
+            move || horizon::run_trustline_checker(state.clone(), rx.clone()),
+        )
+    };
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -149,6 +161,7 @@ async fn main() -> Result<()> {
         join_task(sweeper, &health, "sweeper").await;
         join_task(redrive, &health, "redrive").await;
         join_task(retention, &health, "retention").await;
+        join_task(trustline_checker, &health, "trustline_checker").await;
         if let Some(handle) = stream {
             join_task(handle, &health, "stream").await;
         }
