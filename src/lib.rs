@@ -334,9 +334,10 @@ pub struct AppState {
     /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
     /// clients are visible without grepping logs.
     pub auth_metrics: metrics::AuthMetrics,
-    /// Horizon poll cycle outcome counters: success/rate_limited/error.
-    /// Exposed via `GET /metrics` so sustained throttling is a queryable fact
-    /// rather than indistinguishable `warn!` lines (issue #313).
+    /// Horizon poll cycle outcome counters: success/rate_limited/error, plus
+    /// the current Horizon cursor age. Exposed via `GET /metrics` so
+    /// sustained throttling or detection lag is a queryable fact rather than
+    /// indistinguishable `warn!`/`info!` lines (issue #313).
     pub horizon_metrics: metrics::HorizonMetrics,
     /// Per-asset gateway trustline state, refreshed at boot and on a
     /// recurring interval thereafter (trustlines can be revoked, or an asset
@@ -348,6 +349,14 @@ pub struct AppState {
     /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
     /// and started/stopped/failure/restart counts for monitoring and alerting.
     pub task_health: TaskHealth,
+    /// HTTP request counters and latency histogram, labelled by matched route
+    /// and method. Exposed via `GET /metrics` so traffic volume and latency
+    /// are queryable facts rather than invisible to an operator (issue:
+    /// missing operational metrics).
+    pub http_metrics: metrics::HttpMetrics,
+    /// Payment lifecycle counters and settlement-latency histogram. Exposed
+    /// via `GET /metrics` (issue: missing operational metrics).
+    pub payment_metrics: metrics::PaymentMetrics,
 }
 
 #[cfg(test)]

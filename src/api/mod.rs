@@ -1,7 +1,7 @@
 use crate::api::payments::{AppError, JsonBody, OptionalJsonBody};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, Path, Request, State},
+    extract::{ConnectInfo, MatchedPath, Path, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
@@ -27,21 +27,9 @@ use tower_http::{
 
 mod payments;
 
-/// Reject request bodies larger than this (256 KiB) before they hit a handler.
-const MAX_BODY_BYTES: usize = 256 * 1024;
-
 /// The authenticated merchant ID injected by the auth middleware.
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
-
-/// Maximum number of distinct IP+bucket keys tracked at once.
-/// Once this is reached, moka evicts the least-recently-used entry,
-/// bounding resident memory regardless of key cardinality.
-const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
-
-/// How long a per-key limiter is retained after its last access.
-/// Keys for IPs that go quiet are automatically reclaimed.
-const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct RateLimitState {
@@ -85,8 +73,8 @@ impl RateLimitState {
     /// *looked* harmless because it never fired (issue #276).
     fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
         let limiters = Cache::builder()
-            .max_capacity(RATE_LIMITER_MAX_KEYS)
-            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .max_capacity(max_keys)
+            .time_to_idle(idle_ttl)
             .build();
         Self {
             requests_per_sec,
@@ -117,15 +105,15 @@ struct MerchantRateLimitState {
 }
 
 impl MerchantRateLimitState {
-    fn new(pool: db::Db, default_rps: u32) -> Self {
+    fn new(pool: db::Db, default_rps: u32, max_keys: u64, idle_ttl: Duration) -> Self {
         let limiters = Cache::builder()
-            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .max_capacity(max_keys)
             // A time-to-live (rather than only idle eviction) bounds how long
             // a busy merchant can keep serving a stale, cached quota after an
             // operator changes `rate_limit_per_sec` — a merchant that never
             // goes idle would otherwise never pick up the new value.
-            .time_to_live(RATE_LIMITER_IDLE_TTL)
-            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .time_to_live(idle_ttl)
+            .time_to_idle(idle_ttl)
             .build();
         Self {
             pool,
@@ -137,9 +125,12 @@ impl MerchantRateLimitState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
+    let rate_limiter_idle_ttl = Duration::from_secs(state.config.rate_limiter_idle_ttl_secs);
     let rate_limit = RateLimitState::new(
         state.config.rate_limit_requests_per_sec,
         state.config.trusted_proxy_cidrs.clone(),
+        state.config.rate_limiter_max_keys,
+        rate_limiter_idle_ttl,
     );
     /* Built once and shared (moka `Cache` clones point at the same underlying
     store) across both mounts of `api_v1` below. Built per-call instead, a
@@ -151,6 +142,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             .config
             .rate_limit_requests_per_sec
             .saturating_mul(MERCHANT_DEFAULT_QUOTA_MULTIPLIER),
+        state.config.rate_limiter_max_keys,
+        rate_limiter_idle_ttl,
     );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
@@ -179,7 +172,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
         .layer(middleware::from_fn_with_state(
             rate_limit,
             rate_limit_middleware,
@@ -188,6 +181,14 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
+        ))
+        /* Outermost so it measures the complete request lifecycle — including
+        a 429 from the rate limiter or a 408 from the timeout above — and
+        records the true final status and total latency (issue: missing
+        operational metrics). */
+        .layer(middleware::from_fn_with_state(
+            state.http_metrics.clone(),
+            http_metrics_middleware,
         ))
         .with_state(state)
 }
@@ -1299,14 +1300,59 @@ async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
     }
 }
 
+/// Records one completed HTTP request's method, matched route, status, and
+/// latency into [`crate::metrics::HttpMetrics`].
+///
+/// Labelled by the *matched route pattern* (`MatchedPath`, e.g.
+/// `/v1/payments/:id`), never the raw request URI — using the raw path would
+/// let every distinct payment or merchant id mint its own label series, which
+/// is exactly the unbounded-cardinality failure mode Prometheus labels must
+/// avoid. A request that matched no route at all (a genuine 404 on an
+/// unmapped path) is labelled `<unmatched>` for the same reason.
+///
+/// Applied as the outermost layer in [`router`] so the recorded status and
+/// latency reflect the complete request lifecycle, including rejections from
+/// the rate limiter or timeout layers beneath it.
+async fn http_metrics_middleware(
+    State(http_metrics): State<crate::metrics::HttpMetrics>,
+    req: Request,
+    next: Next,
+) -> axum::response::Response {
+    let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string());
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    http_metrics.record(&method, &route, response.status().as_u16(), elapsed_ms);
+    response
+}
+
 /// `GET /metrics` — Prometheus-compatible plain-text metrics snapshot.
 async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (main_bytes, wal_bytes, shm_bytes) = db::file_sizes(&state.config.database_url);
+    let db_snapshot = crate::metrics::DbSnapshot {
+        pool_size: state.pool.size(),
+        pool_idle: state.pool.num_idle() as u32,
+        pool_max: state.config.db_pool_max_connections,
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
+    };
+
     let body = crate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
-        &state.trustline_metrics,
+        &state.http_metrics,
+        &state.payment_metrics,
+        &db_snapshot,
     );
     (
         StatusCode::OK,

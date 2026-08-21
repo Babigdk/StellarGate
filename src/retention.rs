@@ -17,14 +17,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-/// Upper bound on rows removed per table per cycle.
-///
-/// Without this, the first run against a large backlog would delete
-/// indefinitely, monopolising the single writer. Whatever is left is picked up
-/// next cycle, so a backlog drains over several passes instead of one long
-/// stall.
-const MAX_PER_CYCLE: u64 = 50_000;
-
 pub async fn run_retention_worker(
     state: Arc<AppState>,
     mut shutdown: watch::Receiver<bool>,
@@ -77,10 +69,17 @@ pub async fn run_retention_worker(
 /// deleting expired rows is idempotent, so the next cycle simply continues
 /// from wherever this one stopped.
 pub async fn prune_once(state: &Arc<AppState>) -> anyhow::Result<(u64, u64)> {
+    let cap = state.config.retention_max_rows_per_cycle;
+    let batch_size = state.config.db_prune_batch_size;
+
     let mut deliveries = 0;
     if state.config.webhook_delivery_retention_days > 0 {
-        deliveries = drain(MAX_PER_CYCLE, || {
-            db::prune_webhook_deliveries(&state.pool, state.config.webhook_delivery_retention_days)
+        deliveries = drain(cap, batch_size, || {
+            db::prune_webhook_deliveries(
+                &state.pool,
+                state.config.webhook_delivery_retention_days,
+                batch_size,
+            )
         })
         .await?;
 
@@ -89,10 +88,11 @@ pub async fn prune_once(state: &Arc<AppState>) -> anyhow::Result<(u64, u64)> {
         the bulk of the row and its only reader is redelivery, which is not
         something anyone does to a months-old failure. Counted separately from
         `deliveries` — these rows are retained, not removed. */
-        let compacted = drain(MAX_PER_CYCLE, || {
+        let compacted = drain(cap, batch_size, || {
             db::compact_stale_failed_deliveries(
                 &state.pool,
                 state.config.webhook_delivery_retention_days,
+                batch_size,
             )
         })
         .await?;
@@ -106,8 +106,12 @@ pub async fn prune_once(state: &Arc<AppState>) -> anyhow::Result<(u64, u64)> {
 
     let mut keys = 0;
     if state.config.idempotency_retention_days > 0 {
-        keys = drain(MAX_PER_CYCLE, || {
-            db::prune_idempotency_keys(&state.pool, state.config.idempotency_retention_days)
+        keys = drain(cap, batch_size, || {
+            db::prune_idempotency_keys(
+                &state.pool,
+                state.config.idempotency_retention_days,
+                batch_size,
+            )
         })
         .await?;
     }
@@ -117,7 +121,7 @@ pub async fn prune_once(state: &Arc<AppState>) -> anyhow::Result<(u64, u64)> {
 
 /// Repeat a batched delete until it comes back short (nothing left to remove)
 /// or the per-cycle cap is reached.
-async fn drain<F, Fut>(cap: u64, mut batch: F) -> anyhow::Result<u64>
+async fn drain<F, Fut>(cap: u64, batch_size: i64, mut batch: F) -> anyhow::Result<u64>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<u64>>,
@@ -128,7 +132,7 @@ where
         total += n;
 
         // A short batch means the table is drained.
-        if n < db::PRUNE_BATCH as u64 || total >= cap {
+        if n < batch_size as u64 || total >= cap {
             return Ok(total);
         }
 
@@ -185,6 +189,15 @@ mod tests {
             trusted_proxy_cidrs: vec![],
             max_payment_amount: Default::default(),
             min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -203,7 +216,8 @@ mod tests {
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
             horizon_metrics: crate::metrics::HorizonMetrics::new(),
-            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
+            http_metrics: crate::metrics::HttpMetrics::new(),
+            payment_metrics: crate::metrics::PaymentMetrics::new(),
             task_health: crate::TaskHealth::new(),
         })
     }
@@ -303,12 +317,14 @@ mod tests {
         let state = state_with(test_config(30, 7)).await;
         insert_delivery(&state, "old-failed", "failed", 60, false).await;
 
-        let first = db::compact_stale_failed_deliveries(&state.pool, 30)
-            .await
-            .unwrap();
-        let second = db::compact_stale_failed_deliveries(&state.pool, 30)
-            .await
-            .unwrap();
+        let first =
+            db::compact_stale_failed_deliveries(&state.pool, 30, state.config.db_prune_batch_size)
+                .await
+                .unwrap();
+        let second =
+            db::compact_stale_failed_deliveries(&state.pool, 30, state.config.db_prune_batch_size)
+                .await
+                .unwrap();
 
         assert_eq!(first, 1);
         assert_eq!(
@@ -394,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn drains_a_backlog_larger_than_one_batch() {
         let state = state_with(test_config(1, 1)).await;
-        let total = db::PRUNE_BATCH + 137;
+        let total = state.config.db_prune_batch_size + 137;
 
         for i in 0..total {
             sqlx::query(

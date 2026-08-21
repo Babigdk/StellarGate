@@ -55,9 +55,6 @@ use tracing::{debug, info, warn};
 /// the `kv_state` table, so polling resumes from it across restarts.
 const PAYMENT_CURSOR_KEY: &str = "horizon_payment_cursor";
 
-/// How many payment records to request per Horizon page while catching up.
-const PAGE_LIMIT: u32 = 200;
-
 /// A single payment operation as returned by Horizon, with the embedded
 /// transaction (requested via `join=transactions`) so we can read its memo.
 #[derive(Debug, Clone, Deserialize)]
@@ -508,9 +505,9 @@ pub async fn run_trustline_checker(
 /// searching for a baseline that covers every currently open intent (issue
 /// #311). Bounds the worst case — an account with a large payment history and
 /// an old open intent — to a fixed number of Horizon requests at boot rather
-/// than an unbounded backward scan. `MAX_BASELINE_PAGES * PAGE_LIMIT` (5,000
-/// records) is the same order of magnitude as [`MAX_PAGES_PER_CYCLE`]'s
-/// per-cycle budget.
+/// than an unbounded backward scan. `MAX_BASELINE_PAGES * horizon_page_limit`
+/// (5,000 records at the default page size) is the same order of magnitude as
+/// [`MAX_PAGES_PER_CYCLE`]'s per-cycle budget.
 const MAX_BASELINE_PAGES: usize = 25;
 
 /// Resolve the cursor this cycle should start paging from.
@@ -568,7 +565,7 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
             "{}/accounts/{}/payments?order=desc&limit={}{}",
             state.config.horizon_url.trim_end_matches('/'),
             state.config.gateway_public,
-            PAGE_LIMIT,
+            state.config.horizon_page_limit,
             next_cursor
                 .as_ref()
                 .map(|c| format!("&cursor={c}"))
@@ -648,8 +645,8 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
 /// cycle by looping until caught up — reissuing exactly the request volume
 /// that tripped the limit, immediately after it lifts. The cursor is
 /// checkpointed after every page, so stopping early costs nothing: the next
-/// cycle resumes exactly where this one stopped, `PAGE_LIMIT` records later
-/// per additional cycle.
+/// cycle resumes exactly where this one stopped, `horizon_page_limit` records
+/// later per additional cycle.
 const MAX_PAGES_PER_CYCLE: usize = 25;
 
 /// Run one poll cycle: page forward from the persisted cursor through every
@@ -671,7 +668,7 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             &state.config.horizon_url,
             &state.config.gateway_public,
             &cursor,
-            PAGE_LIMIT,
+            state.config.horizon_page_limit,
         )
         .await?;
         let count = page.len();
@@ -694,6 +691,9 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
             .and_then(elapsed_secs)
         {
             info!(cursor_age_secs, "poller cursor advanced");
+            state
+                .horizon_metrics
+                .record_cursor_age_secs(cursor_age_secs);
         }
 
         /* Checkpoint after the whole page is processed. If we crash mid-page the
@@ -702,7 +702,7 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
         db::set_state(&state.pool, PAYMENT_CURSOR_KEY, &cursor).await?;
 
         // A short page means Horizon has nothing newer — we're caught up.
-        if count < PAGE_LIMIT as usize {
+        if count < state.config.horizon_page_limit as usize {
             break;
         }
 
@@ -853,6 +853,9 @@ async fn settle(
         ?settlement_latency_secs,
         "payment settled"
     );
+    state
+        .payment_metrics
+        .record_settlement(status, settlement_latency_secs);
 
     // Reflect the new state in the copy we hand to the webhook.
     let mut settled = payment.clone();
@@ -1179,6 +1182,9 @@ async fn handle_stream_event(state: &Arc<AppState>, block: &str, cursor: &mut St
         Ok(hp) => {
             if let Some(cursor_age_secs) = hp.created_at.as_deref().and_then(elapsed_secs) {
                 info!(cursor_age_secs, "stream cursor advanced");
+                state
+                    .horizon_metrics
+                    .record_cursor_age_secs(cursor_age_secs);
             }
             /* Receiving a payment record means the stream is alive and the
             cursor moved — the same heartbeat /ready's freshness check uses. */

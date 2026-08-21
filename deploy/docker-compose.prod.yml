@@ -15,6 +15,10 @@ services:
       context: ..
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Compose's own default (10s) is shorter than the app's own
+    # SHUTDOWN_GRACE_SECS drain budget (default 30s) — see "Shutdown grace"
+    # in DEPLOYMENT.md. Raised here so the app is never SIGKILLed mid-drain.
+    stop_grace_period: 35s
     # Deliberately no `ports:` — see the note above. Caddy reaches this over
     # the compose network as http://app:3000.
     expose:

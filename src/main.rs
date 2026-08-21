@@ -12,7 +12,7 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, HorizonMetrics, TrustlineMetrics, WebhookMetrics},
+    metrics::{AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, WebhookMetrics},
     retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -25,9 +25,6 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// Timeout for general outbound HTTP (Horizon). Webhook delivery uses its own
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long shutdown waits for background tasks to drain before forcing exit.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,6 +66,8 @@ async fn main() -> Result<()> {
         horizon_metrics: HorizonMetrics::new(),
         trustline_metrics: TrustlineMetrics::new(),
         task_health: TaskHealth::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
         config: cfg,
     });
 
@@ -148,6 +147,9 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
+    // Captured before `state` is moved into `api::router` below.
+    let shutdown_grace = Duration::from_secs(state.config.shutdown_grace_secs);
+
     axum::serve(
         listener,
         api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
@@ -166,9 +168,9 @@ async fn main() -> Result<()> {
             join_task(handle, &health, "stream").await;
         }
     };
-    if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
+    if tokio::time::timeout(shutdown_grace, drain).await.is_err() {
         info!(
-            timeout_secs = SHUTDOWN_GRACE.as_secs(),
+            timeout_secs = shutdown_grace.as_secs(),
             "background tasks did not drain in time; forcing exit"
         );
     }

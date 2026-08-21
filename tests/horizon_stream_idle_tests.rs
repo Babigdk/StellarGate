@@ -87,13 +87,23 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
             trusted_proxy_cidrs: vec![],
             max_payment_amount: Default::default(),
             min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
-        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -193,12 +203,22 @@ async fn stalled_stream_is_detected_and_reconnected() {
         "a detected stall must be counted as a stream reconnect"
     );
 
+    let db_snapshot = stellargate::metrics::DbSnapshot {
+        pool_size: state.pool.size(),
+        pool_idle: state.pool.num_idle() as u32,
+        pool_max: state.config.db_pool_max_connections,
+        main_bytes: None,
+        wal_bytes: None,
+        shm_bytes: None,
+    };
     let rendered = stellargate::metrics::render(
         &state.webhook_metrics,
         &state.auth_metrics,
         &state.task_health,
         &state.horizon_metrics,
-        &state.trustline_metrics,
+        &state.http_metrics,
+        &state.payment_metrics,
+        &db_snapshot,
     );
     assert!(
         rendered.contains("stellargate_horizon_stream_reconnects_total"),

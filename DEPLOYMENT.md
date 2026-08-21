@@ -255,6 +255,24 @@ no reason to serve the sign-in page to the whole internet. Restrict it in the
 Uncapped container logs filling the boot volume is a slow and surprising way to
 take a service down.
 
+**Shutdown grace.** On `SIGTERM`, StellarGate stops accepting new requests and
+waits up to `SHUTDOWN_GRACE_SECS` (default 30) for the poller, sweeper,
+redrive worker, retention worker, trustline checker, and stream listener to
+drain before forcing exit. That budget is only meaningful if the orchestrator
+sending the signal waits at least as long before escalating to `SIGKILL`:
+
+- **Kubernetes** — `terminationGracePeriodSeconds` also defaults to 30. Left
+  at the default on both sides, the pod can be force-killed at the same
+  instant `SHUTDOWN_GRACE_SECS` expires, cutting a still-draining task off
+  mid-work. Set `terminationGracePeriodSeconds` a few seconds *above*
+  `SHUTDOWN_GRACE_SECS`, not equal to it.
+- **Docker / Docker Compose** (used by `deploy/docker-compose.prod.yml`) —
+  `stop_grace_period` defaults to 10s, well under `SHUTDOWN_GRACE_SECS`'s
+  default of 30. Without raising it, `docker compose down` or a `restart:
+  unless-stopped` cycle sends `SIGKILL` long before the app's own drain
+  window closes. Set `stop_grace_period` on the `app` service to match (add a
+  few seconds of margin, e.g. `35s` for the default `SHUTDOWN_GRACE_SECS=30`).
+
 ---
 
 ## Upgrades and rollback

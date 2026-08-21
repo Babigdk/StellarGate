@@ -27,6 +27,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let expired = db::expire_overdue(&state.pool, state.config.expiry_batch_size).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
+        state.payment_metrics.record_expired();
         webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
     }
     Ok(expired.len())
@@ -109,6 +110,15 @@ mod tests {
             trusted_proxy_cidrs: vec![],
             max_payment_amount: Default::default(),
             min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -130,7 +140,8 @@ mod tests {
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
             horizon_metrics: crate::metrics::HorizonMetrics::new(),
-            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
+            http_metrics: crate::metrics::HttpMetrics::new(),
+            payment_metrics: crate::metrics::PaymentMetrics::new(),
             task_health: crate::TaskHealth::new(),
         }
     }
