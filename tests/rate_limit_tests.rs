@@ -623,3 +623,21 @@ async fn probes_survive_an_exhausted_payments_bucket() {
     server.get("/ready").await.assert_status_ok();
     server.get("/metrics").await.assert_status_ok();
 }
+
+/// Confirms the probes bypass the limiter entirely, rather than merely
+/// receiving a very generous quota of their own: `rate_limit_middleware`
+/// returns before it ever builds an `X-RateLimit-*` header for them.
+#[tokio::test]
+async fn probe_responses_carry_no_rate_limit_headers() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    for path in ["/health", "/ready", "/metrics"] {
+        let res = server.get(path).await;
+        res.assert_status_ok();
+        assert!(
+            res.headers().get("x-ratelimit-limit").is_none(),
+            "{path} must bypass the rate limiter rather than just receive \
+             a generous quota"
+        );
+    }
+}
