@@ -1590,4 +1590,15 @@ mod tests {
             );
         }
     }
+
+    /// The exemption is scoped to exactly the three probe paths — it must not
+    /// widen into "every GET is exempt", which would silently undo the
+    /// per-IP protection on payment enumeration and webhook listing.
+    #[test]
+    fn other_get_routes_still_fall_into_the_default_bucket() {
+        assert_eq!(
+            rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
+            Some("default")
+        );
+    }
 }
