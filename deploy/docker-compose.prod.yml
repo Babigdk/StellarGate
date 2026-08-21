@@ -28,7 +28,9 @@ services:
       - stellargate_data:/data
     healthcheck:
       # /ready, not /health: this reports unhealthy when the database or
-      # Horizon is unreachable, which is what actually matters.
+      # Horizon is unreachable, which is what actually matters. It's also
+      # exempt from the per-IP rate limiter (see DEPLOYMENT.md), so a traffic
+      # spike can never turn this into a 429 and get the container restarted.
       test: ["CMD", "curl", "-fsS", "http://localhost:3000/ready"]
       interval: 30s
       timeout: 10s
