@@ -548,3 +548,33 @@ async fn non_positive_rate_limit_is_rejected() {
         .await
         .assert_status(StatusCode::BAD_REQUEST);
 }
+
+// ── Operational probes are exempt from the limiter ───────────────────────────
+//
+// `/health` and `/ready` used to share the "default" bucket with every other
+// GET request. Under load that bucket empties, the orchestrator's probe —
+// same source IP as everything else on that host — starts getting `429`s,
+// `curl -f` treats that as a failed check, and the instance gets restarted or
+// pulled from rotation right when it can least afford it. These tests pin the
+// fix: probes must stay answerable no matter how drained the API's own quota
+// is.
+
+/// The core regression test: exhaust the "default" bucket with ordinary reads
+/// from the same client the probes share, then confirm `/health` is
+/// completely unaffected.
+#[tokio::test]
+async fn health_survives_an_exhausted_default_bucket() {
+    let (server, _pool) = server_with_config(make_config(1)).await;
+
+    // "default" bucket quota is rate_limit_requests_per_sec × 5 = 5.
+    for _ in 0..5 {
+        server.get("/payments/nonexistent").await;
+    }
+    server
+        .get("/payments/nonexistent")
+        .await
+        .assert_status(StatusCode::TOO_MANY_REQUESTS);
+
+    // /health never touched that bucket, so draining it changes nothing.
+    server.get("/health").await.assert_status_ok();
+}
