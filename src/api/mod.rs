@@ -27,21 +27,9 @@ use tower_http::{
 
 mod payments;
 
-/// Reject request bodies larger than this (256 KiB) before they hit a handler.
-const MAX_BODY_BYTES: usize = 256 * 1024;
-
 /// The authenticated merchant ID injected by the auth middleware.
 #[derive(Clone)]
 pub struct AuthenticatedMerchant(pub String);
-
-/// Maximum number of distinct IP+bucket keys tracked at once.
-/// Once this is reached, moka evicts the least-recently-used entry,
-/// bounding resident memory regardless of key cardinality.
-const RATE_LIMITER_MAX_KEYS: u64 = 10_000;
-
-/// How long a per-key limiter is retained after its last access.
-/// Keys for IPs that go quiet are automatically reclaimed.
-const RATE_LIMITER_IDLE_TTL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 struct RateLimitState {
@@ -78,10 +66,15 @@ const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-r
 const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 impl RateLimitState {
-    fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
+    fn new(
+        requests_per_sec: u32,
+        trusted_proxies: Vec<IpNet>,
+        max_keys: u64,
+        idle_ttl: Duration,
+    ) -> Self {
         let limiters = Cache::builder()
-            .max_capacity(RATE_LIMITER_MAX_KEYS)
-            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .max_capacity(max_keys)
+            .time_to_idle(idle_ttl)
             .build();
         Self {
             requests_per_sec: requests_per_sec.max(1),
@@ -112,15 +105,15 @@ struct MerchantRateLimitState {
 }
 
 impl MerchantRateLimitState {
-    fn new(pool: db::Db, default_rps: u32) -> Self {
+    fn new(pool: db::Db, default_rps: u32, max_keys: u64, idle_ttl: Duration) -> Self {
         let limiters = Cache::builder()
-            .max_capacity(RATE_LIMITER_MAX_KEYS)
+            .max_capacity(max_keys)
             // A time-to-live (rather than only idle eviction) bounds how long
             // a busy merchant can keep serving a stale, cached quota after an
             // operator changes `rate_limit_per_sec` — a merchant that never
             // goes idle would otherwise never pick up the new value.
-            .time_to_live(RATE_LIMITER_IDLE_TTL)
-            .time_to_idle(RATE_LIMITER_IDLE_TTL)
+            .time_to_live(idle_ttl)
+            .time_to_idle(idle_ttl)
             .build();
         Self {
             pool,
@@ -132,9 +125,12 @@ impl MerchantRateLimitState {
 
 pub fn router(state: Arc<AppState>) -> axum::Router {
     let cors = build_cors(&state.config);
+    let rate_limiter_idle_ttl = Duration::from_secs(state.config.rate_limiter_idle_ttl_secs);
     let rate_limit = RateLimitState::new(
         state.config.rate_limit_requests_per_sec,
         state.config.trusted_proxy_cidrs.clone(),
+        state.config.rate_limiter_max_keys,
+        rate_limiter_idle_ttl,
     );
     /* Built once and shared (moka `Cache` clones point at the same underlying
     store) across both mounts of `api_v1` below. Built per-call instead, a
@@ -146,6 +142,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             .config
             .rate_limit_requests_per_sec
             .saturating_mul(MERCHANT_DEFAULT_QUOTA_MULTIPLIER),
+        state.config.rate_limiter_max_keys,
+        rate_limiter_idle_ttl,
     );
     let request_timeout = Duration::from_secs(state.config.request_timeout_secs);
 
@@ -174,7 +172,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
         .layer(middleware::from_fn_with_state(
             rate_limit,
             rate_limit_middleware,

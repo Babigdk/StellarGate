@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deployment-tunable limits that were compile-time constants.** Request
+  body size, rate-limiter capacity/TTL, list-endpoint pagination bounds,
+  shutdown grace period, the Horizon poller's page size, and the retention
+  worker's batch size and per-cycle cap were all `const`s baked into the
+  binary, even though each is a deployment-shaped decision (proxy fanout
+  behind the rate limiter, an orchestrator's termination grace period, a
+  Horizon poll cycle's duration) rather than a design invariant. They are now
+  `Config` fields — `MAX_BODY_BYTES`, `RATE_LIMITER_MAX_KEYS`,
+  `RATE_LIMITER_IDLE_TTL_SECS`, `PAGINATION_DEFAULT_LIMIT`,
+  `PAGINATION_MAX_LIMIT`, `SHUTDOWN_GRACE_SECS`, `HORIZON_PAGE_LIMIT`,
+  `DB_PRUNE_BATCH_SIZE`, `RETENTION_MAX_ROWS_PER_CYCLE` — validated at boot,
+  documented in `.env.example`, with the previous constants kept as their
+  defaults so behaviour is unchanged out of the box. `SHUTDOWN_GRACE_SECS`'s
+  relationship to an orchestrator's own termination grace period (Kubernetes'
+  `terminationGracePeriodSeconds`, Docker's `stop_grace_period`) is documented
+  in a new "Shutdown grace" section of DEPLOYMENT.md, and
+  `deploy/docker-compose.prod.yml` now sets `stop_grace_period` to clear the
+  app's default drain budget instead of undercutting it (issue #279).
 - **Audit events for every state-changing operation.** Authentication
   outcomes and key issuance/revocation were already logged with
   `merchant_id`/`source_ip`, but payment creation, webhook redelivery
