@@ -901,7 +901,16 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// `"default"` bucket with merchant API traffic. They used to share it, which
 /// created a feedback loop under load: a traffic spike exhausts the per-IP
 /// quota, the orchestrator's liveness probe — same source IP, same bucket —
-/// gets a `429`, and a health check treats that as a failed probe.
+/// gets a `429`, `curl -f` treats that as a failed check, and the instance is
+/// restarted or pulled from rotation right when it's under the most load.
+/// Restarting this service is not free (the poller re-baselines and the
+/// redrive worker runs a full pass on start), so that restart concentrates
+/// load on the remaining instances instead of relieving it. Probes are also
+/// the wrong thing to protect: they're cheap, they come from a trusted
+/// orchestrator rather than the public internet, and their entire purpose is
+/// to stay answerable when the system is stressed. If unauthenticated abuse
+/// of these paths ever becomes a real concern, give them their own generous
+/// bucket rather than folding them back into `"default"`.
 ///
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
