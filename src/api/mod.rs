@@ -1569,4 +1569,25 @@ mod tests {
         let wait = Duration::from_secs(600);
         assert!(reset_secs(quota, 0, wait) >= retry_after_secs(wait));
     }
+
+    // ── rate_limited_bucket — probe exemption ────────────────────────────────
+
+    fn method_req(method: axum::http::Method, path: &str) -> Request<axum::body::Body> {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn probe_endpoints_bypass_the_rate_limiter() {
+        for path in ["/health", "/ready", "/metrics"] {
+            assert_eq!(
+                rate_limited_bucket(&method_req(axum::http::Method::GET, path)),
+                None,
+                "{path} must return None so rate_limit_middleware skips it entirely"
+            );
+        }
+    }
 }
