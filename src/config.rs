@@ -499,6 +499,7 @@ impl Config {
         config.validate_addresses()?;
         config.validate_timing()?;
         config.validate_amount_limits()?;
+        config.validate_limits()?;
         Ok(config)
     }
 
@@ -581,6 +582,73 @@ impl Config {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Cross-validate limit fields (floors and upper bounds) to catch
+    /// nonsensical or dangerous configuration values that would cause runtime
+    /// hangs, lock failures, or silent issues:
+    ///
+    /// - `PORT == 0` → binds an ephemeral port, leaving the listening address unpredictable
+    /// - `DB_POOL_MAX_CONNECTIONS == 0` → migrate() blocks indefinitely waiting for a connection that cannot exist
+    /// - `DB_POOL_MAX_CONNECTIONS > 1000` → excessive connection pool size consumes file descriptors and increases SQLite lock contention
+    /// - `DB_BUSY_TIMEOUT_MS == 0` → immediate SQLITE_BUSY failure under concurrent writes
+    /// - `DB_BUSY_TIMEOUT_MS > 3_600_000` → excessive lock wait (> 1 hour)
+    /// - `WEBHOOK_REDRIVE_CONCURRENCY == 0` → redrive worker cannot process failed webhooks
+    /// - `WEBHOOK_REDRIVE_CONCURRENCY > 1000` → excessive redrive concurrency overwhelms target endpoints
+    /// - `RATE_LIMIT_REQUESTS_PER_SEC == 0` → blocks all incoming API requests with 429
+    fn validate_limits(&self) -> Result<()> {
+        if self.port == 0 {
+            return Err(anyhow::anyhow!(
+                "PORT must be > 0 (got 0). A zero port binds an ephemeral port, leaving the listening address unpredictable."
+            ));
+        }
+
+        if self.db_pool_max_connections == 0 {
+            return Err(anyhow::anyhow!(
+                "DB_POOL_MAX_CONNECTIONS must be > 0 (got 0). A zero-sized pool means no connection can ever be acquired and the process will hang at startup."
+            ));
+        }
+
+        if self.db_pool_max_connections > 1000 {
+            return Err(anyhow::anyhow!(
+                "DB_POOL_MAX_CONNECTIONS must be <= 1000 (got {}). Excessive connection pool size consumes file descriptors and increases SQLite lock contention.",
+                self.db_pool_max_connections
+            ));
+        }
+
+        if self.db_busy_timeout_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "DB_BUSY_TIMEOUT_MS must be > 0 (got 0). Zero turns every SQLite write contention into an immediate SQLITE_BUSY error under load."
+            ));
+        }
+
+        if self.db_busy_timeout_ms > 3_600_000 {
+            return Err(anyhow::anyhow!(
+                "DB_BUSY_TIMEOUT_MS must be <= 3600000 (got {}). An excessively high busy timeout blocks requests for too long during lock contention.",
+                self.db_busy_timeout_ms
+            ));
+        }
+
+        if self.webhook_redrive_concurrency == 0 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_CONCURRENCY must be > 0 (got 0). A zero concurrency prevents the redrive worker from dispatching webhooks."
+            ));
+        }
+
+        if self.webhook_redrive_concurrency > 1000 {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_CONCURRENCY must be <= 1000 (got {}). Excessive redrive concurrency can exhaust network resources and overwhelm target endpoints.",
+                self.webhook_redrive_concurrency
+            ));
+        }
+
+        if self.rate_limit_requests_per_sec == 0 {
+            return Err(anyhow::anyhow!(
+                "RATE_LIMIT_REQUESTS_PER_SEC must be > 0 (got 0). A zero rate limit would block all incoming API requests with 429 Too Many Requests."
+            ));
+        }
+
         Ok(())
     }
 
@@ -1858,6 +1926,138 @@ mod tests {
             || {
                 Config::from_env().unwrap();
                 assert!(!logs_contain("ALLOWED_WEBHOOK_SCHEMES"));
+            },
+        );
+    }
+
+    // ── validate_limits ──────────────────────────────────────────────────────
+
+    fn limits_config() -> Config {
+        sample_config()
+    }
+
+    #[test]
+    fn limits_valid_defaults_pass() {
+        assert!(limits_config().validate_limits().is_ok());
+    }
+
+    #[test]
+    fn limits_rejects_zero_port() {
+        let mut cfg = limits_config();
+        cfg.port = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("PORT"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_zero_db_pool_max_connections() {
+        let mut cfg = limits_config();
+        cfg.db_pool_max_connections = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
+        assert!(err.contains("hang"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_absurd_db_pool_max_connections() {
+        let mut cfg = limits_config();
+        cfg.db_pool_max_connections = 1001;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_zero_db_busy_timeout_ms() {
+        let mut cfg = limits_config();
+        cfg.db_busy_timeout_ms = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_absurd_db_busy_timeout_ms() {
+        let mut cfg = limits_config();
+        cfg.db_busy_timeout_ms = 3_600_001;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_zero_webhook_redrive_concurrency() {
+        let mut cfg = limits_config();
+        cfg.webhook_redrive_concurrency = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_absurd_webhook_redrive_concurrency() {
+        let mut cfg = limits_config();
+        cfg.webhook_redrive_concurrency = 1001;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_rejects_zero_rate_limit_requests_per_sec() {
+        let mut cfg = limits_config();
+        cfg.rate_limit_requests_per_sec = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("RATE_LIMIT_REQUESTS_PER_SEC"), "got: {err}");
+    }
+
+    #[test]
+    fn startup_fails_on_zero_db_pool_max_connections_via_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("DB_POOL_MAX_CONNECTIONS", Some("0")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_zero_db_busy_timeout_via_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("DB_BUSY_TIMEOUT_MS", Some("0")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_zero_webhook_redrive_concurrency_via_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("WEBHOOK_REDRIVE_CONCURRENCY", Some("0")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
+            },
+        );
+    }
+
+    #[test]
+    fn startup_fails_on_zero_port_via_env() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("PORT", Some("0")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(err.contains("PORT"), "got: {err}");
             },
         );
     }
