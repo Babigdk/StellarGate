@@ -66,6 +66,17 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+/// Stable machine-readable code for a `JsonRejection` variant not given its
+/// own dedicated code, keyed on the HTTP status axum already chose for it —
+/// `413` for an oversized body (issue #257), `400` for everything else this
+/// catch-all can still see.
+fn rejection_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        _ => "invalid_request",
+    }
+}
+
 /// A drop-in replacement for `Json<T>` that maps any deserialization or
 /// content-type failure into our standard `{"error": "..."}` 400 response
 /// instead of axum's default 422 plaintext rejection.
@@ -114,10 +125,23 @@ where
                             "Content-Type must be application/json",
                         ))
                     }
-                    _ => Err(AppError::bad_request(
-                        "invalid_request",
-                        "invalid request body",
-                    )),
+                    // `JsonRejection` is `#[non_exhaustive]`, so a catch-all is
+                    // required — but it must preserve the rejection's own status
+                    // and reason rather than flattening everything into a
+                    // generic 400. This is where `BytesRejection` lands,
+                    // covering an oversized body (`RequestBodyLimitLayer`) and a
+                    // truncated/aborted one: telling a client its JSON was
+                    // malformed when the real problem was the body's size or a
+                    // dropped connection sends it chasing the wrong fix (issue
+                    // #257).
+                    other => {
+                        tracing::debug!(rejection = %other, "unhandled JSON rejection");
+                        Err(AppError::new(
+                            other.status(),
+                            rejection_code(other.status()),
+                            other.body_text(),
+                        ))
+                    }
                 }
             }
         }
