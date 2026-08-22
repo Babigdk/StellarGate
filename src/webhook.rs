@@ -30,7 +30,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -171,7 +171,18 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     )
     .await
     {
-        warn!(error = %e, "failed to record webhook delivery");
+        /* A durable delivery row is a precondition for the send. Continuing
+        after a save failure POSTs a signed event with no audit row, no
+        redrive path, and silent no-op updates (issue #234). Settlement is
+        already committed, so skipping the send is recoverable — but only if
+        the failure is visible. */
+        error!(
+            payment_id = %payment.id,
+            error = %e,
+            "could not record webhook delivery; not sending"
+        );
+        state.webhook_metrics.record_failed();
+        return;
     }
 
     let client = match safe_client(state, &url).await {

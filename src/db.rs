@@ -875,7 +875,7 @@ pub async fn update_webhook_delivery(
     status: &str,
     attempts: i64,
 ) -> Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
@@ -883,6 +883,9 @@ pub async fn update_webhook_delivery(
     .bind(id)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("webhook delivery {id} not found for status update");
+    }
     Ok(())
 }
 

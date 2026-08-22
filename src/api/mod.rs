@@ -71,7 +71,12 @@ impl RateLimitState {
     /// here (as this used to, to `1`) would make the effective rate diverge
     /// from the configured one for every other value too — the clamp only
     /// *looked* harmless because it never fired (issue #276).
-    fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
+    fn new(
+        requests_per_sec: u32,
+        trusted_proxies: Vec<IpNet>,
+        max_keys: u64,
+        idle_ttl: Duration,
+    ) -> Self {
         let limiters = Cache::builder()
             .max_capacity(max_keys)
             .time_to_idle(idle_ttl)
