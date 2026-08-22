@@ -73,6 +73,15 @@ fn make_config() -> Config {
         trusted_proxy_cidrs: vec![],
         max_payment_amount: Default::default(),
         min_payment_amount: Default::default(),
+        max_body_bytes: 256 * 1024,
+        rate_limiter_max_keys: 10_000,
+        rate_limiter_idle_ttl_secs: 60,
+        pagination_default_limit: 20,
+        pagination_max_limit: 100,
+        shutdown_grace_secs: 30,
+        horizon_page_limit: 200,
+        db_prune_batch_size: 500,
+        retention_max_rows_per_cycle: 50_000,
     }
 }
 
@@ -136,6 +145,8 @@ async fn server_with_all(
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
         trustline_metrics,
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health,
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -498,6 +509,85 @@ async fn test_auth_outcomes_are_counted_in_metrics() {
         body.contains(
             "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
         ),
+        "got: {body}"
+    );
+}
+
+/// HTTP traffic must be observable via `/metrics`, labelled by the matched
+/// route pattern rather than the raw request path — hitting `GET
+/// /payments/:id` with two different payment ids must land in the *same*
+/// series, not mint one series per id (missing operational metrics issue).
+#[tokio::test]
+async fn test_http_requests_are_counted_by_matched_route_not_raw_path() {
+    let server = test_server().await;
+
+    server.get("/payments/one-id").await;
+    server.get("/payments/another-id").await;
+    server.get("/this-path-does-not-exist").await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"/payments/:id\",status=\"404\"} 2"
+        ),
+        "two distinct payment ids must be counted under one bounded-cardinality \
+         route label, not one series each:\n{body}"
+    );
+    assert!(
+        !body.contains("one-id") && !body.contains("another-id"),
+        "the raw path/id must never leak into a metric label:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"<unmatched>\",status=\"404\"} 1"
+        ),
+        "a request matching no route must fall into the bounded <unmatched> \
+         label, not the raw path:\n{body}"
+    );
+    assert!(
+        body.contains("stellargate_http_request_duration_seconds_bucket{method=\"GET\""),
+        "got: {body}"
+    );
+}
+
+/// Payment creation must be counted on `/metrics` (missing operational
+/// metrics issue).
+#[tokio::test]
+async fn test_payment_creation_is_counted_in_metrics() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_payments_total{status=\"created\"} 1"),
+        "got: {body}"
+    );
+}
+
+/// Database pool utilisation must be exported so an operator can see
+/// connections are exhausted before requests start queuing on the pool
+/// (missing operational metrics issue).
+#[tokio::test]
+async fn test_db_pool_metrics_are_exported() {
+    let server = test_server().await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_db_pool_max_connections 10"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_db_pool_connections{state=\"idle\"}"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_db_pool_connections{state=\"in_use\"}"),
         "got: {body}"
     );
 }

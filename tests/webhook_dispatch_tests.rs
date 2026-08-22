@@ -70,6 +70,15 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         trusted_proxy_cidrs: vec![],
         max_payment_amount: Default::default(),
         min_payment_amount: Default::default(),
+        max_body_bytes: 256 * 1024,
+        rate_limiter_max_keys: 10_000,
+        rate_limiter_idle_ttl_secs: 60,
+        pagination_default_limit: 20,
+        pagination_max_limit: 100,
+        shutdown_grace_secs: 30,
+        horizon_page_limit: 200,
+        db_prune_batch_size: 500,
+        retention_max_rows_per_cycle: 50_000,
     }
 }
 
@@ -91,6 +100,8 @@ async fn setup_state(cfg: Config) -> AppState {
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
         trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }
 }
@@ -752,5 +763,55 @@ async fn ssrf_blocked_dispatch_is_never_a_redrive_candidate() {
         candidates.is_empty(),
         "an SSRF-blocked dispatch must never become a redrive candidate, \
          got {candidates:?}"
+    );
+}
+
+// ── Delivery-row precondition (issue #234) ───────────────────────────────────
+
+/// If the delivery row cannot be inserted, `dispatch` must not POST. Otherwise
+/// the merchant receives a signed event that never appears in
+/// `GET /payments/:id/webhooks`, cannot be redelivered, and whose later status
+/// updates silently affect zero rows.
+#[tokio::test]
+async fn dispatch_does_not_send_when_delivery_row_cannot_be_recorded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cfg = make_config("secret", 3);
+    let state = setup_state(cfg).await;
+    let payment = create_test_payment(&state, &format!("{}/hook", server.uri())).await;
+
+    // Force `save_webhook_delivery` to fail without mocking the HTTP stack.
+    sqlx::query("DROP TABLE webhook_deliveries")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    webhook::dispatch(&state, &payment, "payment.completed", None).await;
+
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "a save failure must increment stellargate_webhook_deliveries_total{{outcome=\"failed\"}}"
+    );
+    // MockServer.expect(0) fails the test if any request arrived.
+}
+
+#[tokio::test]
+async fn update_webhook_delivery_errors_when_row_is_missing() {
+    let cfg = make_config("secret", 3);
+    let state = setup_state(cfg).await;
+
+    let err = db::update_webhook_delivery(&state.pool, "missing-id", "failed", 1)
+        .await
+        .expect_err("updating a nonexistent delivery must be an error, not a silent no-op");
+    assert!(
+        err.to_string().contains("missing-id"),
+        "error should name the missing id, got: {err}"
     );
 }

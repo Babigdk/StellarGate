@@ -61,6 +61,15 @@ fn make_config() -> Config {
         trusted_proxy_cidrs: vec![],
         max_payment_amount: Default::default(),
         min_payment_amount: Default::default(),
+        max_body_bytes: 256 * 1024,
+        rate_limiter_max_keys: 10_000,
+        rate_limiter_idle_ttl_secs: 60,
+        pagination_default_limit: 20,
+        pagination_max_limit: 100,
+        shutdown_grace_secs: 30,
+        horizon_page_limit: 200,
+        db_prune_batch_size: 500,
+        retention_max_rows_per_cycle: 50_000,
     }
 }
 
@@ -85,6 +94,8 @@ async fn test_server() -> TestServer {
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
         trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();

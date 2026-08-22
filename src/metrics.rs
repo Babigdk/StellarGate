@@ -228,6 +228,12 @@ struct HorizonMetricsInner {
     /// persistently-reconnecting stream is the alertable signal that a
     /// half-open connection is repeatedly disabling live payment detection.
     stream_reconnects: AtomicU64,
+    /// Age, in seconds, of the most recently processed Horizon payment record
+    /// — the same value `poll_once` and `handle_stream_event` already compute
+    /// via `elapsed_secs` and previously only logged. This is the sharpest
+    /// signal of whether payment detection is falling behind, and was
+    /// unavailable to alerting until exported here (missing-metrics issue).
+    cursor_age_secs: AtomicI64,
 }
 
 impl Default for HorizonMetricsInner {
@@ -237,6 +243,7 @@ impl Default for HorizonMetricsInner {
             rate_limited: AtomicU64::new(0),
             error: AtomicU64::new(0),
             stream_reconnects: AtomicU64::new(0),
+            cursor_age_secs: AtomicI64::new(0),
         }
     }
 }
@@ -261,6 +268,14 @@ impl HorizonMetrics {
         self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the age (in seconds) of the most recently processed Horizon
+    /// payment record. Called from `poll_once` after each page and from
+    /// `handle_stream_event` for each streamed record, alongside the
+    /// existing `info!(cursor_age_secs, ...)` log lines.
+    pub fn record_cursor_age_secs(&self, secs: i64) {
+        self.inner.cursor_age_secs.store(secs, Ordering::Relaxed);
+    }
+
     // ── Snapshot accessors ────────────────────────────────────────────────
 
     pub fn success(&self) -> u64 {
@@ -275,12 +290,267 @@ impl HorizonMetrics {
     pub fn stream_reconnects(&self) -> u64 {
         self.inner.stream_reconnects.load(Ordering::Relaxed)
     }
+    pub fn cursor_age_secs(&self) -> i64 {
+        self.inner.cursor_age_secs.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for HorizonMetrics {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Histogram buckets for HTTP request latency (milliseconds). Roughly the
+/// Prometheus client library defaults (5ms .. 10s), rendered as seconds in
+/// the exposition to match the `_seconds` metric name convention.
+const HTTP_LATENCY_BUCKETS_MS: &[u64] =
+    &[5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
+
+/// One route+method's latency distribution.
+#[derive(Default, Clone)]
+struct RouteLatency {
+    sum_ms: u64,
+    count: u64,
+    /// Cumulative per-bucket counts; one slot past
+    /// `HTTP_LATENCY_BUCKETS_MS` for `+Inf`.
+    buckets: Vec<u64>,
+}
+
+impl RouteLatency {
+    fn record(&mut self, elapsed_ms: u64) {
+        if self.buckets.is_empty() {
+            self.buckets = vec![0; HTTP_LATENCY_BUCKETS_MS.len() + 1];
+        }
+        self.sum_ms += elapsed_ms;
+        self.count += 1;
+        for (i, &bound) in HTTP_LATENCY_BUCKETS_MS.iter().enumerate() {
+            if elapsed_ms <= bound {
+                self.buckets[i] += 1;
+            }
+        }
+        *self.buckets.last_mut().unwrap() += 1;
+    }
+}
+
+/// HTTP request counters and a latency histogram, labelled by the matched
+/// route pattern (e.g. `/v1/payments/:id`) and method — never the raw URI or
+/// a path parameter — so cardinality stays bounded by the fixed route table
+/// regardless of how many distinct payment or merchant ids are requested.
+///
+/// A request that hit no route at all (a genuine 404 on an unmapped path) is
+/// labelled `<unmatched>` rather than the raw path, for the same reason.
+#[derive(Clone)]
+pub struct HttpMetrics {
+    inner: Arc<Mutex<HttpMetricsInner>>,
+}
+
+#[derive(Default)]
+struct HttpMetricsInner {
+    /// (method, route, status) -> count.
+    requests: HashMap<(String, String, u16), u64>,
+    /// (method, route) -> latency distribution.
+    latency: HashMap<(String, String), RouteLatency>,
+}
+
+impl HttpMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HttpMetricsInner::default())),
+        }
+    }
+
+    /// Record one completed HTTP request.
+    pub fn record(&self, method: &str, route: &str, status: u16, elapsed_ms: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        *inner
+            .requests
+            .entry((method.to_string(), route.to_string(), status))
+            .or_insert(0) += 1;
+        inner
+            .latency
+            .entry((method.to_string(), route.to_string()))
+            .or_default()
+            .record(elapsed_ms);
+    }
+
+    /// Snapshot of request counts, sorted for deterministic exposition.
+    fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<_> = inner
+            .requests
+            .iter()
+            .map(|((method, route, status), count)| {
+                (method.clone(), route.clone(), *status, *count)
+            })
+            .collect();
+        rows.sort_unstable_by(|a, b| (a.0.as_str(), a.1.as_str(), a.2).cmp(&(&b.0, &b.1, b.2)));
+        rows
+    }
+
+    /// Snapshot of latency distributions, sorted for deterministic exposition.
+    fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<_> = inner
+            .latency
+            .iter()
+            .map(|((method, route), lat)| (method.clone(), route.clone(), lat.clone()))
+            .collect();
+        rows.sort_unstable_by(|a, b| (a.0.as_str(), a.1.as_str()).cmp(&(&b.0, &b.1)));
+        rows
+    }
+}
+
+impl Default for HttpMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Histogram buckets for payment settlement latency (seconds): creation to
+/// the poller/stream settling the intent. Spans a few seconds (a fast
+/// on-chain confirmation) up to a couple of hours (a slow top-up on an
+/// underpaid intent).
+const SETTLEMENT_LATENCY_BUCKETS_SECS: &[u64] =
+    &[1, 5, 15, 30, 60, 120, 300, 600, 1_800, 3_600, 7_200];
+
+/// Payment lifecycle counters and settlement-latency histogram, so payment
+/// creation and settlement throughput/latency are queryable facts on
+/// `/metrics` rather than only visible via `GET /payments` polling or log
+/// lines (missing-metrics issue).
+#[derive(Clone)]
+pub struct PaymentMetrics {
+    inner: Arc<PaymentMetricsInner>,
+}
+
+struct PaymentMetricsInner {
+    created: AtomicU64,
+    completed: AtomicU64,
+    overpaid: AtomicU64,
+    underpaid: AtomicU64,
+    expired: AtomicU64,
+    settlement_latency_sum_secs: AtomicU64,
+    settlement_latency_count: AtomicU64,
+    settlement_latency_buckets: [AtomicU64; 12],
+}
+
+impl Default for PaymentMetricsInner {
+    fn default() -> Self {
+        Self {
+            created: AtomicU64::new(0),
+            completed: AtomicU64::new(0),
+            overpaid: AtomicU64::new(0),
+            underpaid: AtomicU64::new(0),
+            expired: AtomicU64::new(0),
+            settlement_latency_sum_secs: AtomicU64::new(0),
+            settlement_latency_count: AtomicU64::new(0),
+            settlement_latency_buckets: Default::default(),
+        }
+    }
+}
+
+impl PaymentMetrics {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(PaymentMetricsInner::default()),
+        }
+    }
+
+    /// Record a new payment intent (`POST /payments` minting a fresh id, not
+    /// an idempotent replay of an existing one).
+    pub fn record_created(&self) {
+        self.inner.created.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a payment intent swept to `expired` by the sweeper.
+    pub fn record_expired(&self) {
+        self.inner.expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a settlement outcome (`completed`, `overpaid`, or `underpaid`)
+    /// and, when known, the elapsed time since the intent was created.
+    /// `underpaid` is an intermediate rather than terminal state, but is
+    /// still counted here — it is the reconciler's verdict for this
+    /// transaction, distinct from the intent's eventual final status.
+    pub fn record_settlement(&self, status: &str, latency_secs: Option<i64>) {
+        let counter = match status {
+            "completed" => &self.inner.completed,
+            "overpaid" => &self.inner.overpaid,
+            "underpaid" => &self.inner.underpaid,
+            _ => return,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        if let Some(secs) = latency_secs {
+            // A negative value (clock skew) has no meaningful bucket; floor at 0.
+            let secs = secs.max(0) as u64;
+            self.inner
+                .settlement_latency_sum_secs
+                .fetch_add(secs, Ordering::Relaxed);
+            self.inner
+                .settlement_latency_count
+                .fetch_add(1, Ordering::Relaxed);
+            for (i, &bound) in SETTLEMENT_LATENCY_BUCKETS_SECS.iter().enumerate() {
+                if secs <= bound {
+                    self.inner.settlement_latency_buckets[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            self.inner.settlement_latency_buckets[SETTLEMENT_LATENCY_BUCKETS_SECS.len()]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // ── Snapshot accessors ────────────────────────────────────────────────
+
+    pub fn created(&self) -> u64 {
+        self.inner.created.load(Ordering::Relaxed)
+    }
+    pub fn completed(&self) -> u64 {
+        self.inner.completed.load(Ordering::Relaxed)
+    }
+    pub fn overpaid(&self) -> u64 {
+        self.inner.overpaid.load(Ordering::Relaxed)
+    }
+    pub fn underpaid(&self) -> u64 {
+        self.inner.underpaid.load(Ordering::Relaxed)
+    }
+    pub fn expired(&self) -> u64 {
+        self.inner.expired.load(Ordering::Relaxed)
+    }
+    pub fn settlement_latency_sum_secs(&self) -> u64 {
+        self.inner
+            .settlement_latency_sum_secs
+            .load(Ordering::Relaxed)
+    }
+    pub fn settlement_latency_count(&self) -> u64 {
+        self.inner.settlement_latency_count.load(Ordering::Relaxed)
+    }
+    pub fn settlement_latency_bucket(&self, i: usize) -> u64 {
+        self.inner.settlement_latency_buckets[i].load(Ordering::Relaxed)
+    }
+}
+
+impl Default for PaymentMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Database pool and on-disk file-size metrics, gathered fresh on each
+/// `/metrics` scrape (issue: missing DB metrics). Cheap: pool state is two
+/// atomic reads and file sizes are `stat()` calls on at most three files.
+pub struct DbSnapshot {
+    pub pool_size: u32,
+    pub pool_idle: u32,
+    pub pool_max: u32,
+    /// Bytes of the main database file. `None` for an in-memory database.
+    pub main_bytes: Option<u64>,
+    /// Bytes of the `-wal` file. `None` if absent (e.g. no writes yet, or
+    /// in-memory) — not rendered as a zero series in that case.
+    pub wal_bytes: Option<u64>,
+    /// Bytes of the `-shm` shared-memory index file. Same absence semantics
+    /// as `wal_bytes`.
+    pub shm_bytes: Option<u64>,
 }
 
 /// Per-asset gateway trustline state, refreshed by every call to
@@ -383,17 +653,21 @@ impl Default for TrustlineMetrics {
 
 // ── Prometheus text exposition ────────────────────────────────────────────────
 
-/// Render webhook delivery, auth outcome, background-task, and Horizon poll
-/// metrics as a Prometheus-compatible plain-text snapshot. Called by
-/// `GET /metrics`.
+/// Render webhook delivery, auth outcome, background-task, Horizon poll, HTTP
+/// traffic, payment lifecycle, and database metrics as a Prometheus-compatible
+/// plain-text snapshot. Called by `GET /metrics`.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     webhook: &WebhookMetrics,
     auth: &AuthMetrics,
     tasks: &crate::TaskHealth,
     horizon: &HorizonMetrics,
+    http: &HttpMetrics,
+    payments: &PaymentMetrics,
+    db: &DbSnapshot,
     trustlines: &TrustlineMetrics,
 ) -> String {
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
 
     // stellargate_webhook_deliveries_total — counter vec by outcome
     out.push_str(
@@ -592,7 +866,152 @@ pub fn render(
         tasks.last_success_unix()
     ));
 
-    // stellargate_missing_trustlines — gauge vec by asset (this issue)
+    /* stellargate_horizon_cursor_age_seconds — gauge. Previously computed
+    correctly in both poll_once and handle_stream_event and only ever logged
+    (`info!(cursor_age_secs, ...)`); this is the same value, exported so
+    payment-detection lag is alertable rather than something an operator has
+    to grep logs for. */
+    out.push_str(
+        "# HELP stellargate_horizon_cursor_age_seconds Age, in seconds, of the most recently processed Horizon payment record.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_cursor_age_seconds gauge\n");
+    out.push_str(&format!(
+        "stellargate_horizon_cursor_age_seconds {}\n",
+        horizon.cursor_age_secs()
+    ));
+
+    // stellargate_http_requests_total — counter vec by method/route/status.
+    // Labelled by the matched route pattern, never the raw URI, so
+    // cardinality is bounded by the fixed route table regardless of how many
+    // distinct payment/merchant ids are requested.
+    out.push_str(
+        "# HELP stellargate_http_requests_total Total HTTP requests by matched route, method, and status.\n",
+    );
+    out.push_str("# TYPE stellargate_http_requests_total counter\n");
+    for (method, route, status, count) in http.requests_snapshot() {
+        out.push_str(&format!(
+            "stellargate_http_requests_total{{method=\"{method}\",route=\"{route}\",status=\"{status}\"}} {count}\n"
+        ));
+    }
+
+    // stellargate_http_request_duration_seconds — histogram vec by method/route.
+    out.push_str(
+        "# HELP stellargate_http_request_duration_seconds HTTP request latency by matched route and method.\n",
+    );
+    out.push_str("# TYPE stellargate_http_request_duration_seconds histogram\n");
+    for (method, route, lat) in http.latency_snapshot() {
+        for (i, &bound_ms) in HTTP_LATENCY_BUCKETS_MS.iter().enumerate() {
+            out.push_str(&format!(
+                "stellargate_http_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",le=\"{}\"}} {}\n",
+                bound_ms as f64 / 1000.0,
+                lat.buckets[i]
+            ));
+        }
+        out.push_str(&format!(
+            "stellargate_http_request_duration_seconds_bucket{{method=\"{method}\",route=\"{route}\",le=\"+Inf\"}} {}\n",
+            lat.buckets[HTTP_LATENCY_BUCKETS_MS.len()]
+        ));
+        out.push_str(&format!(
+            "stellargate_http_request_duration_seconds_sum{{method=\"{method}\",route=\"{route}\"}} {}\n",
+            lat.sum_ms as f64 / 1000.0
+        ));
+        out.push_str(&format!(
+            "stellargate_http_request_duration_seconds_count{{method=\"{method}\",route=\"{route}\"}} {}\n",
+            lat.count
+        ));
+    }
+
+    // stellargate_payments_total — counter vec by lifecycle status.
+    out.push_str("# HELP stellargate_payments_total Total payments by lifecycle status.\n");
+    out.push_str("# TYPE stellargate_payments_total counter\n");
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"created\"}} {}\n",
+        payments.created()
+    ));
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"completed\"}} {}\n",
+        payments.completed()
+    ));
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"overpaid\"}} {}\n",
+        payments.overpaid()
+    ));
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"underpaid\"}} {}\n",
+        payments.underpaid()
+    ));
+    out.push_str(&format!(
+        "stellargate_payments_total{{status=\"expired\"}} {}\n",
+        payments.expired()
+    ));
+
+    // stellargate_payment_settlement_latency_seconds — histogram: creation to
+    // the poller/stream settling (or partially settling) the intent.
+    out.push_str(
+        "# HELP stellargate_payment_settlement_latency_seconds Time from payment creation to a settlement outcome (completed, overpaid, or underpaid).\n",
+    );
+    out.push_str("# TYPE stellargate_payment_settlement_latency_seconds histogram\n");
+    for (i, &bound) in SETTLEMENT_LATENCY_BUCKETS_SECS.iter().enumerate() {
+        out.push_str(&format!(
+            "stellargate_payment_settlement_latency_seconds_bucket{{le=\"{bound}\"}} {}\n",
+            payments.settlement_latency_bucket(i)
+        ));
+    }
+    out.push_str(&format!(
+        "stellargate_payment_settlement_latency_seconds_bucket{{le=\"+Inf\"}} {}\n",
+        payments.settlement_latency_bucket(SETTLEMENT_LATENCY_BUCKETS_SECS.len())
+    ));
+    out.push_str(&format!(
+        "stellargate_payment_settlement_latency_seconds_sum {}\n",
+        payments.settlement_latency_sum_secs()
+    ));
+    out.push_str(&format!(
+        "stellargate_payment_settlement_latency_seconds_count {}\n",
+        payments.settlement_latency_count()
+    ));
+
+    // stellargate_db_pool_connections — gauge vec by state (issue: missing DB metrics).
+    out.push_str(
+        "# HELP stellargate_db_pool_connections Current SQLite connection pool size by state.\n",
+    );
+    out.push_str("# TYPE stellargate_db_pool_connections gauge\n");
+    out.push_str(&format!(
+        "stellargate_db_pool_connections{{state=\"idle\"}} {}\n",
+        db.pool_idle
+    ));
+    out.push_str(&format!(
+        "stellargate_db_pool_connections{{state=\"in_use\"}} {}\n",
+        db.pool_size.saturating_sub(db.pool_idle)
+    ));
+    out.push_str(
+        "# HELP stellargate_db_pool_max_connections Configured maximum SQLite connection pool size.\n",
+    );
+    out.push_str("# TYPE stellargate_db_pool_max_connections gauge\n");
+    out.push_str(&format!(
+        "stellargate_db_pool_max_connections {}\n",
+        db.pool_max
+    ));
+
+    // stellargate_db_file_size_bytes — gauge vec by file. Omitted entirely
+    // (no series) for an in-memory database or a file that hasn't been
+    // created yet, rather than rendered as a misleading zero.
+    out.push_str(
+        "# HELP stellargate_db_file_size_bytes On-disk size of the SQLite database files, in bytes.\n",
+    );
+    out.push_str("# TYPE stellargate_db_file_size_bytes gauge\n");
+    for (file, bytes) in [
+        ("main", db.main_bytes),
+        ("wal", db.wal_bytes),
+        ("shm", db.shm_bytes),
+    ] {
+        if let Some(bytes) = bytes {
+            out.push_str(&format!(
+                "stellargate_db_file_size_bytes{{file=\"{file}\"}} {bytes}\n"
+            ));
+        }
+    }
+
+    // stellargate_missing_trustlines — gauge vec by asset
     out.push_str(
         "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no trustline for an accepted asset (1) or confirmed to have one (0). An asset is absent from this metric until the first successful trustline check evaluates it.\n",
     );
@@ -626,65 +1045,255 @@ pub fn render(
 }
 
 #[cfg(test)]
-mod trustline_metrics_tests {
-    use super::TrustlineMetrics;
+mod tests {
+    use super::*;
+
+    fn empty_db_snapshot() -> DbSnapshot {
+        DbSnapshot {
+            pool_size: 3,
+            pool_idle: 1,
+            pool_max: 10,
+            main_bytes: None,
+            wal_bytes: None,
+            shm_bytes: None,
+        }
+    }
+
+    fn render_all(
+        webhook: &WebhookMetrics,
+        auth: &AuthMetrics,
+        tasks: &crate::TaskHealth,
+        horizon: &HorizonMetrics,
+        http: &HttpMetrics,
+        payments: &PaymentMetrics,
+        db: &DbSnapshot,
+    ) -> String {
+        render(
+            webhook,
+            auth,
+            tasks,
+            horizon,
+            http,
+            payments,
+            db,
+            &TrustlineMetrics::new(),
+        )
+    }
+
+    // ── HttpMetrics ──────────────────────────────────────────────────────
 
     #[test]
-    fn unchecked_asset_is_unknown() {
-        let m = TrustlineMetrics::new();
-        assert_eq!(m.is_missing("USDC"), None);
-        assert_eq!(m.last_success_unix(), 0);
+    fn http_metrics_labels_are_bounded_by_route_not_raw_path() {
+        let http = HttpMetrics::new();
+        http.record("GET", "/v1/payments/:id", 200, 5);
+        http.record("GET", "/v1/payments/:id", 200, 15);
+        http.record("GET", "/v1/payments/:id", 404, 3);
+
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &http,
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+        );
+
+        assert!(
+            rendered.contains(
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"200\"} 2"
+            ),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"404\"} 1"
+            ),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "stellargate_http_request_duration_seconds_count{method=\"GET\",route=\"/v1/payments/:id\"} 3"
+            ),
+            "the latency histogram must aggregate over the same bounded route \
+             label as the counter:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("stellargate_http_request_duration_seconds_sum{method=\"GET\",route=\"/v1/payments/:id\"} 0.023"),
+            "sum must be in seconds, not milliseconds:\n{rendered}"
+        );
     }
 
     #[test]
-    fn a_successful_check_records_present_and_missing() {
-        let m = TrustlineMetrics::new();
-        m.record_check(["USDC", "EURC"], &["USDC".to_string()]);
-        assert_eq!(m.is_missing("USDC"), Some(true));
-        assert_eq!(m.is_missing("EURC"), Some(false));
-        assert!(m.last_success_unix() > 0);
+    fn http_latency_histogram_buckets_are_cumulative() {
+        let http = HttpMetrics::new();
+        http.record("GET", "/health", 200, 3); // falls in every bucket
+        http.record("GET", "/health", 200, 600); // falls in buckets >= 1000ms
+
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &http,
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+        );
+
+        assert!(rendered.contains(
+            "stellargate_http_request_duration_seconds_bucket{method=\"GET\",route=\"/health\",le=\"0.005\"} 1"
+        ));
+        assert!(rendered.contains(
+            "stellargate_http_request_duration_seconds_bucket{method=\"GET\",route=\"/health\",le=\"1\"} 2"
+        ));
+        assert!(rendered.contains(
+            "stellargate_http_request_duration_seconds_bucket{method=\"GET\",route=\"/health\",le=\"+Inf\"} 2"
+        ));
+    }
+
+    // ── PaymentMetrics ───────────────────────────────────────────────────
+
+    #[test]
+    fn payment_metrics_count_by_lifecycle_status() {
+        let payments = PaymentMetrics::new();
+        payments.record_created();
+        payments.record_created();
+        payments.record_settlement("completed", Some(42));
+        payments.record_settlement("underpaid", Some(10));
+        payments.record_expired();
+
+        assert_eq!(payments.created(), 2);
+        assert_eq!(payments.completed(), 1);
+        assert_eq!(payments.underpaid(), 1);
+        assert_eq!(payments.expired(), 1);
+        assert_eq!(payments.settlement_latency_count(), 2);
+        assert_eq!(payments.settlement_latency_sum_secs(), 52);
     }
 
     #[test]
-    fn a_failed_check_does_not_overwrite_prior_state() {
-        let m = TrustlineMetrics::new();
-        m.record_check(["USDC"], &["USDC".to_string()]);
-        let ts = m.last_success_unix();
-        m.record_check_failure();
-        assert_eq!(
-            m.is_missing("USDC"),
-            Some(true),
-            "prior confirmed state survives a Horizon failure"
-        );
-        assert_eq!(
-            m.last_success_unix(),
-            ts,
-            "failure must not bump the success timestamp"
-        );
-        assert_eq!(m.check_failures(), 1);
+    fn payment_settlement_clock_skew_floors_at_zero_rather_than_wrapping() {
+        let payments = PaymentMetrics::new();
+        payments.record_settlement("completed", Some(-5));
+        // A negative latency must not wrap around as a huge u64 via `as u64`.
+        assert_eq!(payments.settlement_latency_sum_secs(), 0);
+        assert_eq!(payments.settlement_latency_count(), 1);
     }
 
     #[test]
-    fn a_later_check_drops_assets_no_longer_checked() {
-        let m = TrustlineMetrics::new();
-        m.record_check(["USDC", "EURC"], &["USDC".to_string()]);
-        m.record_check(["EURC"], &[]);
-        assert_eq!(
-            m.is_missing("USDC"),
-            None,
-            "asset removed from ACCEPTED_ASSETS stops being reported"
+    fn payment_metrics_are_exported_on_render() {
+        let payments = PaymentMetrics::new();
+        payments.record_created();
+        payments.record_settlement("overpaid", Some(90));
+
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &payments,
+            &empty_db_snapshot(),
         );
-        assert_eq!(m.is_missing("EURC"), Some(false));
+
+        assert!(rendered.contains("stellargate_payments_total{status=\"created\"} 1"));
+        assert!(rendered.contains("stellargate_payments_total{status=\"overpaid\"} 1"));
+        assert!(rendered.contains("stellargate_payment_settlement_latency_seconds_count 1"));
+        assert!(rendered.contains("stellargate_payment_settlement_latency_seconds_sum 90"));
+    }
+
+    // ── HorizonMetrics cursor age ────────────────────────────────────────
+
+    #[test]
+    fn horizon_cursor_age_is_a_gauge_not_only_a_log_line() {
+        let horizon = HorizonMetrics::new();
+        assert_eq!(horizon.cursor_age_secs(), 0);
+        horizon.record_cursor_age_secs(37);
+        assert_eq!(horizon.cursor_age_secs(), 37);
+
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &horizon,
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+        );
+        assert!(
+            rendered.contains("# TYPE stellargate_horizon_cursor_age_seconds gauge"),
+            "got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("stellargate_horizon_cursor_age_seconds 37"),
+            "got:\n{rendered}"
+        );
+    }
+
+    // ── DbSnapshot ───────────────────────────────────────────────────────
+
+    #[test]
+    fn db_pool_metrics_are_exported() {
+        let db = DbSnapshot {
+            pool_size: 4,
+            pool_idle: 3,
+            pool_max: 10,
+            main_bytes: None,
+            wal_bytes: None,
+            shm_bytes: None,
+        };
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &db,
+        );
+        assert!(rendered.contains("stellargate_db_pool_connections{state=\"idle\"} 3"));
+        assert!(rendered.contains("stellargate_db_pool_connections{state=\"in_use\"} 1"));
+        assert!(rendered.contains("stellargate_db_pool_max_connections 10"));
     }
 
     #[test]
-    fn snapshot_is_sorted_by_asset_code() {
-        let m = TrustlineMetrics::new();
-        m.record_check(["USDC", "EURC", "AAA"], &["USDC".to_string()]);
-        let codes: Vec<_> = m.snapshot().into_iter().map(|(c, _)| c).collect();
-        assert_eq!(
-            codes,
-            vec!["AAA".to_string(), "EURC".to_string(), "USDC".to_string()]
+    fn db_file_size_series_are_omitted_when_absent() {
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
         );
+        assert!(
+            !rendered.contains("stellargate_db_file_size_bytes{"),
+            "an in-memory database must render no file-size series, not a \
+             misleading zero:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn db_file_size_series_are_rendered_when_present() {
+        let db = DbSnapshot {
+            pool_size: 1,
+            pool_idle: 1,
+            pool_max: 10,
+            main_bytes: Some(4096),
+            wal_bytes: Some(128),
+            shm_bytes: None,
+        };
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &db,
+        );
+        assert!(rendered.contains("stellargate_db_file_size_bytes{file=\"main\"} 4096"));
+        assert!(rendered.contains("stellargate_db_file_size_bytes{file=\"wal\"} 128"));
+        assert!(!rendered.contains("stellargate_db_file_size_bytes{file=\"shm\"}"));
     }
 }

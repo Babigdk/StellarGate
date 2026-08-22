@@ -875,7 +875,7 @@ pub async fn update_webhook_delivery(
     status: &str,
     attempts: i64,
 ) -> Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
@@ -883,6 +883,9 @@ pub async fn update_webhook_delivery(
     .bind(id)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("webhook delivery {id} not found for status update");
+    }
     Ok(())
 }
 
@@ -1198,6 +1201,38 @@ pub async fn ping(pool: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the on-disk path from a `sqlite:` `DATABASE_URL`, for file-size
+/// metrics. Returns `None` for `sqlite::memory:` or anything else with no
+/// backing file to `stat()`.
+fn sqlite_path(database_url: &str) -> Option<&str> {
+    let rest = database_url.strip_prefix("sqlite:")?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let rest = rest.trim_start_matches("//");
+    if rest.is_empty() || rest == ":memory:" {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Sizes, in bytes, of the main database file and its `-wal`/`-shm`
+/// companions, for the `stellargate_db_file_size_bytes` gauge (issue: missing
+/// DB metrics). Each is `None` when the file doesn't exist yet (a `-wal`
+/// before the first write, or any of them for an in-memory database) rather
+/// than an error — a fresh deployment legitimately has no WAL file.
+///
+/// Returns `(main, wal, shm)`.
+pub fn file_sizes(database_url: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let Some(path) = sqlite_path(database_url) else {
+        return (None, None, None);
+    };
+    let stat = |p: String| std::fs::metadata(p).ok().map(|m| m.len());
+    (
+        stat(path.to_string()),
+        stat(format!("{path}-wal")),
+        stat(format!("{path}-shm")),
+    )
+}
+
 /* ---------------------------------------------------------------------------
 Merchant API-key management
 --------------------------------------------------------------------------- */
@@ -1259,20 +1294,20 @@ pub async fn create_merchant(
 Retention
 --------------------------------------------------------------------------- */
 
-/// Rows removed per statement. Deleting in batches keeps each write lock short:
-/// SQLite has a single writer, so one unbounded `DELETE` over a large table
-/// would stall every payment write until it finished.
-pub const PRUNE_BATCH: i64 = 500;
-
 /// Delete one batch of idempotency keys older than `retention_days`.
 ///
 /// A key only has to outlive the window in which a client might retry the
 /// create it guarded. Past that it is dead weight, and the table has no other
 /// bound (issue #110).
 ///
+/// `batch` bounds rows removed per statement — deleting in batches keeps each
+/// write lock short, since SQLite has a single writer and one unbounded
+/// `DELETE` over a large table would stall every payment write until it
+/// finished (configurable via `DB_PRUNE_BATCH_SIZE`, issue #279).
+///
 /// Returns how many rows went; the caller loops until a batch comes back
 /// short.
-pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM idempotency_keys
@@ -1283,7 +1318,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1304,7 +1339,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
 /// Acknowledging or requeueing a delivery clears the exemption, and
 /// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
 /// what a full delivery row costs.
-pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
@@ -1317,7 +1352,7 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1336,7 +1371,11 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
 ///
 /// The `payload <> ''` guard makes this idempotent: a row is compacted once,
 /// not rewritten on every cycle.
-pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn compact_stale_failed_deliveries(
+    pool: &Db,
+    retention_days: i64,
+    batch: i64,
+) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "UPDATE webhook_deliveries
@@ -1351,7 +1390,7 @@ pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> 
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -2034,7 +2073,11 @@ mod tests {
     async fn expire_overdue_drains_large_backlog_across_batches() {
         let pool = memory_db().await;
         let batch = 7;
-        let total = PRUNE_BATCH + 137;
+        // An arbitrary count comfortably larger than a single batch — this
+        // test exercises the expiry sweeper's own EXPIRY_BATCH_SIZE, not the
+        // retention pruner's batch size, so no relationship to the latter is
+        // implied by this number.
+        let total = 500 + 137;
         for i in 0..total {
             create_payment(
                 &pool,
@@ -2381,5 +2424,43 @@ mod tests {
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
+    }
+
+    // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────
+
+    #[test]
+    fn file_sizes_is_none_for_in_memory_database() {
+        let (main, wal, shm) = file_sizes("sqlite::memory:");
+        assert_eq!((main, wal, shm), (None, None, None));
+    }
+
+    #[test]
+    fn file_sizes_reports_the_main_file_and_absent_wal_shm() {
+        let contents = b"pretend sqlite header bytes";
+        let path =
+            std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+
+        let url = format!("sqlite:{}", path.display());
+        let (main, wal, shm) = file_sizes(&url);
+        assert_eq!(
+            main,
+            Some(contents.len() as u64),
+            "main file size must be reported"
+        );
+        assert_eq!(wal, None, "no -wal file exists yet");
+        assert_eq!(shm, None, "no -shm file exists yet");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_sizes_strips_query_parameters_before_stat() {
+        // The shared-memory DSN other tests in this module use
+        // (`sqlite:file:<uuid>?mode=memory&cache=shared`) has no on-disk
+        // file, but must not panic or attempt to stat a path still carrying
+        // its `?mode=...` query string.
+        let (main, wal, shm) = file_sizes(&shared_memory_dsn());
+        assert_eq!((main, wal, shm), (None, None, None));
     }
 }

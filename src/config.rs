@@ -364,6 +364,58 @@ pub struct Config {
     /// as [`Self::max_payment_amount`]. Unset means no bound beyond
     /// `parse_stroops` already rejecting non-positive amounts.
     pub min_payment_amount: AmountLimit,
+    /// Reject request bodies larger than this many bytes before they reach a
+    /// handler. Defaults to 256 KiB, generous for the current API; an
+    /// operator who wants a tighter DoS ceiling can lower it without a
+    /// rebuild (issue #279).
+    pub max_body_bytes: usize,
+    /// Maximum number of distinct IP+bucket rate-limiter keys tracked at
+    /// once, across both the IP limiter and the per-merchant limiter. Once
+    /// reached, the least-recently-used entry is evicted, bounding resident
+    /// memory regardless of key cardinality. Behind a proxy fronting many
+    /// client IPs the default of 10,000 can evict constantly, losing limiter
+    /// state; behind a single proxy IP it is mostly wasted slots — both are
+    /// deployment-shaped, not a design invariant (issue #279).
+    pub rate_limiter_max_keys: u64,
+    /// How long (seconds) a per-key rate limiter is retained after its last
+    /// access before being reclaimed. Defaults to 60.
+    pub rate_limiter_idle_ttl_secs: u64,
+    /// Default page size for offset- and cursor-paginated list endpoints
+    /// (`GET /payments`, `/webhook_deliveries`, …) when the caller does not
+    /// pass `limit`. Defaults to 20.
+    pub pagination_default_limit: i64,
+    /// Upper bound `limit` is clamped to on those same endpoints, regardless
+    /// of what the caller requests. Defaults to 100.
+    pub pagination_max_limit: i64,
+    /// How long (seconds) shutdown waits for background tasks (poller,
+    /// sweeper, redrive, retention, trustline checker, stream) to drain
+    /// before forcing exit. Defaults to 30.
+    ///
+    /// Must exceed the orchestrator's own termination grace period to be
+    /// meaningful: Kubernetes' `terminationGracePeriodSeconds` defaults to
+    /// 30s too, so with both left at their defaults the orchestrator can
+    /// SIGKILL the process at the same instant this budget expires, cutting a
+    /// still-draining task off mid-work rather than letting it finish.
+    /// Docker Compose's `stop_grace_period` defaults lower, to 10s, so it
+    /// undercuts this value even sooner unless raised to match. See
+    /// "Shutdown grace" in
+    /// DEPLOYMENT.md.
+    pub shutdown_grace_secs: u64,
+    /// How many payment records to request per Horizon page, both while
+    /// catching up and during steady-state polling. Directly controls how
+    /// long an uninterruptible poll cycle runs. Defaults to 200.
+    pub horizon_page_limit: u32,
+    /// Rows removed (or compacted) per retention `DELETE`/`UPDATE`
+    /// statement. Deleting in batches keeps each write lock short — SQLite
+    /// has a single writer, so one unbounded statement over a large table
+    /// would stall payment writes until it finished. Defaults to 500.
+    pub db_prune_batch_size: i64,
+    /// Upper bound on rows removed per table per retention cycle. Without
+    /// this, the first run against a large backlog would delete
+    /// indefinitely, monopolising the single writer; whatever is left is
+    /// picked up next cycle, so a backlog drains over several passes instead
+    /// of one long stall. Defaults to 50,000.
+    pub retention_max_rows_per_cycle: u64,
 }
 
 impl Config {
@@ -495,6 +547,15 @@ impl Config {
                 &std::env::var("MIN_PAYMENT_AMOUNT").unwrap_or_default(),
                 "MIN_PAYMENT_AMOUNT",
             )?,
+            max_body_bytes: parse_env("MAX_BODY_BYTES", 256 * 1024)?,
+            rate_limiter_max_keys: parse_env("RATE_LIMITER_MAX_KEYS", 10_000)?,
+            rate_limiter_idle_ttl_secs: parse_env("RATE_LIMITER_IDLE_TTL_SECS", 60)?,
+            pagination_default_limit: parse_env("PAGINATION_DEFAULT_LIMIT", 20)?,
+            pagination_max_limit: parse_env("PAGINATION_MAX_LIMIT", 100)?,
+            shutdown_grace_secs: parse_env("SHUTDOWN_GRACE_SECS", 30)?,
+            horizon_page_limit: parse_env("HORIZON_PAGE_LIMIT", 200)?,
+            db_prune_batch_size: parse_env("DB_PRUNE_BATCH_SIZE", 500)?,
+            retention_max_rows_per_cycle: parse_env("RETENTION_MAX_ROWS_PER_CYCLE", 50_000)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
@@ -585,67 +646,80 @@ impl Config {
         Ok(())
     }
 
-    /// Cross-validate limit fields (floors and upper bounds) to catch
-    /// nonsensical or dangerous configuration values that would cause runtime
-    /// hangs, lock failures, or silent issues:
-    ///
-    /// - `PORT == 0` → binds an ephemeral port, leaving the listening address unpredictable
-    /// - `DB_POOL_MAX_CONNECTIONS == 0` → migrate() blocks indefinitely waiting for a connection that cannot exist
-    /// - `DB_POOL_MAX_CONNECTIONS > 1000` → excessive connection pool size consumes file descriptors and increases SQLite lock contention
-    /// - `DB_BUSY_TIMEOUT_MS == 0` → immediate SQLITE_BUSY failure under concurrent writes
-    /// - `DB_BUSY_TIMEOUT_MS > 3_600_000` → excessive lock wait (> 1 hour)
-    /// - `WEBHOOK_REDRIVE_CONCURRENCY == 0` → redrive worker cannot process failed webhooks
-    /// - `WEBHOOK_REDRIVE_CONCURRENCY > 1000` → excessive redrive concurrency overwhelms target endpoints
-    /// - `RATE_LIMIT_REQUESTS_PER_SEC == 0` → blocks all incoming API requests with 429
+    /// Validate the deployment-tunable limits promoted from compile-time
+    /// constants (issue #279): each must be a value the code that consumes it
+    /// can actually act on, so a misconfiguration aborts boot with a clear
+    /// message instead of silently degenerating into a no-op or a tight loop.
     fn validate_limits(&self) -> Result<()> {
-        if self.port == 0 {
+        if self.max_body_bytes == 0 {
             return Err(anyhow::anyhow!(
-                "PORT must be > 0 (got 0). A zero port binds an ephemeral port, leaving the listening address unpredictable."
+                "MAX_BODY_BYTES must be > 0 (got 0). \
+                 A zero limit would reject every request body outright."
             ));
         }
 
-        if self.db_pool_max_connections == 0 {
+        if self.rate_limiter_max_keys == 0 {
             return Err(anyhow::anyhow!(
-                "DB_POOL_MAX_CONNECTIONS must be > 0 (got 0). A zero-sized pool means no connection can ever be acquired and the process will hang at startup."
+                "RATE_LIMITER_MAX_KEYS must be > 0 (got 0). \
+                 A zero capacity would evict every rate-limiter entry immediately, \
+                 making the limit ineffective."
             ));
         }
 
-        if self.db_pool_max_connections > 1000 {
+        if self.rate_limiter_idle_ttl_secs == 0 {
             return Err(anyhow::anyhow!(
-                "DB_POOL_MAX_CONNECTIONS must be <= 1000 (got {}). Excessive connection pool size consumes file descriptors and increases SQLite lock contention.",
-                self.db_pool_max_connections
+                "RATE_LIMITER_IDLE_TTL_SECS must be > 0 (got 0). \
+                 A zero TTL would evict a rate-limiter entry before the next \
+                 request could ever reuse it."
             ));
         }
 
-        if self.db_busy_timeout_ms == 0 {
+        if self.pagination_default_limit <= 0 {
             return Err(anyhow::anyhow!(
-                "DB_BUSY_TIMEOUT_MS must be > 0 (got 0). Zero turns every SQLite write contention into an immediate SQLITE_BUSY error under load."
+                "PAGINATION_DEFAULT_LIMIT must be > 0 (got {}). \
+                 A zero or negative default page size would return nothing.",
+                self.pagination_default_limit
             ));
         }
 
-        if self.db_busy_timeout_ms > 3_600_000 {
+        if self.pagination_max_limit < self.pagination_default_limit {
             return Err(anyhow::anyhow!(
-                "DB_BUSY_TIMEOUT_MS must be <= 3600000 (got {}). An excessively high busy timeout blocks requests for too long during lock contention.",
-                self.db_busy_timeout_ms
+                "PAGINATION_MAX_LIMIT ({}) must be >= PAGINATION_DEFAULT_LIMIT ({}). \
+                 With the current settings the default page size would already \
+                 exceed the ceiling it is clamped to.",
+                self.pagination_max_limit,
+                self.pagination_default_limit
             ));
         }
 
-        if self.webhook_redrive_concurrency == 0 {
+        if self.shutdown_grace_secs == 0 {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_CONCURRENCY must be > 0 (got 0). A zero concurrency prevents the redrive worker from dispatching webhooks."
+                "SHUTDOWN_GRACE_SECS must be > 0 (got 0). \
+                 A zero grace period would force-exit before any background \
+                 task got a chance to drain."
             ));
         }
 
-        if self.webhook_redrive_concurrency > 1000 {
+        if self.horizon_page_limit == 0 {
             return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_CONCURRENCY must be <= 1000 (got {}). Excessive redrive concurrency can exhaust network resources and overwhelm target endpoints.",
-                self.webhook_redrive_concurrency
+                "HORIZON_PAGE_LIMIT must be > 0 (got 0). \
+                 A zero page size would make the Horizon poller request nothing \
+                 on every page, forever."
             ));
         }
 
-        if self.rate_limit_requests_per_sec == 0 {
+        if self.db_prune_batch_size <= 0 {
             return Err(anyhow::anyhow!(
-                "RATE_LIMIT_REQUESTS_PER_SEC must be > 0 (got 0). A zero rate limit would block all incoming API requests with 429 Too Many Requests."
+                "DB_PRUNE_BATCH_SIZE must be > 0 (got {}). \
+                 A zero or negative batch would make retention pruning a no-op.",
+                self.db_prune_batch_size
+            ));
+        }
+
+        if self.retention_max_rows_per_cycle == 0 {
+            return Err(anyhow::anyhow!(
+                "RETENTION_MAX_ROWS_PER_CYCLE must be > 0 (got 0). \
+                 A zero per-cycle cap would make retention pruning a no-op."
             ));
         }
 
@@ -664,6 +738,9 @@ impl Config {
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
+    /// - `RATE_LIMIT_REQUESTS_PER_SEC == 0` → silently clamped up to 1 req/sec
+    ///   by `RateLimitState::new`, the most aggressive limit available, rather
+    ///   than disabling the limiter as an operator setting `0` likely intends
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
@@ -768,6 +845,15 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
+            ));
+        }
+
+        if self.rate_limit_requests_per_sec == 0 {
+            return Err(anyhow::anyhow!(
+                "RATE_LIMIT_REQUESTS_PER_SEC must be > 0 (got 0). \
+                 `RateLimitState::new` used to silently clamp a zero configured rate up to \
+                 1 request/sec — the single most aggressive limit the system can apply, not \
+                 the disabled limiter an operator setting 0 most likely intended."
             ));
         }
 
@@ -932,6 +1018,21 @@ impl std::fmt::Debug for Config {
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("max_payment_amount", &self.max_payment_amount)
             .field("min_payment_amount", &self.min_payment_amount)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field("rate_limiter_max_keys", &self.rate_limiter_max_keys)
+            .field(
+                "rate_limiter_idle_ttl_secs",
+                &self.rate_limiter_idle_ttl_secs,
+            )
+            .field("pagination_default_limit", &self.pagination_default_limit)
+            .field("pagination_max_limit", &self.pagination_max_limit)
+            .field("shutdown_grace_secs", &self.shutdown_grace_secs)
+            .field("horizon_page_limit", &self.horizon_page_limit)
+            .field("db_prune_batch_size", &self.db_prune_batch_size)
+            .field(
+                "retention_max_rows_per_cycle",
+                &self.retention_max_rows_per_cycle,
+            )
             .finish()
     }
 }
@@ -1030,6 +1131,15 @@ mod tests {
             trusted_proxy_cidrs: vec![],
             max_payment_amount: AmountLimit::default(),
             min_payment_amount: AmountLimit::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -1114,6 +1224,15 @@ mod tests {
             trusted_proxy_cidrs: vec![],
             max_payment_amount: AmountLimit::default(),
             min_payment_amount: AmountLimit::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -1740,6 +1859,19 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_zero_rate_limit_requests_per_sec() {
+        let mut cfg = timing_config();
+        cfg.rate_limit_requests_per_sec = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("RATE_LIMIT_REQUESTS_PER_SEC"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_allows_default_rate_limit_requests_per_sec() {
+        assert!(timing_config().validate_timing().is_ok());
+    }
+
+    #[test]
     fn startup_fails_on_ttl_shorter_than_poll_interval_via_env() {
         run_with_env(
             &[
@@ -1930,134 +2062,155 @@ mod tests {
         );
     }
 
-    // ── validate_limits ──────────────────────────────────────────────────────
+    // ── Deployment-tunable limits (issue #279) ────────────────────────────────
+    //
+    // MAX_BODY_BYTES, RATE_LIMITER_MAX_KEYS, RATE_LIMITER_IDLE_TTL_SECS,
+    // PAGINATION_DEFAULT_LIMIT, PAGINATION_MAX_LIMIT, SHUTDOWN_GRACE_SECS,
+    // HORIZON_PAGE_LIMIT, DB_PRUNE_BATCH_SIZE, RETENTION_MAX_ROWS_PER_CYCLE.
 
-    fn limits_config() -> Config {
-        sample_config()
+    #[test]
+    fn limits_default_from_sample_config_pass() {
+        assert!(sample_config().validate_limits().is_ok());
     }
 
     #[test]
-    fn limits_valid_defaults_pass() {
-        assert!(limits_config().validate_limits().is_ok());
-    }
-
-    #[test]
-    fn limits_rejects_zero_port() {
-        let mut cfg = limits_config();
-        cfg.port = 0;
+    fn limits_rejects_zero_max_body_bytes() {
+        let mut cfg = sample_config();
+        cfg.max_body_bytes = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("PORT"), "got: {err}");
+        assert!(err.contains("MAX_BODY_BYTES"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_zero_db_pool_max_connections() {
-        let mut cfg = limits_config();
-        cfg.db_pool_max_connections = 0;
+    fn limits_rejects_zero_rate_limiter_max_keys() {
+        let mut cfg = sample_config();
+        cfg.rate_limiter_max_keys = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
-        assert!(err.contains("hang"), "got: {err}");
+        assert!(err.contains("RATE_LIMITER_MAX_KEYS"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_absurd_db_pool_max_connections() {
-        let mut cfg = limits_config();
-        cfg.db_pool_max_connections = 1001;
+    fn limits_rejects_zero_rate_limiter_idle_ttl() {
+        let mut cfg = sample_config();
+        cfg.rate_limiter_idle_ttl_secs = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
+        assert!(err.contains("RATE_LIMITER_IDLE_TTL_SECS"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_zero_db_busy_timeout_ms() {
-        let mut cfg = limits_config();
-        cfg.db_busy_timeout_ms = 0;
+    fn limits_rejects_zero_pagination_default_limit() {
+        let mut cfg = sample_config();
+        cfg.pagination_default_limit = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_absurd_db_busy_timeout_ms() {
-        let mut cfg = limits_config();
-        cfg.db_busy_timeout_ms = 3_600_001;
+    fn limits_rejects_pagination_max_below_default() {
+        let mut cfg = sample_config();
+        cfg.pagination_default_limit = 50;
+        cfg.pagination_max_limit = 10;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
+        assert!(err.contains("PAGINATION_MAX_LIMIT"), "got: {err}");
+        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_zero_webhook_redrive_concurrency() {
-        let mut cfg = limits_config();
-        cfg.webhook_redrive_concurrency = 0;
+    fn limits_allows_pagination_max_equal_to_default() {
+        let mut cfg = sample_config();
+        cfg.pagination_default_limit = 20;
+        cfg.pagination_max_limit = 20;
+        assert!(cfg.validate_limits().is_ok());
+    }
+
+    #[test]
+    fn limits_rejects_zero_shutdown_grace() {
+        let mut cfg = sample_config();
+        cfg.shutdown_grace_secs = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
+        assert!(err.contains("SHUTDOWN_GRACE_SECS"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_absurd_webhook_redrive_concurrency() {
-        let mut cfg = limits_config();
-        cfg.webhook_redrive_concurrency = 1001;
+    fn limits_rejects_zero_horizon_page_limit() {
+        let mut cfg = sample_config();
+        cfg.horizon_page_limit = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
+        assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
     }
 
     #[test]
-    fn limits_rejects_zero_rate_limit_requests_per_sec() {
-        let mut cfg = limits_config();
-        cfg.rate_limit_requests_per_sec = 0;
+    fn limits_rejects_zero_db_prune_batch_size() {
+        let mut cfg = sample_config();
+        cfg.db_prune_batch_size = 0;
         let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMIT_REQUESTS_PER_SEC"), "got: {err}");
+        assert!(err.contains("DB_PRUNE_BATCH_SIZE"), "got: {err}");
     }
 
     #[test]
-    fn startup_fails_on_zero_db_pool_max_connections_via_env() {
+    fn limits_rejects_zero_retention_max_rows_per_cycle() {
+        let mut cfg = sample_config();
+        cfg.retention_max_rows_per_cycle = 0;
+        let err = cfg.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("RETENTION_MAX_ROWS_PER_CYCLE"), "got: {err}");
+    }
+
+    #[test]
+    fn limits_parse_from_env_and_override_defaults() {
         run_with_env(
             &[
                 ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("DB_POOL_MAX_CONNECTIONS", Some("0")),
+                ("MAX_BODY_BYTES", Some("1024")),
+                ("RATE_LIMITER_MAX_KEYS", Some("500")),
+                ("RATE_LIMITER_IDLE_TTL_SECS", Some("120")),
+                ("PAGINATION_DEFAULT_LIMIT", Some("5")),
+                ("PAGINATION_MAX_LIMIT", Some("50")),
+                ("SHUTDOWN_GRACE_SECS", Some("45")),
+                ("HORIZON_PAGE_LIMIT", Some("100")),
+                ("DB_PRUNE_BATCH_SIZE", Some("250")),
+                ("RETENTION_MAX_ROWS_PER_CYCLE", Some("1000")),
             ],
             || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("DB_POOL_MAX_CONNECTIONS"), "got: {err}");
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(cfg.max_body_bytes, 1024);
+                assert_eq!(cfg.rate_limiter_max_keys, 500);
+                assert_eq!(cfg.rate_limiter_idle_ttl_secs, 120);
+                assert_eq!(cfg.pagination_default_limit, 5);
+                assert_eq!(cfg.pagination_max_limit, 50);
+                assert_eq!(cfg.shutdown_grace_secs, 45);
+                assert_eq!(cfg.horizon_page_limit, 100);
+                assert_eq!(cfg.db_prune_batch_size, 250);
+                assert_eq!(cfg.retention_max_rows_per_cycle, 1000);
             },
         );
     }
 
     #[test]
-    fn startup_fails_on_zero_db_busy_timeout_via_env() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("DB_BUSY_TIMEOUT_MS", Some("0")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("DB_BUSY_TIMEOUT_MS"), "got: {err}");
-            },
-        );
+    fn limits_default_to_the_previous_compile_time_constants() {
+        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.max_body_bytes, 256 * 1024);
+            assert_eq!(cfg.rate_limiter_max_keys, 10_000);
+            assert_eq!(cfg.rate_limiter_idle_ttl_secs, 60);
+            assert_eq!(cfg.pagination_default_limit, 20);
+            assert_eq!(cfg.pagination_max_limit, 100);
+            assert_eq!(cfg.shutdown_grace_secs, 30);
+            assert_eq!(cfg.horizon_page_limit, 200);
+            assert_eq!(cfg.db_prune_batch_size, 500);
+            assert_eq!(cfg.retention_max_rows_per_cycle, 50_000);
+        });
     }
 
     #[test]
-    fn startup_fails_on_zero_webhook_redrive_concurrency_via_env() {
+    fn limits_invalid_env_value_aborts_boot() {
         run_with_env(
             &[
                 ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("WEBHOOK_REDRIVE_CONCURRENCY", Some("0")),
+                ("HORIZON_PAGE_LIMIT", Some("not-a-number")),
             ],
             || {
                 let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("WEBHOOK_REDRIVE_CONCURRENCY"), "got: {err}");
-            },
-        );
-    }
-
-    #[test]
-    fn startup_fails_on_zero_port_via_env() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("PORT", Some("0")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("PORT"), "got: {err}");
+                assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
             },
         );
     }
