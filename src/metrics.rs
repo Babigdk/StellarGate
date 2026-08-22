@@ -665,6 +665,7 @@ pub fn render(
     http: &HttpMetrics,
     payments: &PaymentMetrics,
     db: &DbSnapshot,
+    trustlines: &TrustlineMetrics,
 ) -> String {
     let mut out = String::with_capacity(2048);
 
@@ -1010,6 +1011,36 @@ pub fn render(
         }
     }
 
+    // stellargate_missing_trustlines — gauge vec by asset
+    out.push_str(
+        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no trustline for an accepted asset (1) or confirmed to have one (0). An asset is absent from this metric until the first successful trustline check evaluates it.\n",
+    );
+    out.push_str("# TYPE stellargate_missing_trustlines gauge\n");
+    for (asset, missing) in trustlines.snapshot() {
+        out.push_str(&format!(
+            "stellargate_missing_trustlines{{asset=\"{asset}\"}} {}\n",
+            if missing { 1 } else { 0 }
+        ));
+    }
+
+    out.push_str(
+        "# HELP stellargate_trustline_check_failures_total Total trustline checks that could not reach Horizon or got a non-2xx response. Does not affect stellargate_missing_trustlines, which only reflects confirmed answers.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_check_failures_total counter\n");
+    out.push_str(&format!(
+        "stellargate_trustline_check_failures_total {}\n",
+        trustlines.check_failures()
+    ));
+
+    out.push_str(
+        "# HELP stellargate_trustline_check_last_success_timestamp_seconds Unix timestamp of the last trustline check that got a confirmed answer from Horizon. 0 means never — treat stellargate_missing_trustlines as unknown, not confirmed, until this is nonzero.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_check_last_success_timestamp_seconds gauge\n");
+    out.push_str(&format!(
+        "stellargate_trustline_check_last_success_timestamp_seconds {}\n",
+        trustlines.last_success_unix()
+    ));
+
     out
 }
 
@@ -1037,7 +1068,16 @@ mod tests {
         payments: &PaymentMetrics,
         db: &DbSnapshot,
     ) -> String {
-        render(webhook, auth, tasks, horizon, http, payments, db)
+        render(
+            webhook,
+            auth,
+            tasks,
+            horizon,
+            http,
+            payments,
+            db,
+            &TrustlineMetrics::new(),
+        )
     }
 
     // ── HttpMetrics ──────────────────────────────────────────────────────
