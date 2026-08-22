@@ -665,6 +665,7 @@ it was choosing the tenant and was not.
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
+| `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
 | `merchant_not_found` | `404` | No merchant with that id |
 | `key_not_found` | `404` | No active key with that id for this merchant |
@@ -904,7 +905,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | Param | Description | Default |
 |---|---|---|
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
-| `limit` | Page size, 1–100 | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
@@ -983,7 +984,7 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | Query param | Description | Default |
 |---|---|---|
 | `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
-| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 
 `next_cursor` is `null` on the final page. To page through the history, start with a
@@ -1030,7 +1031,7 @@ look.
 | Query | Default | Notes |
 |---|---|---|
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
-| `limit` | `20` | 1–100 |
+| `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
 
 ```bash

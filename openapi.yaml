@@ -481,6 +481,11 @@ paths:
                   value:
                     error: "offset exceeds maximum of 10000; use cursor pagination instead (see the `cursor` parameter and `next_cursor` in the response)"
                     code: invalid_offset
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -588,11 +593,17 @@ paths:
               schema:
                 $ref: "#/components/schemas/ListMerchantWebhookDeliveriesResponse"
         "400":
-          description: Invalid `status` or `cursor`
+          description: Invalid `status`, `cursor`, or `limit`
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
 
   /payments/webhooks/redeliver:
     post:
@@ -678,6 +689,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -1188,8 +1210,8 @@ components:
             values currently include unauthorized, internal_error,
             invalid_request, unknown_field, unsupported_asset, invalid_amount,
             amount_out_of_range, invalid_webhook_url, invalid_status,
-            invalid_cursor, payment_not_found, delivery_not_found,
-            rate_limit_exceeded, not_found, webhook_target_blocked,
+            invalid_cursor, invalid_limit, payment_not_found,
+            delivery_not_found, rate_limit_exceeded, not_found, webhook_target_blocked,
             webhook_delivery_failed, idempotency_conflict, merchant_not_found,
             invalid_label, last_active_key, trustline_missing, and
             key_not_found.
