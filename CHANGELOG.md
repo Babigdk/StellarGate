@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Log rotation and resource limits on both compose stacks.** Neither
+  `docker-compose.yml` nor `deploy/docker-compose.prod.yml` capped container
+  memory or CPU, and the quickstart file had no log rotation at all — an
+  unbounded `json-file` log driver grows until the disk holding
+  `stellargate_data` fills up, which stops SQLite writes and, with them,
+  payment processing. Both files now set `logging.options` (10 MB × 5) and
+  `deploy.resources.limits`/`reservations` sized against the baseline Oracle
+  Always Free shape (1 OCPU / 6 GB); the quickstart file also gained the
+  `stop_grace_period: 35s` that `deploy/docker-compose.prod.yml` already had.
+  Sizing rationale is in a new "Resource limits" section of DEPLOYMENT.md.
 - **Deployment-tunable limits that were compile-time constants.** Request
   body size, rate-limiter capacity/TTL, list-endpoint pagination bounds,
   shutdown grace period, the Horizon poller's page size, and the retention
