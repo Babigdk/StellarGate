@@ -3546,3 +3546,44 @@ async fn test_both_mounts_share_the_same_data() {
     via_v1.assert_status_ok();
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
 }
+
+/// Concurrent payment creation should succeed without 500 errors, even under
+/// high concurrency where memo collisions might occur. The retry logic in
+/// generate_unique_memo ensures that UNIQUE constraint violations on memo
+/// trigger a retry with a fresh memo (issue #273).
+#[tokio::test]
+async fn test_concurrent_payment_creation_handles_memo_collisions() {
+    let server = Arc::new(test_server().await);
+    let key = provision_merchant(&server).await;
+
+    // Spawn 50 concurrent payment creation requests
+    let mut tasks = Vec::new();
+    for i in 0..50 {
+        let server = Arc::clone(&server);
+        let key = key.clone();
+        let task = tokio::spawn(async move {
+            server
+                .post("/payments")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({ "amount": format!("{}.5", i), "asset": "XLM" }))
+                .await
+        });
+        tasks.push(task);
+    }
+
+    // Wait for all concurrent requests to complete
+    let mut memos = Vec::new();
+    for task in tasks {
+        let response = task.await.unwrap();
+        // Verify no 500 errors (the original bug would cause 500s on memo collisions)
+        response.assert_status(StatusCode::CREATED);
+        let body = response.json::<Value>();
+        let memo = body["memo"].as_str().unwrap().to_string();
+        memos.push(memo);
+    }
+
+    // Verify all memos are unique (no collisions actually occurred, or if they
+    // did, retries resolved them with fresh memos)
+    let unique_count = memos.iter().collect::<std::collections::HashSet<_>>().len();
+    assert_eq!(unique_count, 50, "all payment memos must be unique");
+}
