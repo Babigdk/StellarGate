@@ -563,6 +563,24 @@ const MAX_OFFSET: i64 = 10_000;
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
 
+/// Validates a caller-supplied `limit` against `(1..=max)`, rather than
+/// silently clamping it. Clamping absorbs three distinct bad inputs — too
+/// large, zero, negative — into a `200` that gives the caller no signal
+/// anything was wrong; a client paginating past `max` would read the
+/// silently-shortened page as "end of results" and stop early (issue #258).
+/// Matches the existing `invalid_status`/`invalid_cursor` convention: reject
+/// rather than coerce.
+fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
+    match limit {
+        None => Ok(default),
+        Some(n) if (1..=max).contains(&n) => Ok(n),
+        Some(n) => Err(AppError::bad_request(
+            "invalid_limit",
+            format!("limit must be between 1 and {max} (got {n})"),
+        )),
+    }
+}
+
 /// Statuses a webhook delivery can hold: `pending` while attempts are still
 /// possible, `delivered` on success, `failed` when the attempt budget is
 /// exhausted. Nothing writes any other value, so a filter on anything else is
@@ -587,10 +605,11 @@ pub async fn list(
         }
     }
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
@@ -810,10 +829,11 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match q.cursor.as_deref() {
         Some(raw_cursor) => {
@@ -895,10 +915,11 @@ pub async fn list_merchant_webhooks(
         ));
     }
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match &q.cursor {
         Some(raw) => Some(

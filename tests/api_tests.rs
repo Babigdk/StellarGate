@@ -2351,10 +2351,11 @@ async fn test_list_webhooks_status_filter() {
     assert_eq!(res.json::<Value>()["code"], "invalid_status");
 }
 
-/// Regression for #326: an undecodable `cursor` is rejected with a 400, and
-/// `limit` is clamped into the acknowledged range.
+/// Regression for #326 (cursor) and #258 (limit): an undecodable `cursor` is
+/// rejected with a 400, and an out-of-range `limit` is rejected rather than
+/// silently clamped.
 #[tokio::test]
-async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
+async fn test_list_webhooks_invalid_cursor_and_limit_out_of_range() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
     let auth = format!("Bearer {key}");
@@ -2375,13 +2376,15 @@ async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
 
-    // Above MAX_LIMIT is clamped down to 100, not an error.
+    // Above MAX_LIMIT is now rejected rather than silently clamped down to
+    // 100 (issue #258) — a paginating client trusting the echoed limit would
+    // otherwise read the short page as "end of results" and stop early.
     let res = server
         .get(&format!("/payments/{id}/webhooks?limit=5000"))
         .add_header("Authorization", auth)
         .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["limit"], 100);
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_limit");
 }
 
 #[tokio::test]
