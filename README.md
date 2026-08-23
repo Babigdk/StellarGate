@@ -567,6 +567,11 @@ GET  /v1/payments/:id
 POST /v1/merchants
 ```
 
+The bundled dashboard uses this same canonical prefix through one shared API
+base, so all of its authenticated requests track the current API version.
+Operational requests such as `/` and `/ready` remain unversioned as described
+below.
+
 Unversioned paths (`/payments`, `/merchants`) still work and serve the same
 data, so nothing breaks today. They respond with headers pointing at their
 replacement:

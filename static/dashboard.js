@@ -13,6 +13,7 @@
 (function () {
   "use strict";
 
+  var API_BASE = "/v1";
   var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
 
@@ -97,7 +98,7 @@
     var headers = { Accept: "application/json" };
     if (state.key) headers.Authorization = "Bearer " + state.key;
 
-    return fetch(path, { method: opts.method || "GET", headers: headers }).then(
+    return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers }).then(
       function (res) {
         if (res.status === 401) {
           signOut("That API key was rejected. Please sign in again.");
