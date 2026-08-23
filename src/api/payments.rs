@@ -871,6 +871,7 @@ pub async fn list_webhooks(
             "event": d.event(),
             "status": d.status,
             "attempts": d.attempts,
+            "manual_attempts": d.manual_attempts,
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
@@ -1032,6 +1033,7 @@ fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
         "event": d.event(),
         "status": d.status,
         "attempts": d.attempts,
+        "manual_attempts": d.manual_attempts,
         "last_attempt": d.last_attempt,
         "acknowledged_at": d.acknowledged_at,
         "created_at": d.created_at,
@@ -1118,8 +1120,11 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
-        .await?;
+    /* Manual redelivery must not share the automatic redrive budget or refresh
+    `last_attempt` — otherwise a merchant clicking "resend" can exhaust
+    `WEBHOOK_REDRIVE_MAX_ATTEMPTS` and permanently disable background recovery
+    (issue #235). */
+    db::record_manual_redelivery(&state.pool, &delivery_id, new_status).await?;
 
     /* A burst of redeliveries previously had no attributable origin in the
     logs at all (issue #305). Logged regardless of outcome — `outcome` here

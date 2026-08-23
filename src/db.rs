@@ -134,6 +134,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
+            manual_attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
             acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -174,6 +175,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN acknowledged_at TEXT")
             .execute(pool)
             .await?;
+    }
+
+    /* Manual redeliveries must not share the automatic redrive budget (issue
+    #235). `manual_attempts` is incremented by POST .../redeliver; the redrive
+    worker only looks at `attempts`. */
+    let has_manual_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_manual_attempts == 0 {
+        sqlx::query(
+            "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
     }
 
     /* Durable key/value state — used by the Horizon poller to persist its
@@ -895,6 +912,28 @@ pub async fn update_webhook_delivery(
     Ok(())
 }
 
+/// Record a merchant-initiated redelivery outcome.
+///
+/// Updates `status` and increments `manual_attempts` only. Leaves `attempts`
+/// and `last_attempt` untouched so the automatic redrive budget and backoff
+/// schedule are unaffected (issue #235).
+pub async fn record_manual_redelivery(pool: &Db, id: &str, status: &str) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE webhook_deliveries
+            SET status = ?,
+                manual_attempts = manual_attempts + 1
+          WHERE id = ?",
+    )
+    .bind(status)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("webhook delivery {id} not found for manual redelivery");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct WebhookDelivery {
     pub id: String,
@@ -906,6 +945,9 @@ pub struct WebhookDelivery {
     pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
+    /// Merchant-initiated redeliveries. Ignored by the redrive worker's budget
+    /// (issue #235); exposed on listing so operators can tell the two apart.
+    pub manual_attempts: i64,
     pub last_attempt: Option<String>,
     /// When somebody acted on this delivery — requeued it, or explicitly
     /// acknowledged it. `None` means nobody has looked at it yet, which is
@@ -944,6 +986,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
+        manual_attempts: row.get("manual_attempts"),
         last_attempt: row.get("last_attempt"),
         acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
@@ -953,7 +996,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// Columns every delivery read selects, in the order `row_to_webhook_delivery`
 /// expects. Kept in one place so adding a column cannot leave one query behind.
 const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status, attempts, \
-                                last_attempt, acknowledged_at, created_at";
+                                manual_attempts, last_attempt, acknowledged_at, created_at";
 
 /// Deliveries eligible for the background redrive worker: not yet delivered,
 /// under the attempt cap, and idle long enough that no in-flight `dispatch()`
@@ -1137,7 +1180,7 @@ pub async fn list_deliveries_for_merchant(
 ) -> Result<Vec<WebhookDelivery>> {
     let mut sql = String::from(
         "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
-                d.last_attempt, d.acknowledged_at, d.created_at
+                d.manual_attempts, d.last_attempt, d.acknowledged_at, d.created_at
            FROM webhook_deliveries d
            JOIN payments p ON p.id = d.payment_id
           WHERE p.merchant_id = ? AND d.status = ?",

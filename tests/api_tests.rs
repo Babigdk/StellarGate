@@ -2524,6 +2524,78 @@ async fn test_redeliver_echoes_the_original_event_type() {
     );
 }
 
+/// Manual redeliveries must not share the automatic redrive budget (issue #235).
+#[tokio::test]
+async fn test_manual_redeliver_does_not_consume_automatic_attempts() {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(3)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-manual",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-manual", "failed", 2)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        let res = server
+            .post(&format!(
+                "/payments/{id}/webhooks/delivery-manual/redeliver"
+            ))
+            .add_header("Authorization", auth.clone())
+            .await;
+        // Endpoint returns 502 when the target rejects — that is fine; we care
+        // about the counters, not the HTTP success of the merchant call.
+        assert!(
+            res.status_code().as_u16() == 502 || res.status_code().is_success(),
+            "unexpected status {}",
+            res.status_code()
+        );
+    }
+
+    let listed = server
+        .get(&format!("/payments/{id}/webhooks"))
+        .add_header("Authorization", auth)
+        .await
+        .json::<Value>();
+    let d = &listed["deliveries"][0];
+    assert_eq!(
+        d["attempts"], 2,
+        "automatic attempts must stay put; got {listed}"
+    );
+    assert_eq!(
+        d["manual_attempts"], 3,
+        "manual_attempts must count each click; got {listed}"
+    );
+}
+
 /// Deliveries written before `event_type` existed have a NULL column, so the
 /// event has to come from the stored payload rather than a hard-coded default.
 #[tokio::test]
