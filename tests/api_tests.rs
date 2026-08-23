@@ -10,10 +10,10 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use tracing_test::traced_test;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use tracing_test::traced_test;
 
 /// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
 /// every connection the pool opens talks to the SAME database. A bare
