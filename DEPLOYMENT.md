@@ -251,9 +251,49 @@ outcomes, retries, delivery latency, and auth success/failure.
 no reason to serve the sign-in page to the whole internet. Restrict it in the
 `Caddyfile` by source IP, or put it behind basic auth, if only your team uses it.
 
-**Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app).
-Uncapped container logs filling the boot volume is a slow and surprising way to
-take a service down.
+**Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app,
+10 MB × 3 for Caddy). Uncapped container logs filling the boot volume is a
+slow and surprising way to take a service down — the same disk holds
+`stellargate_data`, so a full disk stops SQLite writes and, with them,
+payment processing.
+
+**Resource limits.** Both containers in `deploy/docker-compose.prod.yml` set
+`deploy.resources.limits` and `reservations` (Compose's non-Swarm CLI honors
+these directly; no `docker stack deploy` needed):
+
+| Service | CPU limit | Memory limit | Memory reservation |
+|---|---|---|---|
+| `app` | 1.5 | 1 GB | 256 MB |
+| `caddy` | 0.5 | 256 MB | 64 MB |
+
+Sizing assumptions:
+
+- The baseline shape from [Provision the VM](#provision-the-vm) is 1 OCPU /
+  6 GB (Ampere Altra — a full core, not a fractional vCPU). `app`'s 1.5 CPU
+  limit and 1 GB memory limit leave room for a Horizon catch-up poll cycle to
+  burst without starving Caddy or the host OS, while still being well under
+  the 6 GB total on the recommended shape.
+- `caddy` only terminates TLS and proxies to one backend; 0.5 CPU / 256 MB is
+  generous headroom for that job, not a measured ceiling.
+- The 256 MB / 64 MB memory **reservations** are soft guarantees, not caps —
+  they keep the host scheduler from starving either container under memory
+  pressure, without preventing either from using more, up to its limit, when
+  the host has room.
+- Without a memory limit, a leak or an unusually large Horizon backlog in
+  either container competes for the whole host's memory, and the Linux OOM
+  killer's choice of victim is not guaranteed to be the process that caused
+  the pressure — it can just as easily kill `caddy`, taking down the only
+  thing the internet can reach while the real problem continues in `app`.
+- If you deploy on the smaller `VM.Standard.E2.1.Micro` shape (1 vCPU / 1 GB)
+  mentioned above, lower these limits accordingly — the defaults here assume
+  the recommended Ampere shape and will not both fit comfortably on 1 GB of
+  total host memory alongside the OS.
+
+The root `docker-compose.yml` (the local quickstart) sets the same
+`stop_grace_period` and log rotation, plus a generous `2.0` CPU / `1G`
+memory limit — a laptop guardrail against a runaway container, not a tuned
+production ceiling. Rely on `deploy/docker-compose.prod.yml`'s numbers above
+for actual capacity planning.
 
 **Shutdown grace.** On `SIGTERM`, StellarGate stops accepting new requests and
 waits up to `SHUTDOWN_GRACE_SECS` (default 30) for the poller, sweeper,

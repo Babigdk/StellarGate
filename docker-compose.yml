@@ -11,6 +11,27 @@ services:
     volumes:
       - stellargate_data:/data
     restart: unless-stopped
+    # Compose's own default (10s) is shorter than the app's own
+    # SHUTDOWN_GRACE_SECS drain budget (default 30s) — see "Shutdown grace"
+    # in DEPLOYMENT.md.
+    stop_grace_period: 35s
+    # Local/dev guardrails, not a tuned production ceiling — see "Resource
+    # limits" in DEPLOYMENT.md. deploy/docker-compose.prod.yml has the
+    # sizing that actually matters.
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        # Without a cap, container logs will eventually fill the disk — a
+        # slow, surprising way to take the gateway down.
+        max-size: "10m"
+        max-file: "5"
     healthcheck:
       # /health is exempt from the per-IP rate limiter (see DEPLOYMENT.md), so
       # a traffic spike can never turn this into a 429 and restart the container.
