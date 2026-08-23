@@ -1244,7 +1244,8 @@ components:
           description: >-
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
-            invalid_request, unknown_field, unsupported_asset, invalid_amount,
+            invalid_request, unknown_field, unsupported_media_type,
+            payload_too_large, unsupported_asset, invalid_amount,
             amount_out_of_range, invalid_webhook_url, invalid_status,
             invalid_cursor, payment_not_found, delivery_not_found,
             rate_limit_exceeded, not_found, method_not_allowed,

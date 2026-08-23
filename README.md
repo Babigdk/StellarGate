@@ -665,6 +665,7 @@ it was choosing the tenant and was not.
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
+| `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
