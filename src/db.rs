@@ -118,6 +118,12 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
+         WHERE status IN ('pending', 'underpaid')",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -2143,6 +2149,74 @@ mod tests {
         );
         let swept = get_payment(&pool, "swept").await.unwrap().unwrap();
         assert_eq!(swept.status, "expired");
+    }
+
+    /// Verify that the partial composite index for watchable-status queries exists
+    /// (issue #270). This test confirms the index was created successfully during
+    /// database migration and is available for query optimization.
+    #[tokio::test]
+    async fn partial_composite_index_created_for_watchable_queries() {
+        let pool = memory_db().await;
+
+        // Verify the partial composite index exists in sqlite_master
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_payments_status_expires_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "idx_payments_status_expires_at index must exist in the database"
+        );
+
+        // Verify the index is on the payments table
+        let index_table: String = sqlx::query_scalar(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_payments_status_expires_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_table, "payments",
+            "idx_payments_status_expires_at must be on the payments table"
+        );
+
+        // Create a test payment to verify the index can be used
+        create_payment(&pool, new_payment("test-idx", "MEMOIDX", 3600))
+            .await
+            .unwrap();
+
+        // Verify list_pending successfully retrieves the payment
+        let pending = list_pending(&pool).await.unwrap();
+        assert!(
+            pending.iter().any(|p| p.id == "test-idx"),
+            "list_pending should find the test payment"
+        );
+
+        // Verify expire_overdue works correctly
+        create_payment(&pool, new_payment("test-expire", "MEMOEXP", -10))
+            .await
+            .unwrap();
+
+        let expired = expire_overdue(&pool, 10).await.unwrap();
+        assert!(
+            expired.iter().any(|p| p.id == "test-expire"),
+            "expire_overdue should find and transition the overdue payment"
+        );
+
+        // Verify find_pending_by_memo works correctly
+        let found = find_pending_by_memo(&pool, "MEMOIDX").await.unwrap();
+        assert!(
+            found.is_some(),
+            "find_pending_by_memo should find the pending payment"
+        );
     }
 
     #[tokio::test]
