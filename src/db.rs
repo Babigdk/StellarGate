@@ -2212,9 +2212,7 @@ mod tests {
         );
 
         // Verify find_pending_by_memo works correctly
-        let found = find_pending_by_memo(&pool, "MEMOIDX")
-            .await
-            .unwrap();
+        let found = find_pending_by_memo(&pool, "MEMOIDX").await.unwrap();
         assert!(
             found.is_some(),
             "find_pending_by_memo should find the pending payment"
