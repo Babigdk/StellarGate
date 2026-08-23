@@ -977,8 +977,9 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
-fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    let path = req.uri().path();
+pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
+    let raw_path = req.uri().path();
+    let path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
     if path == "/health" || path == "/ready" || path == "/metrics" {
         return None;
     }
@@ -1002,7 +1003,7 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
 ///
 /// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
 /// higher allowance (× 5) so normal API consumers aren't throttled by polling.
-fn bucket_rate_multiplier(bucket: &str) -> u32 {
+pub fn bucket_rate_multiplier(bucket: &str) -> u32 {
     match bucket {
         "payments" | "merchants" | "redeliver" => 1,
         _ => 5,
@@ -1709,5 +1710,46 @@ mod tests {
             rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
             Some("default")
         );
+    }
+
+    #[test]
+    fn test_rate_limit_bucket_assignment_all_routes() {
+        use axum::http::Method;
+        let cases = [
+            (Method::POST, "/payments", Some("payments")),
+            (Method::POST, "/v1/payments", Some("payments")),
+            (Method::POST, "/merchants", Some("merchants")),
+            (Method::POST, "/v1/merchants", Some("merchants")),
+            (
+                Method::POST,
+                "/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (
+                Method::POST,
+                "/v1/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (Method::GET, "/health", None),
+            (Method::GET, "/v1/health", None),
+        ];
+
+        for (method, path, expected_bucket) in cases {
+            let req = method_req(method.clone(), path);
+            assert_eq!(
+                rate_limited_bucket(&req),
+                expected_bucket,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_rate_multiplier() {
+        assert_eq!(bucket_rate_multiplier("payments"), 1);
+        assert_eq!(bucket_rate_multiplier("merchants"), 1);
+        assert_eq!(bucket_rate_multiplier("redeliver"), 1);
+        assert_eq!(bucket_rate_multiplier("default"), 5);
+        assert_eq!(bucket_rate_multiplier("unknown"), 5);
     }
 }
