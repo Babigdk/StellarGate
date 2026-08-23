@@ -837,13 +837,6 @@ pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE memo = ?")
-        .bind(memo)
-        .fetch_one(pool)
-        .await?;
-    Ok(count > 0)
-}
 
 /// Record an outbound webhook delivery. `event_type` is the event name the
 /// payload carries (e.g. `payment.underpaid`); it is persisted so a later
