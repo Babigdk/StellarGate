@@ -1203,7 +1203,7 @@ components:
 
     WebhookDelivery:
       type: object
-      required: [id, url, event, status, attempts, created_at]
+      required: [id, url, event, status, attempts, manual_attempts, created_at]
       properties:
         id:
           type: string
@@ -1222,6 +1222,15 @@ components:
           enum: [pending, delivered, failed]
         attempts:
           type: integer
+          description: >-
+            Automatic delivery attempts (inline dispatch + background redrive).
+            Capped by WEBHOOK_REDRIVE_MAX_ATTEMPTS.
+        manual_attempts:
+          type: integer
+          description: >-
+            Merchant-initiated redeliveries via POST .../redeliver. Does not
+            consume the automatic redrive budget and does not refresh
+            last_attempt / backoff.
         last_attempt:
           type: string
           format: date-time

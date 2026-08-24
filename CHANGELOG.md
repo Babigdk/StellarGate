@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Manual webhook redelivery no longer consumes the automatic redrive
+  budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
+  increment the same `attempts` counter the background redrive worker
+  compares against `WEBHOOK_REDRIVE_MAX_ATTEMPTS`, and refreshed
+  `last_attempt` on every click — so a merchant recovering a delivery could
+  permanently disable automatic retries for it (issue #235). Manual
+  redeliveries now bump a separate `manual_attempts` column and leave
+  `attempts` / `last_attempt` alone; listings expose both counts.
+
 ### Added
 
 - **Log rotation and resource limits on both compose stacks.** Neither
