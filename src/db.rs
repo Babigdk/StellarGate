@@ -118,6 +118,12 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     )
     .execute(pool)
     .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
+         WHERE status IN ('pending', 'underpaid')",
+    )
+    .execute(pool)
+    .await?;
 
     sqlx::query(&format!(
         "CREATE TABLE IF NOT EXISTS webhook_deliveries (
@@ -128,6 +134,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
+            manual_attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '{TS_PATTERN}'),
             acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '{TS_PATTERN}'),
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
@@ -170,6 +177,22 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
+    /* Manual redeliveries must not share the automatic redrive budget (issue
+    #235). `manual_attempts` is incremented by POST .../redeliver; the redrive
+    worker only looks at `attempts`. */
+    let has_manual_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'manual_attempts'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_manual_attempts == 0 {
+        sqlx::query(
+            "ALTER TABLE webhook_deliveries ADD COLUMN manual_attempts INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(pool)
+        .await?;
+    }
+
     /* Durable key/value state — used by the Horizon poller to persist its
     paging cursor so it resumes exactly where it left off across restarts. */
     sqlx::query(&format!(
@@ -196,6 +219,20 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     ))
     .execute(pool)
     .await?;
+
+    /* Per-merchant rate-limit override (issue: rate limiter keyed on IP, not
+    identity). NULL means "use the configured default"; a merchant only gets
+    a row value once an operator sets one explicitly. */
+    let has_rate_limit_per_sec: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('merchants') WHERE name = 'rate_limit_per_sec'",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_rate_limit_per_sec == 0 {
+        sqlx::query("ALTER TABLE merchants ADD COLUMN rate_limit_per_sec INTEGER")
+            .execute(pool)
+            .await?;
+    }
 
     /* API keys, one row per credential rather than one per merchant, so a key
     can be rotated (issue a second, revoke the first) and revoked individually
@@ -823,14 +860,6 @@ pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn memo_exists(pool: &Db, memo: &str) -> Result<bool> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE memo = ?")
-        .bind(memo)
-        .fetch_one(pool)
-        .await?;
-    Ok(count > 0)
-}
-
 /// Record an outbound webhook delivery. `event_type` is the event name the
 /// payload carries (e.g. `payment.underpaid`); it is persisted so a later
 /// redelivery can reproduce the original `X-StellarGate-Event` header.
@@ -861,7 +890,7 @@ pub async fn update_webhook_delivery(
     status: &str,
     attempts: i64,
 ) -> Result<()> {
-    sqlx::query(
+    let result = sqlx::query(
         "UPDATE webhook_deliveries SET status = ?, attempts = ?, last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
     )
     .bind(status)
@@ -869,6 +898,31 @@ pub async fn update_webhook_delivery(
     .bind(id)
     .execute(pool)
     .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("webhook delivery {id} not found for status update");
+    }
+    Ok(())
+}
+
+/// Record a merchant-initiated redelivery outcome.
+///
+/// Updates `status` and increments `manual_attempts` only. Leaves `attempts`
+/// and `last_attempt` untouched so the automatic redrive budget and backoff
+/// schedule are unaffected (issue #235).
+pub async fn record_manual_redelivery(pool: &Db, id: &str, status: &str) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE webhook_deliveries
+            SET status = ?,
+                manual_attempts = manual_attempts + 1
+          WHERE id = ?",
+    )
+    .bind(status)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        anyhow::bail!("webhook delivery {id} not found for manual redelivery");
+    }
     Ok(())
 }
 
@@ -883,6 +937,9 @@ pub struct WebhookDelivery {
     pub event_type: Option<String>,
     pub status: String,
     pub attempts: i64,
+    /// Merchant-initiated redeliveries. Ignored by the redrive worker's budget
+    /// (issue #235); exposed on listing so operators can tell the two apart.
+    pub manual_attempts: i64,
     pub last_attempt: Option<String>,
     /// When somebody acted on this delivery — requeued it, or explicitly
     /// acknowledged it. `None` means nobody has looked at it yet, which is
@@ -921,6 +978,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
         event_type: row.get("event_type"),
         status: row.get("status"),
         attempts: row.get("attempts"),
+        manual_attempts: row.get("manual_attempts"),
         last_attempt: row.get("last_attempt"),
         acknowledged_at: row.get("acknowledged_at"),
         created_at: normalize_ts(&row.get::<String, _>("created_at")),
@@ -930,7 +988,7 @@ fn row_to_webhook_delivery(row: &sqlx::sqlite::SqliteRow) -> WebhookDelivery {
 /// Columns every delivery read selects, in the order `row_to_webhook_delivery`
 /// expects. Kept in one place so adding a column cannot leave one query behind.
 const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status, attempts, \
-                                last_attempt, acknowledged_at, created_at";
+                                manual_attempts, last_attempt, acknowledged_at, created_at";
 
 /// Deliveries eligible for the background redrive worker: not yet delivered,
 /// under the attempt cap, and idle long enough that no in-flight `dispatch()`
@@ -1114,7 +1172,7 @@ pub async fn list_deliveries_for_merchant(
 ) -> Result<Vec<WebhookDelivery>> {
     let mut sql = String::from(
         "SELECT d.id, d.payment_id, d.url, d.payload, d.event_type, d.status, d.attempts, \
-                d.last_attempt, d.acknowledged_at, d.created_at
+                d.manual_attempts, d.last_attempt, d.acknowledged_at, d.created_at
            FROM webhook_deliveries d
            JOIN payments p ON p.id = d.payment_id
           WHERE p.merchant_id = ? AND d.status = ?",
@@ -1184,6 +1242,38 @@ pub async fn ping(pool: &Db) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the on-disk path from a `sqlite:` `DATABASE_URL`, for file-size
+/// metrics. Returns `None` for `sqlite::memory:` or anything else with no
+/// backing file to `stat()`.
+fn sqlite_path(database_url: &str) -> Option<&str> {
+    let rest = database_url.strip_prefix("sqlite:")?;
+    let rest = rest.split('?').next().unwrap_or(rest);
+    let rest = rest.trim_start_matches("//");
+    if rest.is_empty() || rest == ":memory:" {
+        return None;
+    }
+    Some(rest)
+}
+
+/// Sizes, in bytes, of the main database file and its `-wal`/`-shm`
+/// companions, for the `stellargate_db_file_size_bytes` gauge (issue: missing
+/// DB metrics). Each is `None` when the file doesn't exist yet (a `-wal`
+/// before the first write, or any of them for an in-memory database) rather
+/// than an error — a fresh deployment legitimately has no WAL file.
+///
+/// Returns `(main, wal, shm)`.
+pub fn file_sizes(database_url: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let Some(path) = sqlite_path(database_url) else {
+        return (None, None, None);
+    };
+    let stat = |p: String| std::fs::metadata(p).ok().map(|m| m.len());
+    (
+        stat(path.to_string()),
+        stat(format!("{path}-wal")),
+        stat(format!("{path}-shm")),
+    )
+}
+
 /* ---------------------------------------------------------------------------
 Merchant API-key management
 --------------------------------------------------------------------------- */
@@ -1205,12 +1295,23 @@ fn hash_api_key(raw: &str) -> String {
 /// constraint on databases created before `api_keys` existed. Nothing reads it
 /// any more — authentication goes through `api_keys` so that rotation and
 /// revocation work — and it is not maintained as keys change.
-pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -> Result<String> {
+///
+/// `rate_limit_per_sec` is an optional per-merchant override for the
+/// authenticated rate limiter; `None` leaves the merchant on the configured
+/// default quota.
+pub async fn create_merchant(
+    pool: &Db,
+    id: &str,
+    raw_key: &str,
+    prefix: &str,
+    rate_limit_per_sec: Option<i64>,
+) -> Result<String> {
     let mut tx = pool.begin().await?;
 
-    sqlx::query("INSERT INTO merchants (id, api_key_hash) VALUES (?, ?)")
+    sqlx::query("INSERT INTO merchants (id, api_key_hash, rate_limit_per_sec) VALUES (?, ?, ?)")
         .bind(id)
         .bind(hash_api_key(raw_key))
+        .bind(rate_limit_per_sec)
         .execute(&mut *tx)
         .await?;
 
@@ -1234,20 +1335,20 @@ pub async fn create_merchant(pool: &Db, id: &str, raw_key: &str, prefix: &str) -
 Retention
 --------------------------------------------------------------------------- */
 
-/// Rows removed per statement. Deleting in batches keeps each write lock short:
-/// SQLite has a single writer, so one unbounded `DELETE` over a large table
-/// would stall every payment write until it finished.
-pub const PRUNE_BATCH: i64 = 500;
-
 /// Delete one batch of idempotency keys older than `retention_days`.
 ///
 /// A key only has to outlive the window in which a client might retry the
 /// create it guarded. Past that it is dead weight, and the table has no other
 /// bound (issue #110).
 ///
+/// `batch` bounds rows removed per statement — deleting in batches keeps each
+/// write lock short, since SQLite has a single writer and one unbounded
+/// `DELETE` over a large table would stall every payment write until it
+/// finished (configurable via `DB_PRUNE_BATCH_SIZE`, issue #279).
+///
 /// Returns how many rows went; the caller loops until a batch comes back
 /// short.
-pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM idempotency_keys
@@ -1258,7 +1359,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1279,7 +1380,7 @@ pub async fn prune_idempotency_keys(pool: &Db, retention_days: i64) -> Result<u6
 /// Acknowledging or requeueing a delivery clears the exemption, and
 /// [`compact_stale_failed_deliveries`] keeps the retained rows from costing
 /// what a full delivery row costs.
-pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64, batch: i64) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "DELETE FROM webhook_deliveries
@@ -1292,7 +1393,7 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1311,7 +1412,11 @@ pub async fn prune_webhook_deliveries(pool: &Db, retention_days: i64) -> Result<
 ///
 /// The `payload <> ''` guard makes this idempotent: a row is compacted once,
 /// not rewritten on every cycle.
-pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> Result<u64> {
+pub async fn compact_stale_failed_deliveries(
+    pool: &Db,
+    retention_days: i64,
+    batch: i64,
+) -> Result<u64> {
     let cutoff = format!("-{retention_days} days");
     let n = sqlx::query(
         "UPDATE webhook_deliveries
@@ -1326,7 +1431,7 @@ pub async fn compact_stale_failed_deliveries(pool: &Db, retention_days: i64) -> 
           )",
     )
     .bind(&cutoff)
-    .bind(PRUNE_BATCH)
+    .bind(batch)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1491,6 +1596,36 @@ pub async fn count_active_api_keys(pool: &Db, merchant_id: &str) -> Result<i64> 
     Ok(n)
 }
 
+/// The merchant's per-second rate-limit override, if an operator has set one.
+/// `Ok(None)` covers both "merchant has no override" and "merchant does not
+/// exist" — callers that need to distinguish those should check
+/// [`merchant_exists`] first.
+pub async fn get_merchant_rate_limit(pool: &Db, merchant_id: &str) -> Result<Option<i64>> {
+    let value: Option<Option<i64>> = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT rate_limit_per_sec FROM merchants WHERE id = ?",
+    )
+    .bind(merchant_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(value.flatten())
+}
+
+/// Set (or clear, with `None`) a merchant's rate-limit override. Returns
+/// `false` if the merchant does not exist.
+pub async fn set_merchant_rate_limit(
+    pool: &Db,
+    merchant_id: &str,
+    rate_limit_per_sec: Option<i64>,
+) -> Result<bool> {
+    let affected = sqlx::query("UPDATE merchants SET rate_limit_per_sec = ? WHERE id = ?")
+        .bind(rate_limit_per_sec)
+        .bind(merchant_id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(affected > 0)
+}
+
 /// Whether a merchant exists, so key endpoints can 404 rather than silently
 /// operating on nothing.
 pub async fn merchant_exists(pool: &Db, merchant_id: &str) -> Result<bool> {
@@ -1580,6 +1715,61 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].prefix, "legacy");
         assert!(keys[0].revoked_at.is_none());
+
+        // The pre-upgrade schema had no rate_limit_per_sec column at all;
+        // migrating must add it and leave existing merchants on the default.
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "legacy-merchant")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A merchant's rate-limit override round-trips: unset by default,
+    /// settable, and clearable back to `None` (the "use the default" state).
+    #[tokio::test]
+    async fn merchant_rate_limit_override_round_trips() {
+        let pool = memory_db().await;
+        let (raw, prefix) = generate_api_key();
+        create_merchant(&pool, "m1", &raw, &prefix, None)
+            .await
+            .unwrap();
+
+        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
+
+        assert!(set_merchant_rate_limit(&pool, "m1", Some(50))
+            .await
+            .unwrap());
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "m1").await.unwrap(),
+            Some(50)
+        );
+
+        assert!(set_merchant_rate_limit(&pool, "m1", None).await.unwrap());
+        assert_eq!(get_merchant_rate_limit(&pool, "m1").await.unwrap(), None);
+
+        // A merchant that doesn't exist reports "nothing updated".
+        assert!(
+            !set_merchant_rate_limit(&pool, "no-such-merchant", Some(10))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A merchant provisioned with an override has it set from creation.
+    #[tokio::test]
+    async fn create_merchant_persists_initial_rate_limit_override() {
+        let pool = memory_db().await;
+        let (raw, prefix) = generate_api_key();
+        create_merchant(&pool, "m2", &raw, &prefix, Some(25))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            get_merchant_rate_limit(&pool, "m2").await.unwrap(),
+            Some(25)
+        );
     }
 
     /// Revoking a key must take effect immediately for authentication.
@@ -1587,7 +1777,9 @@ mod tests {
     async fn revoked_keys_stop_authenticating() {
         let pool = memory_db().await;
         let (raw, prefix) = generate_api_key();
-        let key_id = create_merchant(&pool, "m1", &raw, &prefix).await.unwrap();
+        let key_id = create_merchant(&pool, "m1", &raw, &prefix, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             find_merchant_by_key(&pool, &raw).await.unwrap(),
@@ -1922,7 +2114,11 @@ mod tests {
     async fn expire_overdue_drains_large_backlog_across_batches() {
         let pool = memory_db().await;
         let batch = 7;
-        let total = PRUNE_BATCH + 137;
+        // An arbitrary count comfortably larger than a single batch — this
+        // test exercises the expiry sweeper's own EXPIRY_BATCH_SIZE, not the
+        // retention pruner's batch size, so no relationship to the latter is
+        // implied by this number.
+        let total = 500 + 137;
         for i in 0..total {
             create_payment(
                 &pool,
@@ -1988,6 +2184,74 @@ mod tests {
         );
         let swept = get_payment(&pool, "swept").await.unwrap().unwrap();
         assert_eq!(swept.status, "expired");
+    }
+
+    /// Verify that the partial composite index for watchable-status queries exists
+    /// (issue #270). This test confirms the index was created successfully during
+    /// database migration and is available for query optimization.
+    #[tokio::test]
+    async fn partial_composite_index_created_for_watchable_queries() {
+        let pool = memory_db().await;
+
+        // Verify the partial composite index exists in sqlite_master
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_payments_status_expires_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "idx_payments_status_expires_at index must exist in the database"
+        );
+
+        // Verify the index is on the payments table
+        let index_table: String = sqlx::query_scalar(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_payments_status_expires_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_table, "payments",
+            "idx_payments_status_expires_at must be on the payments table"
+        );
+
+        // Create a test payment to verify the index can be used
+        create_payment(&pool, new_payment("test-idx", "MEMOIDX", 3600))
+            .await
+            .unwrap();
+
+        // Verify list_pending successfully retrieves the payment
+        let pending = list_pending(&pool).await.unwrap();
+        assert!(
+            pending.iter().any(|p| p.id == "test-idx"),
+            "list_pending should find the test payment"
+        );
+
+        // Verify expire_overdue works correctly
+        create_payment(&pool, new_payment("test-expire", "MEMOEXP", -10))
+            .await
+            .unwrap();
+
+        let expired = expire_overdue(&pool, 10).await.unwrap();
+        assert!(
+            expired.iter().any(|p| p.id == "test-expire"),
+            "expire_overdue should find and transition the overdue payment"
+        );
+
+        // Verify find_pending_by_memo works correctly
+        let found = find_pending_by_memo(&pool, "MEMOIDX").await.unwrap();
+        assert!(
+            found.is_some(),
+            "find_pending_by_memo should find the pending payment"
+        );
     }
 
     #[tokio::test]
@@ -2269,5 +2533,43 @@ mod tests {
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
+    }
+
+    // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────
+
+    #[test]
+    fn file_sizes_is_none_for_in_memory_database() {
+        let (main, wal, shm) = file_sizes("sqlite::memory:");
+        assert_eq!((main, wal, shm), (None, None, None));
+    }
+
+    #[test]
+    fn file_sizes_reports_the_main_file_and_absent_wal_shm() {
+        let contents = b"pretend sqlite header bytes";
+        let path =
+            std::env::temp_dir().join(format!("stellargate-metrics-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, contents).unwrap();
+
+        let url = format!("sqlite:{}", path.display());
+        let (main, wal, shm) = file_sizes(&url);
+        assert_eq!(
+            main,
+            Some(contents.len() as u64),
+            "main file size must be reported"
+        );
+        assert_eq!(wal, None, "no -wal file exists yet");
+        assert_eq!(shm, None, "no -shm file exists yet");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn file_sizes_strips_query_parameters_before_stat() {
+        // The shared-memory DSN other tests in this module use
+        // (`sqlite:file:<uuid>?mode=memory&cache=shared`) has no on-disk
+        // file, but must not panic or attempt to stat a path still carrying
+        // its `?mode=...` query string.
+        let (main, wal, shm) = file_sizes(&shared_memory_dsn());
+        assert_eq!((main, wal, shm), (None, None, None));
     }
 }

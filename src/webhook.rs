@@ -20,6 +20,7 @@
 //! small tolerance window. See the README "Verifying webhooks" section for the
 //! verification recipe and recommended window.
 
+use crate::config::WebhookPayloadDetail;
 use crate::supervise::TaskExit;
 use crate::{db, AppState};
 // `KeyInit` provides `new_from_slice`; it moved off `Mac` in hmac 0.13.
@@ -29,7 +30,7 @@ use sha2::Sha256;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -67,41 +68,66 @@ pub(crate) fn current_timestamp() -> i64 {
 ///
 /// `delta` carries the absolute difference between the requested and received
 /// amounts, and is included in the payload for `payment.overpaid` (excess to
-/// refund) and `payment.underpaid` (shortfall still owed) events.
+/// refund) and `payment.underpaid` (shortfall still owed) events — but only
+/// under [`WebhookPayloadDetail::Full`]; see below.
 ///
 /// Amounts are canonicalized to ensure consistent serialization: "10.00", "10.0",
 /// and "10" all serialize as "10". This handles both new payments (already
 /// canonicalized on write) and any legacy data.
-pub fn build_payload(payment: &db::Payment, event: &str, delta: Option<&str>) -> serde_json::Value {
-    // Canonicalize the requested amount
-    let canonical_amount = crate::money::parse_stroops(&payment.amount)
-        .map(crate::money::stroops_to_string)
-        .unwrap_or_else(|| payment.amount.clone());
-
-    // Canonicalize the received amount
-    let canonical_paid_amount = payment
-        .paid_amount
-        .as_ref()
-        .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
-
-    // Canonicalize delta if present (it's a price difference)
-    let canonical_delta =
-        delta.and_then(|d| crate::money::parse_stroops(d).map(crate::money::stroops_to_string));
-
+///
+/// `detail` controls how much the body carries (issue #306):
+///
+/// - [`WebhookPayloadDetail::Minimal`] (the default): `event`, `payment_id`,
+///   `status`, and `updated_at`. Enough to know *that* something happened and
+///   to look it up; a receiver that needs the rest already has an API key and
+///   can call `GET /v1/payments/:id`.
+/// - [`WebhookPayloadDetail::Full`]: the above, plus `merchant_id`, `amount`,
+///   `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, and (when present)
+///   `delta`.
+///
+/// `merchant_id` and the amounts are the fields withheld by default:
+/// `merchant_id` is a tenant identifier the receiver already knows (it's
+/// *their* id), so it adds nothing for a legitimate recipient while making an
+/// intercepted payload immediately attributable, and the same reasoning
+/// applies to transaction size. HMAC signing proves the payload is authentic;
+/// it says nothing about who else could read it in transit.
+pub fn build_payload(
+    payment: &db::Payment,
+    event: &str,
+    delta: Option<&str>,
+    detail: WebhookPayloadDetail,
+) -> serde_json::Value {
     let mut payload = json!({
         "event": event,
         "payment_id": payment.id,
-        "merchant_id": payment.merchant_id,
-        "tx_hash": payment.tx_hash,
-        "amount": canonical_amount,
-        "paid_amount": canonical_paid_amount,
-        "asset": payment.asset,
-        "asset_issuer": payment.asset_issuer,
         "status": payment.status,
+        "updated_at": payment.updated_at,
     });
-    if let Some(d) = canonical_delta {
-        payload["delta"] = json!(d);
+
+    if detail == WebhookPayloadDetail::Full {
+        // Canonicalize amounts to ensure consistent serialization: "10.00",
+        // "10.0", and "10" all serialize as "10".
+        let canonical_amount = crate::money::parse_stroops(&payment.amount)
+            .map(crate::money::stroops_to_string)
+            .unwrap_or_else(|| payment.amount.clone());
+        let canonical_paid_amount = payment
+            .paid_amount
+            .as_ref()
+            .and_then(|pa| crate::money::parse_stroops(pa).map(crate::money::stroops_to_string));
+        let canonical_delta =
+            delta.and_then(|d| crate::money::parse_stroops(d).map(crate::money::stroops_to_string));
+
+        payload["merchant_id"] = json!(payment.merchant_id);
+        payload["tx_hash"] = json!(payment.tx_hash);
+        payload["amount"] = json!(canonical_amount);
+        payload["paid_amount"] = json!(canonical_paid_amount);
+        payload["asset"] = json!(payment.asset);
+        payload["asset_issuer"] = json!(payment.asset_issuer);
+        if let Some(d) = canonical_delta {
+            payload["delta"] = json!(d);
+        }
     }
+
     payload
 }
 
@@ -123,7 +149,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         return;
     };
 
-    let payload = build_payload(payment, event, delta);
+    let payload = build_payload(payment, event, delta, state.config.webhook_payload_detail);
     let body = match serde_json::to_vec(&payload) {
         Ok(b) => b,
         Err(e) => {
@@ -145,7 +171,18 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     )
     .await
     {
-        warn!(error = %e, "failed to record webhook delivery");
+        /* A durable delivery row is a precondition for the send. Continuing
+        after a save failure POSTs a signed event with no audit row, no
+        redrive path, and silent no-op updates (issue #234). Settlement is
+        already committed, so skipping the send is recoverable — but only if
+        the failure is visible. */
+        error!(
+            payment_id = %payment.id,
+            error = %e,
+            "could not record webhook delivery; not sending"
+        );
+        state.webhook_metrics.record_failed();
+        return;
     }
 
     let client = match safe_client(state, &url).await {
@@ -158,7 +195,13 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
             `stellargate_webhook_deliveries_total{outcome="failed"}` and to any
             alert built on it (issues #319, #233). */
             state.webhook_metrics.record_failed();
-            let _ = db::update_webhook_delivery(&state.pool, &delivery_id, "failed", 0).await;
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery_id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };
@@ -258,6 +301,21 @@ pub fn retry_delay(attempt: u32, base: Duration, max: Duration) -> Duration {
     Duration::from_millis(half + rand::random_range(0..=(ceiling_ms - half)))
 }
 
+/// The `attempts` value to record for a delivery the SSRF guard blocked.
+///
+/// `list_redrivable_deliveries` selects rows where `status IN ('pending',
+/// 'failed') AND attempts < max_attempts` — so `status = "failed"` alone does
+/// not remove a row from consideration; only `attempts` reaching the redrive
+/// cap does. A blocked delivery makes no network attempt, so there is no
+/// natural attempt count to record, but leaving it at its prior value (often
+/// `0`) left `attempts < max_attempts` permanently true: the redrive worker
+/// would pick the same blocked delivery back up on every subsequent pass —
+/// forever, and double-counting the terminal-failure metric each time it did.
+/// Recording the cap itself is what actually makes the row terminal.
+fn blocked_delivery_attempts(state: &AppState) -> i64 {
+    state.config.webhook_redrive_max_attempts as i64
+}
+
 /// Resolve and SSRF-check `url`, returning a client pinned to the validated
 /// address. The client is built with the configured `WEBHOOK_TIMEOUT_SECS`
 /// timeout so that each delivery attempt is independently bounded. Honors
@@ -341,9 +399,13 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
             warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
             // Terminal, so counted — same gap as the inline path above.
             state.webhook_metrics.record_failed();
-            let _ =
-                db::update_webhook_delivery(&state.pool, &delivery.id, "failed", delivery.attempts)
-                    .await;
+            let _ = db::update_webhook_delivery(
+                &state.pool,
+                &delivery.id,
+                "failed",
+                blocked_delivery_attempts(state),
+            )
+            .await;
             return;
         }
     };
@@ -588,7 +650,7 @@ mod tests {
             "payment.underpaid",
             "payment.expired",
         ] {
-            let payload = build_payload(&payment, event, None);
+            let payload = build_payload(&payment, event, None, WebhookPayloadDetail::Full);
             assert_eq!(
                 payload["event"].as_str(),
                 Some(*event),
@@ -605,5 +667,92 @@ mod tests {
                 "serialised body must contain the event string (event={event})"
             );
         }
+    }
+
+    // ── Payload minimisation (issue #306) ────────────────────────────────────
+
+    fn sample_payment() -> db::Payment {
+        db::Payment {
+            id: "pay_1".into(),
+            merchant_id: "merchant_1".into(),
+            destination_address: "GDESTINATION".into(),
+            memo: "ABCD1234".into(),
+            amount: "10".into(),
+            asset: "XLM".into(),
+            status: "completed".into(),
+            tx_hash: Some("txhash".into()),
+            paid_amount: Some("10".into()),
+            webhook_url: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:01Z".into(),
+            expires_at: "2026-01-01T01:00:00Z".into(),
+            asset_issuer: None,
+        }
+    }
+
+    /// The default (`Minimal`) payload must carry only what's needed to know
+    /// something happened and look it up — no tenant or financial detail.
+    #[test]
+    fn build_payload_minimal_omits_tenant_and_financial_detail() {
+        let payment = sample_payment();
+        let payload = build_payload(
+            &payment,
+            "payment.completed",
+            Some("5"),
+            WebhookPayloadDetail::Minimal,
+        );
+
+        assert_eq!(payload["event"], "payment.completed");
+        assert_eq!(payload["payment_id"], "pay_1");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["updated_at"], "2026-01-01T00:00:01Z");
+
+        for field in [
+            "merchant_id",
+            "amount",
+            "paid_amount",
+            "asset",
+            "asset_issuer",
+            "tx_hash",
+            "delta",
+        ] {
+            assert!(
+                payload.get(field).is_none(),
+                "minimal payload must not include {field:?}, got: {payload}"
+            );
+        }
+    }
+
+    /// `Full` restores the previous rich payload for merchants that opt in.
+    #[test]
+    fn build_payload_full_includes_tenant_and_financial_detail() {
+        let payment = sample_payment();
+        let payload = build_payload(
+            &payment,
+            "payment.overpaid",
+            Some("5"),
+            WebhookPayloadDetail::Full,
+        );
+
+        assert_eq!(payload["merchant_id"], "merchant_1");
+        assert_eq!(payload["amount"], "10");
+        assert_eq!(payload["paid_amount"], "10");
+        assert_eq!(payload["asset"], "XLM");
+        assert_eq!(payload["tx_hash"], "txhash");
+        assert_eq!(payload["delta"], "5");
+    }
+
+    /// `delta` is only ever present under `Full`, and only when the caller
+    /// actually passed one (exact-payment events pass `None`).
+    #[test]
+    fn build_payload_full_without_delta_omits_the_field() {
+        let payment = sample_payment();
+        let payload = build_payload(
+            &payment,
+            "payment.completed",
+            None,
+            WebhookPayloadDetail::Full,
+        );
+        assert!(payload.get("delta").is_none());
     }
 }

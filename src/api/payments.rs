@@ -39,6 +39,10 @@ impl AppError {
     pub fn not_found(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, code, message)
     }
+
+    pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -59,6 +63,17 @@ impl From<anyhow::Error> for AppError {
             "internal_error",
             "internal server error",
         )
+    }
+}
+
+/// Stable machine-readable code for a `JsonRejection` variant not given its
+/// own dedicated code, keyed on the HTTP status axum already chose for it —
+/// `413` for an oversized body (issue #257), `400` for everything else this
+/// catch-all can still see.
+fn rejection_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        _ => "invalid_request",
     }
 }
 
@@ -110,10 +125,23 @@ where
                             "Content-Type must be application/json",
                         ))
                     }
-                    _ => Err(AppError::bad_request(
-                        "invalid_request",
-                        "invalid request body",
-                    )),
+                    // `JsonRejection` is `#[non_exhaustive]`, so a catch-all is
+                    // required — but it must preserve the rejection's own status
+                    // and reason rather than flattening everything into a
+                    // generic 400. This is where `BytesRejection` lands,
+                    // covering an oversized body (`RequestBodyLimitLayer`) and a
+                    // truncated/aborted one: telling a client its JSON was
+                    // malformed when the real problem was the body's size or a
+                    // dropped connection sends it chasing the wrong fix (issue
+                    // #257).
+                    other => {
+                        tracing::debug!(rejection = %other, "unhandled JSON rejection");
+                        Err(AppError::new(
+                            other.status(),
+                            rejection_code(other.status()),
+                            other.body_text(),
+                        ))
+                    }
                 }
             }
         }
@@ -224,6 +252,27 @@ pub async fn create(
         }
     };
     let asset_issuer = accepted_asset.issuer.as_deref();
+
+    /* A trustline confirmed missing means any intent minted here will bounce
+    on-chain — reject at creation rather than let the customer pay into a
+    black hole (issue: report_trustlines only ran once, at boot). Native XLM
+    never needs a trustline, so it's exempt. An asset never yet checked, or
+    whose last check errored contacting Horizon, is NOT treated as missing
+    here — `is_missing` returns `None` for either, and a Horizon outage must
+    not fail every payment creation on top of already failing the check. */
+    if asset_issuer.is_some()
+        && state.trustline_metrics.is_missing(&accepted_asset.code) == Some(true)
+    {
+        return Err(AppError::service_unavailable(
+            "trustline_missing",
+            format!(
+                "the gateway account currently has no trustline for {}; payments in this \
+                 asset cannot be received until one is established",
+                accepted_asset.code
+            ),
+        ));
+    }
+
     let stroops = money::parse_stroops(&body.amount).ok_or_else(|| {
         AppError::bad_request(
             "invalid_amount",
@@ -374,23 +423,42 @@ pub async fn create(
         }
     }
 
-    let memo = generate_unique_memo(&state.pool).await?;
-
-    let payment = db::create_payment(
-        &state.pool,
-        db::NewPayment {
-            id: &id,
-            merchant_id: &merchant_id,
-            destination_address: &state.config.gateway_public,
-            memo: &memo,
-            amount: &body.amount,
-            asset: &asset,
-            asset_issuer,
-            webhook_url: body.webhook_url.as_deref(),
-            ttl_secs: state.config.payment_ttl_secs as i64,
-        },
-    )
-    .await?;
+    // Retry loop to handle UNIQUE constraint violations on memo generation.
+    // Each iteration generates a fresh memo and attempts to create the payment.
+    // If the memo collides (concurrent request claimed the same memo), we retry
+    // with a new memo. Any other error is returned immediately.
+    let payment = 'retry: {
+        for _ in 0..10 {
+            let memo = generate_unique_memo();
+            match db::create_payment(
+                &state.pool,
+                db::NewPayment {
+                    id: &id,
+                    merchant_id: &merchant_id,
+                    destination_address: &state.config.gateway_public,
+                    memo: &memo,
+                    amount: &body.amount,
+                    asset: &asset,
+                    asset_issuer,
+                    webhook_url: body.webhook_url.as_deref(),
+                    ttl_secs: state.config.payment_ttl_secs as i64,
+                },
+            )
+            .await
+            {
+                Ok(p) => break 'retry p,
+                Err(err) if is_unique_violation(&err) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        // Exhausted retries after UNIQUE constraint violations
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "memo_collision_exhausted",
+            "unable to generate a unique memo after multiple retries",
+        ));
+    };
+    state.payment_metrics.record_created();
 
     /* A merchant disputing a charge, or investigating a burst of unexpected
     intents, starts from "which merchant created this and from where" — which
@@ -501,8 +569,6 @@ pub struct ListQuery {
     pub include_total: Option<bool>,
 }
 
-const DEFAULT_LIMIT: i64 = 20;
-const MAX_LIMIT: i64 = 100;
 /// Offset pagination is `O(offset)` in SQLite — it produces and discards
 /// every skipped row. This ceiling (generous for any real UI) keeps a deep,
 /// expensive scan-and-skip from being answered at all; the keyset (`cursor`)
@@ -514,6 +580,24 @@ const MAX_OFFSET: i64 = 10_000;
 /// (`db::expire_overdue`). Nothing writes any other value, so anything else is
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
+
+/// Validates a caller-supplied `limit` against `(1..=max)`, rather than
+/// silently clamping it. Clamping absorbs three distinct bad inputs — too
+/// large, zero, negative — into a `200` that gives the caller no signal
+/// anything was wrong; a client paginating past `max` would read the
+/// silently-shortened page as "end of results" and stop early (issue #258).
+/// Matches the existing `invalid_status`/`invalid_cursor` convention: reject
+/// rather than coerce.
+fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
+    match limit {
+        None => Ok(default),
+        Some(n) if (1..=max).contains(&n) => Ok(n),
+        Some(n) => Err(AppError::bad_request(
+            "invalid_limit",
+            format!("limit must be between 1 and {max} (got {n})"),
+        )),
+    }
+}
 
 /// Statuses a webhook delivery can hold: `pending` while attempts are still
 /// possible, `delivered` on success, `failed` when the attempt budget is
@@ -539,7 +623,11 @@ pub async fn list(
         }
     }
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
@@ -649,15 +737,9 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 }
 
 /// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
-/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
-/// used by *any* payment intent before — `memo_exists` checks the entire
-/// `payments` table, not just pending ones, so a memo is never reused for the
-/// lifetime of the database. That makes the collision probability for a
-/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
-/// times before giving up; exhausting that before billions of payments exist
-/// is effectively impossible. If traffic ever approaches that scale, widen
-/// the memo (more hex chars, still under the 28-byte limit) rather than
-/// switching scheme.
+/// well within Stellar's 28-byte text memo limit). Unlike a pre-check approach,
+/// this function does not verify uniqueness — the database UNIQUE constraint
+/// on the memo column is relied upon to enforce it.
 ///
 /// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
 /// (32-byte) because it's the simplest scheme that round-trips a
@@ -668,18 +750,21 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 /// same text as one of our hex memos. `horizon::HorizonPayment::memo()`
 /// guards against this by only matching when Horizon reports `memo_type:
 /// "text"` (see issue #17).
-async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
-    for _ in 0..10 {
-        let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
-        if !db::memo_exists(pool, &memo).await? {
-            return Ok(memo);
+fn generate_unique_memo() -> String {
+    Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase()
+}
+
+/// Checks if an error is a UNIQUE constraint violation.
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    if let Some(db_err) = err.downcast_ref::<sqlx::Error>() {
+        if let sqlx::Error::Database(db_error) = db_err {
+            // Check for UNIQUE constraint violation
+            // SQLite error message format: "UNIQUE constraint failed: table.column"
+            let msg = db_error.message();
+            return msg.contains("UNIQUE constraint failed");
         }
     }
-    Err(AppError::new(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "memo generation failed",
-    ))
+    false
 }
 
 fn to_json(p: &db::Payment) -> Value {
@@ -759,7 +844,11 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match q.cursor.as_deref() {
         Some(raw_cursor) => {
@@ -797,6 +886,7 @@ pub async fn list_webhooks(
             "event": d.event(),
             "status": d.status,
             "attempts": d.attempts,
+            "manual_attempts": d.manual_attempts,
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
@@ -841,7 +931,11 @@ pub async fn list_merchant_webhooks(
         ));
     }
 
-    let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match &q.cursor {
         Some(raw) => Some(
@@ -954,6 +1048,7 @@ fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
         "event": d.event(),
         "status": d.status,
         "attempts": d.attempts,
+        "manual_attempts": d.manual_attempts,
         "last_attempt": d.last_attempt,
         "acknowledged_at": d.acknowledged_at,
         "created_at": d.created_at,
@@ -1040,8 +1135,11 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
-        .await?;
+    /* Manual redelivery must not share the automatic redrive budget or refresh
+    `last_attempt` — otherwise a merchant clicking "resend" can exhaust
+    `WEBHOOK_REDRIVE_MAX_ATTEMPTS` and permanently disable background recovery
+    (issue #235). */
+    db::record_manual_redelivery(&state.pool, &delivery_id, new_status).await?;
 
     /* A burst of redeliveries previously had no attributable origin in the
     logs at all (issue #305). Logged regardless of outcome — `outcome` here

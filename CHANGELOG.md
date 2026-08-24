@@ -7,8 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Manual webhook redelivery no longer consumes the automatic redrive
+  budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
+  increment the same `attempts` counter the background redrive worker
+  compares against `WEBHOOK_REDRIVE_MAX_ATTEMPTS`, and refreshed
+  `last_attempt` on every click — so a merchant recovering a delivery could
+  permanently disable automatic retries for it (issue #235). Manual
+  redeliveries now bump a separate `manual_attempts` column and leave
+  `attempts` / `last_attempt` alone; listings expose both counts.
+
 ### Added
 
+- **Log rotation and resource limits on both compose stacks.** Neither
+  `docker-compose.yml` nor `deploy/docker-compose.prod.yml` capped container
+  memory or CPU, and the quickstart file had no log rotation at all — an
+  unbounded `json-file` log driver grows until the disk holding
+  `stellargate_data` fills up, which stops SQLite writes and, with them,
+  payment processing. Both files now set `logging.options` (10 MB × 5) and
+  `deploy.resources.limits`/`reservations` sized against the baseline Oracle
+  Always Free shape (1 OCPU / 6 GB); the quickstart file also gained the
+  `stop_grace_period: 35s` that `deploy/docker-compose.prod.yml` already had.
+  Sizing rationale is in a new "Resource limits" section of DEPLOYMENT.md.
+- **Deployment-tunable limits that were compile-time constants.** Request
+  body size, rate-limiter capacity/TTL, list-endpoint pagination bounds,
+  shutdown grace period, the Horizon poller's page size, and the retention
+  worker's batch size and per-cycle cap were all `const`s baked into the
+  binary, even though each is a deployment-shaped decision (proxy fanout
+  behind the rate limiter, an orchestrator's termination grace period, a
+  Horizon poll cycle's duration) rather than a design invariant. They are now
+  `Config` fields — `MAX_BODY_BYTES`, `RATE_LIMITER_MAX_KEYS`,
+  `RATE_LIMITER_IDLE_TTL_SECS`, `PAGINATION_DEFAULT_LIMIT`,
+  `PAGINATION_MAX_LIMIT`, `SHUTDOWN_GRACE_SECS`, `HORIZON_PAGE_LIMIT`,
+  `DB_PRUNE_BATCH_SIZE`, `RETENTION_MAX_ROWS_PER_CYCLE` — validated at boot,
+  documented in `.env.example`, with the previous constants kept as their
+  defaults so behaviour is unchanged out of the box. `SHUTDOWN_GRACE_SECS`'s
+  relationship to an orchestrator's own termination grace period (Kubernetes'
+  `terminationGracePeriodSeconds`, Docker's `stop_grace_period`) is documented
+  in a new "Shutdown grace" section of DEPLOYMENT.md, and
+  `deploy/docker-compose.prod.yml` now sets `stop_grace_period` to clear the
+  app's default drain budget instead of undercutting it (issue #279).
 - **Audit events for every state-changing operation.** Authentication
   outcomes and key issuance/revocation were already logged with
   `merchant_id`/`source_ip`, but payment creation, webhook redelivery
@@ -22,8 +61,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   limiting and auth logs) is now reusable from any handler via
   `client_ip_key_from_parts`, so every audit event uses the same source
   attribution as everything else (issue #305).
+- **Webhook payload minimisation, and a startup warning for plaintext
+  delivery.** `build_payload` put `merchant_id` and full financial detail
+  (`amount`, `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, `delta`) in
+  every webhook body. HMAC signing proves authenticity, not confidentiality,
+  and on any network other than `public`, `ALLOWED_WEBHOOK_SCHEMES` may still
+  permit plain `http` — so that detail could transit in cleartext, and
+  `merchant_id` in particular adds nothing for the legitimate recipient
+  (it's *their* id) while making an intercepted payload immediately
+  attributable. `WEBHOOK_PAYLOAD_DETAIL` (default `minimal`) now sends only
+  `event`, `payment_id`, `status`, and `updated_at`; the full payload is
+  available by setting it to `full`, and a receiver that needs the omitted
+  fields can call `GET /v1/payments/:id` with its API key instead. Separately,
+  boot now logs a `warn` whenever `ALLOWED_WEBHOOK_SCHEMES` includes `http`,
+  on every network, not just when it would be unsafe — so enabling plaintext
+  delivery is never a silent choice. Documented in a new "Webhook Payload
+  Exposure" section of SECURITY.md and the README's "Payload detail"
+  subsection, with a migration note for existing `full`-payload receivers
+  (issue #306).
 
 ### Fixed
+
+- **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive
+  limit the system can apply.** `Config::validate_timing` rejects
+  `POLL_INTERVAL_SECS=0`, `PAYMENT_TTL_SECS=0`, `WEBHOOK_RETRY_ATTEMPTS=0`,
+  `WEBHOOK_RETRY_DELAY_MS=0`, and `REQUEST_TIMEOUT_SECS=0` at boot, but
+  `RATE_LIMIT_REQUESTS_PER_SEC=0` was missed — it passed validation and was
+  then silently clamped up to `1` request/sec by `RateLimitState::new`. An
+  operator setting `0` almost always means "disable rate limiting" or "I
+  haven't configured this yet"; either way they got the tightest possible
+  limit instead, with no warning at boot, which looks like an outage. Boot
+  now refuses `RATE_LIMIT_REQUESTS_PER_SEC=0` with the same explanatory style
+  as its siblings, and the `.max(1)` clamp is gone — the effective per-IP
+  rate now always equals the configured one (issue #276).
+
+- **An SSRF-blocked webhook delivery was retried by the redrive worker
+  forever, double-counting the failure metric on every pass.** Both
+  `dispatch()` and `redrive_one()` correctly marked a delivery blocked by the
+  SSRF guard `status = "failed"`, but left `attempts` at its prior value
+  (usually `0`). `list_redrivable_deliveries` selects on `status IN
+  ('pending', 'failed') AND attempts < max_attempts`, so `status = "failed"`
+  alone never removed the row from consideration — only `attempts` reaching
+  the redrive cap does. The background worker picked the same blocked
+  delivery back up on every subsequent pass, re-ran the (still-blocked) SSRF
+  check, and incremented `stellargate_webhook_deliveries_total{outcome
+  ="failed"}` again each time, forever. Both blocked branches now record
+  `attempts` at the configured redrive cap, which is what actually makes the
+  row terminal. New tests in `tests/webhook_dispatch_tests.rs` pin the
+  invariant directly — a second `redrive_once` pass past the grace window
+  attempts nothing, and a blocked `dispatch()` delivery never appears in
+  `list_redrivable_deliveries` at all — rather than asserting specific column
+  values, so they survive a future change of representation.
 
 - **Test pools now use a genuinely shared in-memory SQLite database.** Every
   test suite built its pool from the DSN `sqlite::memory:` while allowing

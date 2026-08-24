@@ -268,7 +268,46 @@ It is a warning, not a boot failure — accepting XLM only is perfectly valid, s
 refusing to start would be wrong. **Read the first lines of the log after your
 first deploy.**
 
-To check what the account currently trusts:
+**The check doesn't stop at boot.** A trustline can be removed at any time
+after startup — by the account operator, or by an issuer revoking
+authorization — and an asset can be added to `ACCEPTED_ASSETS` on a redeploy.
+A background `trustline_checker` task re-runs the same check on the retention
+worker's cadence (`RETENTION_INTERVAL_SECS`, default 1 hour) for as long as
+the gateway wallet is configured, so drift after boot is caught rather than
+only ever logged once.
+
+Current trustline state is on `GET /metrics`, so it's alertable rather than
+grep-only:
+
+```
+# a confirmed-missing trustline
+stellargate_missing_trustlines{asset="USDC"} 1
+
+# how many checks have failed to reach Horizon at all — distinct from a
+# confirmed-absent trustline, which only ever comes from a check that
+# actually got an answer
+stellargate_trustline_check_failures_total 0
+
+# unix timestamp of the last check that got a confirmed answer; 0 means
+# never — treat stellargate_missing_trustlines as unknown, not confirmed,
+# until this is nonzero
+stellargate_trustline_check_last_success_timestamp_seconds 1732000000
+```
+
+A Horizon outage during a check only increments
+`stellargate_trustline_check_failures_total`; it leaves the last confirmed
+`stellargate_missing_trustlines` value alone rather than guessing, so "Horizon
+is unreachable" and "trustline confirmed absent" never look the same on the
+scrape.
+
+Once a trustline is confirmed missing, `POST /payments` for that asset returns
+`503 trustline_missing` instead of minting an intent that can only bounce
+on-chain. An asset that has never been checked yet (or whose last check
+errored) is **not** rejected on that basis alone — an unreachable Horizon
+must not also fail every payment creation for assets it simply hasn't had a
+chance to confirm.
+
+To check what the account currently trusts directly against Horizon:
 
 ```bash
 curl -s "https://horizon-testnet.stellar.org/accounts/$STELLAR_GATEWAY_PUBLIC" \
@@ -446,7 +485,7 @@ until it finished; a backlog drains over several cycles instead.
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
-| `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. | `10` |
+| `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
 | `DB_POOL_MAX_CONNECTIONS` | SQLite pool size. WAL allows one writer plus many readers. | `10` |
 | `DB_BUSY_TIMEOUT_MS` | Lock-acquisition wait before erroring. Must be `> 0` under concurrent load. | `5000` |
@@ -465,7 +504,15 @@ client's payment quota, or vice versa. The client IP is resolved per
 | `payments` | `POST /payments` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `merchants` | `POST /merchants` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
 | `redeliver` | `POST /payments/:id/webhooks/:delivery_id/redeliver` | `RATE_LIMIT_REQUESTS_PER_SEC` × 1 |
-| `default` | everything else, including all `GET` routes and the probes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+| `default` | everything else, including all other `GET` routes | `RATE_LIMIT_REQUESTS_PER_SEC` × 5 |
+
+`/health`, `/ready` and `/metrics` are **not** in any bucket — they are exempt
+from rate limiting entirely, not merely given a generous one. They are cheap,
+come from a trusted orchestrator rather than the public internet, and their
+whole purpose is to stay answerable when the system is under stress; sharing a
+bucket with merchant traffic would mean a load spike that trips the limiter
+could also turn an orchestrator's own liveness probe into a `429` — see
+DEPLOYMENT.md for the failure mode this avoids.
 
 Write and sensitive routes get the base rate; read-only traffic gets a more
 generous allowance so ordinary polling is not throttled. Redelivery is bucketed
@@ -519,6 +566,11 @@ POST /v1/payments
 GET  /v1/payments/:id
 POST /v1/merchants
 ```
+
+The bundled dashboard uses this same canonical prefix through one shared API
+base, so all of its authenticated requests track the current API version.
+Operational requests such as `/` and `/ready` remain unversioned as described
+below.
 
 Unversioned paths (`/payments`, `/merchants`) still work and serve the same
 data, so nothing breaks today. They respond with headers pointing at their
@@ -613,11 +665,13 @@ it was choosing the tenant and was not.
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
+| `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
+| `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
 | `merchant_not_found` | `404` | No merchant with that id |
 | `key_not_found` | `404` | No active key with that id for this merchant |
@@ -629,7 +683,17 @@ it was choosing the tenant and was not.
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
 | `idempotency_conflict` | `500` | Concurrent creates raced on one idempotency key |
 | `not_found` | `404` | No matching route |
+| `method_not_allowed` | `405` | Path exists, but not for this HTTP method |
+| `request_timeout` | `408` | Request exceeded `REQUEST_TIMEOUT_SECS` |
 | `internal_error` | `500` | Unexpected server-side failure |
+
+`405`, `413`, and `408` are otherwise generated by axum and `tower_http`
+themselves — before this, they carried an empty body rather than the envelope
+above, so a client parsing the documented contract got a JSON decode failure
+instead of an error it could act on. A response-rewriting middleware
+(`json_error_envelope_middleware` in `src/api/mod.rs`) fills in the envelope
+for these three cases wherever nothing downstream has already answered with
+one.
 
 ---
 
@@ -857,7 +921,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | Param | Description | Default |
 |---|---|---|
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
-| `limit` | Page size, 1–100 | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 | `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
@@ -936,7 +1000,7 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | Query param | Description | Default |
 |---|---|---|
 | `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
-| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 
 `next_cursor` is `null` on the final page. To page through the history, start with a
@@ -983,7 +1047,7 @@ look.
 | Query | Default | Notes |
 |---|---|---|
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
-| `limit` | `20` | 1–100 |
+| `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
 
 ```bash
@@ -1180,26 +1244,57 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | Event | Fired when |
 |---|---|
 | `payment.completed` | Cumulative received equals the requested amount |
-| `payment.overpaid` | Cumulative received exceeds it (`delta` = excess) |
-| `payment.underpaid` | Payment received but short (`delta` = shortfall) |
+| `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
+| `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+
+### Payload detail
+
+`WEBHOOK_PAYLOAD_DETAIL` controls how much the body carries. HMAC signing
+(below) proves the body is authentic; it says nothing about who else can read
+it in transit, and on any network other than `public`,
+`ALLOWED_WEBHOOK_SCHEMES` may permit plain `http` — see [SECURITY.md](SECURITY.md#webhook-payload-exposure)
+for the full exposure model.
+
+**`minimal` (the default)** — enough to know something happened and look it
+up; no tenant or financial detail:
 
 ```json
 {
   "event": "payment.overpaid",
   "payment_id": "a1b2c3d4-...",
+  "status": "completed",
+  "updated_at": "2026-01-01T00:00:01Z"
+}
+```
+
+**`full`** — the previous rich payload, opt in with `WEBHOOK_PAYLOAD_DETAIL=full`:
+
+```json
+{
+  "event": "payment.overpaid",
+  "payment_id": "a1b2c3d4-...",
+  "status": "completed",
+  "updated_at": "2026-01-01T00:00:01Z",
   "merchant_id": "your-merchant-id",
   "tx_hash": "abc123...",
   "amount": "10",
   "paid_amount": "12.5",
   "asset": "XLM",
   "asset_issuer": null,
-  "status": "completed",
   "delta": "2.5"
 }
 ```
 
-`delta` is present only on `payment.overpaid` and `payment.underpaid`.
+`delta` is present only on `payment.overpaid` and `payment.underpaid`, and
+only under `full` detail. A receiver that needs the fields `minimal` omits
+already holds an API key and can call `GET /v1/payments/:id` for the full
+record instead.
+
+> **Migrating from the previous default.** Every field prior versions sent is
+> still available — set `WEBHOOK_PAYLOAD_DETAIL=full` to keep receiving
+> exactly the payload shown above. There is no forced cutover: `full` is
+> supported indefinitely, not a deprecated compatibility mode.
 
 ### Verifying Signatures
 
@@ -1296,7 +1391,7 @@ For the full canonical reference, see **[WEBHOOK_REFERENCE.md](WEBHOOK_REFERENCE
 
 **Client IP attribution is fail-closed.** `X-Forwarded-For`/`X-Real-IP` are client-supplied, so they are honored only when the socket peer is a configured trusted proxy (`TRUSTED_PROXY_CIDRS`) — an unset allow-list means the headers are always ignored and the peer address is used, so a caller can't rotate a header to evade the limiter or poison the auth logs. When no peer address is available at all, every request shares a single key rather than trusting a header.
 
-**Bounded requests.** Bodies are capped at 256 KiB and every request is subject to `REQUEST_TIMEOUT_SECS`.
+**Bounded requests.** Bodies are capped at `MAX_BODY_BYTES` (256 KiB by default) and every request is subject to `REQUEST_TIMEOUT_SECS`.
 
 **Fail-fast configuration.** Invalid strkeys, unknown listener modes, and short webhook secrets abort startup instead of degrading silently.
 
@@ -1325,6 +1420,14 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_task_disabled` | gauge | `1` if the named task exited because configuration gave it nothing to do |
 | `stellargate_horizon_poll_cycles_total` | counter | Horizon poll cycles, labelled by `outcome` (`success`, `rate_limited`, `error`) |
 | `stellargate_horizon_last_successful_poll_timestamp_seconds` | gauge | Unix timestamp of the last successful Horizon poll or stream event |
+| `stellargate_horizon_cursor_age_seconds` | gauge | Age of the most recently processed Horizon payment record — the sharpest signal of payment-detection lag |
+| `stellargate_http_requests_total` | counter | HTTP requests, labelled by `method`, matched `route` (never the raw path — bounded cardinality), and `status` |
+| `stellargate_http_request_duration_seconds` | histogram | HTTP request latency, labelled by `method` and matched `route` |
+| `stellargate_payments_total` | counter | Payments labelled by lifecycle `status` (`created`, `completed`, `overpaid`, `underpaid`, `expired`) |
+| `stellargate_payment_settlement_latency_seconds` | histogram | Time from payment creation to a settlement outcome |
+| `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
+| `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
+| `stellargate_db_file_size_bytes` | gauge | On-disk size of the SQLite database files, labelled by `file` (`main`, `wal`, `shm`); absent for an in-memory database |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was
@@ -1334,7 +1437,17 @@ compare it against. `stellargate_task_disabled` is what separates "switched off
 on purpose" from "not running", which `stellargate_task_running` alone reports
 identically.
 
-Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
+Structured logs (via `tracing`) carry a `request_id` field on every request span, matching the `x-request-id` response header returned to clients. Every log line emitted during a request — including internal errors (`AppError`), audit events, and auth denials — inherits `request_id` automatically from the span context. Operators can search logs directly using the request ID returned in response headers:
+
+```bash
+# Filter JSON logs by request ID quoted by a client:
+jq 'select(.request_id == "7f3a...")' /var/log/stellargate.log
+
+# Grep structured text logs by request ID:
+grep 'request_id=7f3a...' /var/log/stellargate.log
+```
+
+Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 
 Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=debug`.
 

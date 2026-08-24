@@ -10,6 +10,7 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use tracing_test::traced_test;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -31,7 +32,7 @@ fn make_config() -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -42,6 +43,7 @@ fn make_config() -> Config {
         rejects http:// — these tests cover the network-based rule (http is fine
         on testnet, HTTPS-only on public), which runs after this gate. */
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -71,6 +73,15 @@ fn make_config() -> Config {
         trusted_proxy_cidrs: vec![],
         max_payment_amount: Default::default(),
         min_payment_amount: Default::default(),
+        max_body_bytes: 256 * 1024,
+        rate_limiter_max_keys: 10_000,
+        rate_limiter_idle_ttl_secs: 60,
+        pagination_default_limit: 20,
+        pagination_max_limit: 100,
+        shutdown_grace_secs: 30,
+        horizon_page_limit: 200,
+        db_prune_batch_size: 500,
+        retention_max_rows_per_cycle: 50_000,
     }
 }
 
@@ -92,6 +103,30 @@ async fn server_with_config_and_health(
     cfg: Config,
     task_health: stellargate::TaskHealth,
 ) -> (TestServer, db::Db) {
+    server_with_all(
+        cfg,
+        task_health,
+        stellargate::metrics::TrustlineMetrics::new(),
+    )
+    .await
+}
+
+/// Like [`server_with_config`], but with an explicitly-provided
+/// [`stellargate::metrics::TrustlineMetrics`] so tests can drive `POST
+/// /payments` and `GET /metrics` against a known trustline state without
+/// going through a real (or mocked) Horizon call.
+async fn server_with_config_and_trustlines(
+    cfg: Config,
+    trustline_metrics: stellargate::metrics::TrustlineMetrics,
+) -> (TestServer, db::Db) {
+    server_with_all(cfg, stellargate::TaskHealth::new(), trustline_metrics).await
+}
+
+async fn server_with_all(
+    cfg: Config,
+    task_health: stellargate::TaskHealth,
+    trustline_metrics: stellargate::metrics::TrustlineMetrics,
+) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
         // A shared-cache in-memory database is dropped once its last
         // connection closes — keep exactly one open for the pool's lifetime.
@@ -109,6 +144,9 @@ async fn server_with_config_and_health(
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics,
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health,
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
@@ -368,7 +406,7 @@ async fn test_ready_fails_when_cursor_stale() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.set_last_success_unix(0); // never succeeded → maximally stale
@@ -396,7 +434,7 @@ async fn test_ready_ok_when_cursor_fresh() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.note_success();
@@ -471,6 +509,85 @@ async fn test_auth_outcomes_are_counted_in_metrics() {
         body.contains(
             "stellargate_auth_attempts_total{outcome=\"failure\",reason=\"invalid_key\"} 1"
         ),
+        "got: {body}"
+    );
+}
+
+/// HTTP traffic must be observable via `/metrics`, labelled by the matched
+/// route pattern rather than the raw request path — hitting `GET
+/// /payments/:id` with two different payment ids must land in the *same*
+/// series, not mint one series per id (missing operational metrics issue).
+#[tokio::test]
+async fn test_http_requests_are_counted_by_matched_route_not_raw_path() {
+    let server = test_server().await;
+
+    server.get("/payments/one-id").await;
+    server.get("/payments/another-id").await;
+    server.get("/this-path-does-not-exist").await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"/payments/:id\",status=\"404\"} 2"
+        ),
+        "two distinct payment ids must be counted under one bounded-cardinality \
+         route label, not one series each:\n{body}"
+    );
+    assert!(
+        !body.contains("one-id") && !body.contains("another-id"),
+        "the raw path/id must never leak into a metric label:\n{body}"
+    );
+    assert!(
+        body.contains(
+            "stellargate_http_requests_total{method=\"GET\",route=\"<unmatched>\",status=\"404\"} 1"
+        ),
+        "a request matching no route must fall into the bounded <unmatched> \
+         label, not the raw path:\n{body}"
+    );
+    assert!(
+        body.contains("stellargate_http_request_duration_seconds_bucket{method=\"GET\""),
+        "got: {body}"
+    );
+}
+
+/// Payment creation must be counted on `/metrics` (missing operational
+/// metrics issue).
+#[tokio::test]
+async fn test_payment_creation_is_counted_in_metrics() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await
+        .assert_status(StatusCode::CREATED);
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_payments_total{status=\"created\"} 1"),
+        "got: {body}"
+    );
+}
+
+/// Database pool utilisation must be exported so an operator can see
+/// connections are exhausted before requests start queuing on the pool
+/// (missing operational metrics issue).
+#[tokio::test]
+async fn test_db_pool_metrics_are_exported() {
+    let server = test_server().await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_db_pool_max_connections 10"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_db_pool_connections{state=\"idle\"}"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_db_pool_connections{state=\"in_use\"}"),
         "got: {body}"
     );
 }
@@ -696,6 +813,104 @@ async fn test_create_invalid_asset() {
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
     res.assert_contains_header("x-request-id");
+}
+
+// ── Trustline-aware payment creation (this issue) ────────────────────────────
+
+/// A trustline confirmed missing by the trustline checker must reject the
+/// intent rather than mint one that can only bounce on-chain.
+#[tokio::test]
+async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(res.json::<Value>()["code"], "trustline_missing");
+}
+
+/// An asset the checker has confirmed present is unaffected.
+#[tokio::test]
+async fn test_create_accepts_asset_with_confirmed_present_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &[]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// An asset that has never been checked (fresh `TrustlineMetrics`, the state
+/// every deployment starts in before its first check completes) must not be
+/// rejected — `None` means "unknown", not "missing".
+#[tokio::test]
+async fn test_create_accepts_asset_never_checked_for_a_trustline() {
+    let res = server_with_config(make_config()).await.0;
+    let key = provision_merchant(&res).await;
+
+    let res = res
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// Native XLM never needs a trustline, so it's exempt from the check even if
+/// somehow marked missing.
+#[tokio::test]
+async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "10", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// `GET /metrics` exposes the current trustline state as a gauge, plus the
+/// counters that distinguish a Horizon outage from a confirmed absence
+/// (acceptance criteria of this issue).
+#[tokio::test]
+async fn test_metrics_expose_trustline_state() {
+    let trustlines = stellargate::metrics::TrustlineMetrics::new();
+    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()]);
+    trustlines.record_check_failure();
+    let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
+
+    let body = server.get("/metrics").await.text();
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_missing_trustlines{asset=\"EURC\"} 0"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_failures_total 1"),
+        "got: {body}"
+    );
+    assert!(
+        body.contains("stellargate_trustline_check_last_success_timestamp_seconds"),
+        "got: {body}"
+    );
 }
 
 // ── Unknown request-body fields (issue #329) ─────────────────────────────────
@@ -2137,10 +2352,11 @@ async fn test_list_webhooks_status_filter() {
     assert_eq!(res.json::<Value>()["code"], "invalid_status");
 }
 
-/// Regression for #326: an undecodable `cursor` is rejected with a 400, and
-/// `limit` is clamped into the acknowledged range.
+/// Regression for #326 (cursor) and #258 (limit): an undecodable `cursor` is
+/// rejected with a 400, and an out-of-range `limit` is rejected rather than
+/// silently clamped.
 #[tokio::test]
-async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
+async fn test_list_webhooks_invalid_cursor_and_limit_out_of_range() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
     let auth = format!("Bearer {key}");
@@ -2161,13 +2377,15 @@ async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
 
-    // Above MAX_LIMIT is clamped down to 100, not an error.
+    // Above MAX_LIMIT is now rejected rather than silently clamped down to
+    // 100 (issue #258) — a paginating client trusting the echoed limit would
+    // otherwise read the short page as "end of results" and stop early.
     let res = server
         .get(&format!("/payments/{id}/webhooks?limit=5000"))
         .add_header("Authorization", auth)
         .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["limit"], 100);
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_limit");
 }
 
 #[tokio::test]
@@ -2304,6 +2522,78 @@ async fn test_redeliver_echoes_the_original_event_type() {
         received[0].headers.get("X-StellarGate-Event").unwrap(),
         "payment.underpaid",
         "redelivered header must match the event the payload carries"
+    );
+}
+
+/// Manual redeliveries must not share the automatic redrive budget (issue #235).
+#[tokio::test]
+async fn test_manual_redeliver_does_not_consume_automatic_attempts() {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(3)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-manual",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-manual", "failed", 2)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        let res = server
+            .post(&format!(
+                "/payments/{id}/webhooks/delivery-manual/redeliver"
+            ))
+            .add_header("Authorization", auth.clone())
+            .await;
+        // Endpoint returns 502 when the target rejects — that is fine; we care
+        // about the counters, not the HTTP success of the merchant call.
+        assert!(
+            res.status_code().as_u16() == 502 || res.status_code().is_success(),
+            "unexpected status {}",
+            res.status_code()
+        );
+    }
+
+    let listed = server
+        .get(&format!("/payments/{id}/webhooks"))
+        .add_header("Authorization", auth)
+        .await
+        .json::<Value>();
+    let d = &listed["deliveries"][0];
+    assert_eq!(
+        d["attempts"], 2,
+        "automatic attempts must stay put; got {listed}"
+    );
+    assert_eq!(
+        d["manual_attempts"], 3,
+        "manual_attempts must count each click; got {listed}"
     );
 }
 
@@ -3331,4 +3621,35 @@ async fn test_both_mounts_share_the_same_data() {
         .await;
     via_v1.assert_status_ok();
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
+}
+
+/// Payment creation should succeed without 500 errors when retrying due to
+/// memo collisions. The retry logic in create_payment ensures that UNIQUE
+/// constraint violations on memo trigger a retry with a fresh memo (issue #273).
+#[tokio::test]
+async fn test_concurrent_payment_creation_handles_memo_collisions() {
+    let server = Arc::new(test_server().await);
+    let key = provision_merchant(&server).await;
+
+    // Create 50 payment requests in rapid succession. Even though they execute
+    // sequentially in this test, the payment creation logic itself includes retry
+    // logic to handle potential memo collisions from the database UNIQUE constraint.
+    let mut memos = Vec::new();
+    for i in 0..50 {
+        let response = server
+            .post("/payments")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({ "amount": format!("{}.5", i), "asset": "XLM" }))
+            .await;
+
+        // Verify no 500 errors (the original bug would cause 500s on memo collisions)
+        response.assert_status(StatusCode::CREATED);
+        let body = response.json::<Value>();
+        let memo = body["memo"].as_str().unwrap().to_string();
+        memos.push(memo);
+    }
+
+    // Verify all memos are unique (the retry logic ensures fresh memos on collisions)
+    let unique_count = memos.iter().collect::<std::collections::HashSet<_>>().len();
+    assert_eq!(unique_count, 50, "all payment memos must be unique");
 }
