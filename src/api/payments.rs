@@ -1,8 +1,8 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
     async_trait,
-    extract::{ConnectInfo, Extension, FromRequest, Path, Query, Request, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -203,6 +203,51 @@ where
         JsonBody::<T>::from_request(req, state)
             .await
             .map(|JsonBody(value)| OptionalJsonBody(Some(value)))
+    }
+}
+
+/// A drop-in replacement for `Query<T>` that maps a query-string failure into
+/// our standard `{"code": "...", "error": "..."}` 400 instead of axum's
+/// plaintext rejection.
+///
+/// Paired with `#[serde(deny_unknown_fields)]` on the target struct, this is
+/// what makes an unrecognised *parameter* a first-class error: serde raises
+/// "unknown field `stauts`, expected one of ..." and this turns it into
+/// `400 unknown_parameter` with that message intact, so the response names the
+/// offending key and lists the accepted ones.
+pub struct QueryParams<T>(pub T);
+
+#[async_trait]
+impl<T, S> FromRequestParts<S> for QueryParams<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match Query::<T>::from_request_parts(parts, state).await {
+            Ok(Query(value)) => Ok(QueryParams(value)),
+            Err(rejection) => {
+                let detail = rejection.body_text();
+                /* An unrecognised parameter is its own failure mode, not a
+                generic deserialization error: it almost always means a typo or
+                a client written against an older spec, and the fix is
+                different from "the value had the wrong type". This mirrors the
+                `unknown_field` split `JsonBody` already makes for bodies. */
+                if detail.contains("unknown field") {
+                    Err(AppError::bad_request(
+                        "unknown_parameter",
+                        format!("invalid query string: {detail}"),
+                    ))
+                } else {
+                    Err(AppError::bad_request(
+                        "invalid_query",
+                        format!("invalid query string: {detail}"),
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -555,7 +600,24 @@ fn public_view(p: &db::Payment) -> Value {
     })
 }
 
+/// Query parameters for the payments listing.
+///
+/// `deny_unknown_fields` because a discarded parameter is a silently
+/// unfiltered page (issue #352). `?stauts=completed` — one transposed
+/// character — used to return `200 OK` listing *every* payment including
+/// pending ones, so a merchant reconciliation script that filters server-side
+/// and trusts the result would read unpaid intents as paid.
+///
+/// It also keeps the parameter set evolvable: while unknown parameters were
+/// ignored, adding a real `page` later would change the behaviour of requests
+/// that appeared to work before.
+///
+/// This matches how the rest of the API already treats input it does not
+/// understand: `status` is checked against an allow-list, an undecodable
+/// `cursor` is `400 invalid_cursor`, an unrecognised body field is `400
+/// unknown_field`. Strictness previously stopped at parameter names.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
@@ -608,7 +670,7 @@ const VALID_DELIVERY_STATUSES: [&str; 3] = ["pending", "delivered", "failed"];
 pub async fn list(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    Query(q): Query<ListQuery>,
+    QueryParams(q): QueryParams<ListQuery>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
         if !VALID_STATUSES.contains(&s.as_str()) {
@@ -815,8 +877,10 @@ fn to_json(p: &db::Payment) -> Value {
 /// Query parameters for the webhook-delivery listing. Matches the payments
 /// listing conventions: a `status` filter, a `limit` (default 20, max 100),
 /// and an opaque keyset `cursor` whose value comes from a previous response's
-/// `next_cursor`.
+/// `next_cursor`. `deny_unknown_fields` for the same reason as [`ListQuery`]:
+/// a mistyped parameter must not read as an applied filter (issue #352).
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListDeliveryQuery {
     pub status: Option<String>,
     pub limit: Option<i64>,
@@ -827,7 +891,7 @@ pub async fn list_webhooks(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
     Path(payment_id): Path<String>,
-    Query(q): Query<ListDeliveryQuery>,
+    QueryParams(q): QueryParams<ListDeliveryQuery>,
 ) -> Result<Json<Value>, AppError> {
     if let Some(s) = &q.status {
         if !VALID_DELIVERY_STATUSES.contains(&s.as_str()) {
@@ -898,6 +962,7 @@ pub async fn list_webhooks(
             "event": d.event(),
             "status": d.status,
             "attempts": d.attempts,
+            "manual_attempts": d.manual_attempts,
             "last_attempt": d.last_attempt,
             "created_at": d.created_at,
         })).collect::<Vec<_>>(),
@@ -908,7 +973,13 @@ pub async fn list_webhooks(
 
 // ── Dead-letter view (issue #319) ────────────────────────────────────────────
 
+/// `deny_unknown_fields` for the same reason as [`ListQuery`]: a mistyped
+/// parameter must not read as an applied filter (issue #352). It matters more
+/// here than elsewhere, because `status` defaults to `failed` when absent — so
+/// a typo'd `?staus=pending` would answer the dead-letter question with the
+/// dead-letter list and look entirely plausible.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListDeliveriesQuery {
     /// Defaults to `failed` — the dead-letter case this endpoint exists for.
     pub status: Option<String>,
@@ -928,7 +999,7 @@ pub struct ListDeliveriesQuery {
 pub async fn list_merchant_webhooks(
     State(state): State<Arc<AppState>>,
     Extension(AuthenticatedMerchant(merchant_id)): Extension<AuthenticatedMerchant>,
-    Query(q): Query<ListDeliveriesQuery>,
+    QueryParams(q): QueryParams<ListDeliveriesQuery>,
 ) -> Result<Json<Value>, AppError> {
     let status = q.status.as_deref().unwrap_or("failed");
     if !VALID_DELIVERY_STATUSES.contains(&status) {
@@ -1059,6 +1130,7 @@ fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
         "event": d.event(),
         "status": d.status,
         "attempts": d.attempts,
+        "manual_attempts": d.manual_attempts,
         "last_attempt": d.last_attempt,
         "acknowledged_at": d.acknowledged_at,
         "created_at": d.created_at,
@@ -1145,8 +1217,11 @@ pub async fn redeliver_webhook(
         _ => "failed",
     };
 
-    db::update_webhook_delivery(&state.pool, &delivery_id, new_status, delivery.attempts + 1)
-        .await?;
+    /* Manual redelivery must not share the automatic redrive budget or refresh
+    `last_attempt` — otherwise a merchant clicking "resend" can exhaust
+    `WEBHOOK_REDRIVE_MAX_ATTEMPTS` and permanently disable background recovery
+    (issue #235). */
+    db::record_manual_redelivery(&state.pool, &delivery_id, new_status).await?;
 
     /* A burst of redeliveries previously had no attributable origin in the
     logs at all (issue #305). Logged regardless of outcome — `outcome` here

@@ -317,8 +317,12 @@ sending the signal waits at least as long before escalating to `SIGKILL`:
 
 ## Upgrades and rollback
 
-Migrations in `migrations/` run automatically at startup and are recorded in
-`_sqlx_migrations`, so each runs exactly once.
+There is no `migrations/` directory and no `_sqlx_migrations` tracking table.
+Schema changes are hand-written, idempotent Rust statements in `db::migrate`
+(`src/db.rs`), applied automatically at startup — every statement runs on
+every boot, `CREATE TABLE IF NOT EXISTS` and column-presence checks make
+re-running them a no-op once applied. See "Database Migrations" in the
+README for how this is kept honest against drift.
 
 ```bash
 cd ~/StellarGate

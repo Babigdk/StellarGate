@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Unknown query parameters on the listing endpoints are now rejected
+  instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
+  `GET /payments/webhooks` deserialized the parameters they knew and discarded
+  everything else, so a typo returned `200 OK` with an unfiltered first page:
+  `?stauts=completed` listed every payment including pending ones, and a
+  merchant reconciliation script that filtered server-side would read unpaid
+  intents as paid (issue #352). All three parameter sets are now closed, and
+  an unrecognised key is a `400` `unknown_parameter` naming it — the same
+  treatment request bodies already got via `unknown_field` (issue #329). A
+  malformed *value* (`?limit=abc`) now also returns the standard JSON error
+  envelope under `invalid_query`, where it previously produced axum's
+  plaintext `400`. **Breaking for any client currently sending a stray
+  parameter**, which is the point: it was never being applied.
+
+- **Manual webhook redelivery no longer consumes the automatic redrive
+  budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
+  increment the same `attempts` counter the background redrive worker
+  compares against `WEBHOOK_REDRIVE_MAX_ATTEMPTS`, and refreshed
+  `last_attempt` on every click — so a merchant recovering a delivery could
+  permanently disable automatic retries for it (issue #235). Manual
+  redeliveries now bump a separate `manual_attempts` column and leave
+  `attempts` / `last_attempt` alone; listings expose both counts.
+
 ### Added
 
 - **Log rotation and resource limits on both compose stacks.** Neither
@@ -131,6 +156,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
   fixture is genuinely shared and that the old bare-DSN form is not, so the
   footgun can't be silently reintroduced (issue #309).
+
+- **Removed the stale `migrations/` directory; the live schema now verifies
+  itself.** The schema existed twice: as hand-written DDL inside
+  `db::migrate` (the only one that ever ran) and as SQL files in
+  `migrations/`, which nothing in the codebase read. The files had already
+  drifted — missing `merchants`, `api_keys`, `processed_transactions`, and
+  `webhook_deliveries.event_type` — so a database built from them could not
+  authenticate a request or record a settlement. They looked authoritative
+  (numbered, in the conventional location), which made a contributor or
+  reviewer trusting them actively misled rather than merely working from an
+  incomplete reference. `migrations/` is now deleted, and a new
+  `tests/schema_snapshot_test.rs` asserts a freshly migrated database matches
+  a checked-in `tests/schema_snapshot.sql` exactly, so a schema change that
+  isn't reflected there fails CI instead of drifting silently — the same
+  failure mode the old directory had, closed by making `db::migrate` itself
+  self-verifying instead of hand-copied. `CONTRIBUTING.md`, `DEPLOYMENT.md`,
+  and `SECURITY.md` no longer reference `migrations/`; `DEPLOYMENT.md` in
+  particular had claimed migrations were "recorded in `_sqlx_migrations`",
+  a table that has never existed in this codebase (issue #308).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and

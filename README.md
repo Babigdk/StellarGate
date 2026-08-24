@@ -659,11 +659,38 @@ edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
 always taken the merchant from the API key, so a client that sent it believed
 it was choosing the tenant and was not.
 
+**Query strings are closed too.** The listing endpoints accept exactly the
+parameters documented for them, and anything else is rejected with `400`
+`unknown_parameter` naming the offending key:
+
+```bash
+curl "http://localhost:3000/v1/payments?stauts=completed" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+```json
+{
+  "error": "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`",
+  "code": "unknown_parameter"
+}
+```
+
+The cost of the old behaviour was the same as for bodies, and quieter: a
+discarded filter is an unfiltered page returned as `200 OK`, so
+`?stauts=completed` listed every payment including pending ones and a
+reconciliation script that filtered server-side read unpaid intents as paid.
+`?page` and `?per_page` are the other common shapes of this — plausible
+pagination names that this API has never used. Closing the parameter set also
+keeps it evolvable: while unknown parameters were ignored, adding a real `page`
+later would silently change the behaviour of requests that appeared to work.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
+| `unknown_parameter` | `400` | Query string contained a parameter the endpoint does not accept |
+| `invalid_query` | `400` | Query string could not be deserialized (e.g. a non-numeric `limit`) |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
@@ -1014,6 +1041,9 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 
+Any other query parameter is rejected with `400` `unknown_parameter` — see
+[Error Envelope](#error-envelope).
+
 `next_cursor` is `null` on the final page. To page through the history, start with a
 request that carries **no** `cursor`, then pass the previous response's `next_cursor`
 on each subsequent request.
@@ -1060,6 +1090,10 @@ look.
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
 | `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+Any other query parameter is rejected with `400` `unknown_parameter`. It matters
+most here, where `status` defaults to `failed`: a typo'd filter would otherwise
+answer with the dead-letter list and look entirely plausible.
 
 ```bash
 curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
@@ -1542,18 +1576,16 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 
-> [!IMPORTANT]
-> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
->
-> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+`db::migrate` is **the only schema definition in this repository.** There used to be a second, hand-synchronised one — a `migrations/` directory of numbered `.sql` files that nothing ever executed (no `sqlx::migrate!` call anywhere in the codebase) and that had silently drifted to the point of missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column: a database built from those files could not authenticate a request or record a settlement. It looked authoritative — numbered, in the conventional location — which made it actively misleading rather than merely unused, so it was removed rather than left as a second definition a future change could drift from again (issue #308). `tests/schema_snapshot_test.rs` now keeps `db::migrate` itself honest: it asserts a freshly migrated database matches the checked-in `tests/schema_snapshot.sql` exactly, so a schema change that isn't reflected there fails CI instead of drifting silently — the same failure mode the old `migrations/` directory had, closed by making the live schema self-verifying instead of hand-copied.
 
 **Changing the schema**
 
 1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
 2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
-3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
+3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately, and `tests/schema_snapshot_test.rs` will fail with the new schema's exact text, ready to paste into `tests/schema_snapshot.sql`.
+4. Review the snapshot diff like any other schema change, and update this section's tables/docs if you added something a reader would need to know about.
 
-Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
+Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 (adopting `sqlx::migrate!` with a recorded schema version) first rather than working around it — that is the bigger, separate change this snapshot test deliberately does not attempt to replace.
 
 ---
 
@@ -1580,6 +1612,7 @@ CI enforces all four on every pull request, plus a [`cargo audit`](https://githu
 | `tests/webhook_dispatch_tests.rs` | Signing, retries, redrive |
 | `tests/trustline_tests.rs` | Asset trustline checks |
 | `tests/db_shared_memory_tests.rs` | Proves the shared-cache in-memory SQLite fixture (below) is actually shared across pooled connections |
+| `tests/schema_snapshot_test.rs` | `db::migrate`'s output matches the checked-in `tests/schema_snapshot.sql` exactly |
 
 Integration tests run against an in-memory SQLite database and a [wiremock](https://github.com/LukeMathWalker/wiremock-rs) HTTP server — no network access or external services required.
 

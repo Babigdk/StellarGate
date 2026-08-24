@@ -1543,6 +1543,102 @@ async fn test_list_invalid_status() {
     res.assert_status(StatusCode::BAD_REQUEST);
 }
 
+/// Regression for #352: a query parameter the listing does not know is a 400
+/// naming it, not a silently unfiltered first page.
+///
+/// `?stauts=completed` used to return `200 OK` listing every payment including
+/// pending ones, so a merchant reconciling server-side would read unpaid
+/// intents as paid. `?page` / `?per_page` are the other shapes of the same
+/// mistake: plausible names this API has never accepted.
+#[tokio::test]
+async fn test_list_rejects_unknown_query_parameter() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    for (query, offender) in [
+        ("stauts=completed", "stauts"),
+        ("page=2", "page"),
+        ("per_page=50", "per_page"),
+    ] {
+        let res = server
+            .get(&format!("/payments?{query}"))
+            .add_header("Authorization", auth.clone())
+            .await;
+        res.assert_status(StatusCode::BAD_REQUEST);
+        let body = res.json::<Value>();
+        assert_eq!(body["code"], "unknown_parameter", "for ?{query}");
+        // The message must name the offending key, or the caller is left
+        // guessing which of their parameters was wrong.
+        assert!(
+            body["error"].as_str().unwrap().contains(offender),
+            "error for ?{query} must name `{offender}`, got: {}",
+            body["error"]
+        );
+    }
+}
+
+/// The strictness must not cost the parameters the listing does accept: every
+/// one of them, together, still answers 200.
+#[tokio::test]
+async fn test_list_accepts_every_documented_parameter() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?status=pending&limit=5&offset=0&include_total=true")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status_ok();
+    assert!(res.json::<Value>()["total"].is_number());
+}
+
+/// The same guard on both webhook-delivery listings. It matters most on the
+/// merchant-wide one, where `status` defaults to `failed`: a typo'd filter
+/// would answer with the dead-letter list and look entirely plausible.
+#[tokio::test]
+async fn test_webhook_listings_reject_unknown_query_parameter() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .get(&format!("/payments/{id}/webhooks?staus=failed"))
+        .add_header("Authorization", auth.clone())
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "unknown_parameter");
+
+    let res = server
+        .get("/payments/webhooks?staus=pending")
+        .add_header("Authorization", auth)
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "unknown_parameter");
+}
+
+/// A malformed *value* stays a 400 too, but under its own code — a caller
+/// branching on `unknown_parameter` must not also catch `?limit=abc`.
+#[tokio::test]
+async fn test_list_rejects_malformed_parameter_value() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?limit=abc")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_query");
+}
+
 /// No code path ever writes `failed` to a payment — underpayment settles as
 /// `underpaid` — so accepting it as a filter would only ever return an empty
 /// page while implying the gateway has a lifecycle state it doesn't.
@@ -2601,6 +2697,78 @@ async fn test_redeliver_echoes_the_original_event_type() {
         received[0].headers.get("X-StellarGate-Event").unwrap(),
         "payment.underpaid",
         "redelivered header must match the event the payload carries"
+    );
+}
+
+/// Manual redeliveries must not share the automatic redrive budget (issue #235).
+#[tokio::test]
+async fn test_manual_redeliver_does_not_consume_automatic_attempts() {
+    let mock = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/hook"))
+        .respond_with(wiremock::ResponseTemplate::new(500))
+        .expect(3)
+        .mount(&mock)
+        .await;
+
+    let mut cfg = make_config();
+    cfg.webhook_allow_private_targets = true;
+    let (server, pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+    let id = server
+        .post("/payments")
+        .add_header("Authorization", auth.clone())
+        .json(&json!({ "amount": "5", "asset": "XLM" }))
+        .await
+        .json::<Value>()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    stellargate::db::save_webhook_delivery(
+        &pool,
+        "delivery-manual",
+        &id,
+        &format!("{}/hook", mock.uri()),
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    stellargate::db::update_webhook_delivery(&pool, "delivery-manual", "failed", 2)
+        .await
+        .unwrap();
+
+    for _ in 0..3 {
+        let res = server
+            .post(&format!(
+                "/payments/{id}/webhooks/delivery-manual/redeliver"
+            ))
+            .add_header("Authorization", auth.clone())
+            .await;
+        // Endpoint returns 502 when the target rejects — that is fine; we care
+        // about the counters, not the HTTP success of the merchant call.
+        assert!(
+            res.status_code().as_u16() == 502 || res.status_code().is_success(),
+            "unexpected status {}",
+            res.status_code()
+        );
+    }
+
+    let listed = server
+        .get(&format!("/payments/{id}/webhooks"))
+        .add_header("Authorization", auth)
+        .await
+        .json::<Value>();
+    let d = &listed["deliveries"][0];
+    assert_eq!(
+        d["attempts"], 2,
+        "automatic attempts must stay put; got {listed}"
+    );
+    assert_eq!(
+        d["manual_attempts"], 3,
+        "manual_attempts must count each click; got {listed}"
     );
 }
 
