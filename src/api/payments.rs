@@ -650,7 +650,7 @@ const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired
 /// silently-shortened page as "end of results" and stop early (issue #258).
 /// Matches the existing `invalid_status`/`invalid_cursor` convention: reject
 /// rather than coerce.
-fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
+pub fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
     match limit {
         None => Ok(default),
         Some(n) if (1..=max).contains(&n) => Ok(n),
@@ -783,7 +783,7 @@ pub async fn list(
     }
 }
 
-fn encode_cursor(ts: &str, id: &str) -> String {
+pub fn encode_cursor(ts: &str, id: &str) -> String {
     hex::encode(format!("{ts}\t{id}"))
 }
 
@@ -792,7 +792,7 @@ fn encode_cursor(ts: &str, id: &str) -> String {
 /// tight, so it rejects only what could not possibly be a real cursor.
 const MAX_CURSOR_HEX_LEN: usize = 256;
 
-fn decode_cursor(raw: &str) -> Option<(String, String)> {
+pub fn decode_cursor(raw: &str) -> Option<(String, String)> {
     // Cheap rejections first: an oversized or non-hex string is rejected
     // before it is ever allocated or decoded (issue #304).
     if raw.len() > MAX_CURSOR_HEX_LEN || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {

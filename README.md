@@ -775,7 +775,22 @@ curl -X POST http://localhost:3000/merchants/$MERCHANT_ID/keys \
 ### `GET /merchants/:id/keys`
 
 List a merchant's keys, including revoked ones so the history stays visible.
-Admin only.
+Admin only. Keyset (cursor) paginated with the same conventions as
+[`GET /payments`](#get-payments) — revoked keys are never deleted, so a
+merchant that rotates regularly accumulates rows without bound, and this
+endpoint used to return every one of them in a single unbounded response
+(issue #262).
+
+| Param | Default | Notes |
+|---|---|---|
+| `limit` | 20 (max 100) | Page size. Rejected with `400 invalid_limit` outside `1..=100`, not silently clamped. |
+| `cursor` | _(unset)_ | Opaque cursor from a previous response's `next_cursor`. Omit for the first page. |
+| `active` | _(unset — both)_ | `true` returns only usable keys, `false` only revoked ones. Omitted returns both. |
+
+```bash
+curl "http://localhost:3000/merchants/$MERCHANT_ID/keys?limit=20&active=true" \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
+```
 
 **`200 OK`**
 
@@ -792,7 +807,9 @@ Admin only.
       "revoked_at": null,
       "active": true
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": null
 }
 ```
 
@@ -802,6 +819,12 @@ deciding which to revoke. `last_used_at` is refreshed at most once a minute per
 key: it runs on every authenticated request, and SQLite takes a write lock per
 update, so touching it unconditionally would put a write in the path of every
 read.
+
+A full page (`keys.len() == limit`) mints `next_cursor` from its last row; pass
+it back as `cursor` to fetch the next page. A short page (or an empty one)
+returns `next_cursor: null`, meaning there is nothing more. `active=true` lets
+an operator looking for currently-usable keys skip straight past the revoked
+history instead of paging through it to find them.
 
 ---
 
