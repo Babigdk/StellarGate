@@ -201,7 +201,9 @@ pub struct Config {
     pub port: u16,
     pub database_url: String,
     pub network: String,
-    pub horizon_url: String,
+    /// Parsed and validated once at boot so every Horizon request starts from
+    /// a typed URL rather than reparsing or trimming an arbitrary string.
+    pub horizon_url: reqwest::Url,
     pub gateway_public: String,
     /// Assets the gateway will accept, validated on POST /payments.
     /// Duplicate codes are rejected at boot (issue #222). Non-native entries
@@ -423,8 +425,10 @@ impl Config {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
         let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-        let horizon_url = std::env::var("STELLAR_HORIZON_URL")
-            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let horizon_url = Self::parse_horizon_url(
+            &std::env::var("STELLAR_HORIZON_URL")
+                .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+        )?;
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
@@ -568,6 +572,39 @@ impl Config {
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+
+    /// Parse and normalize the Horizon base URL during configuration loading.
+    /// Request-specific paths and queries are appended later with `Url`'s
+    /// segment and query-pair APIs, so a base query or fragment would be
+    /// ambiguous and is rejected here rather than silently overwritten.
+    fn parse_horizon_url(raw: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(raw).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: {e}. Expected an absolute HTTP(S) URL."
+            )
+        })?;
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: scheme must be http or https"
+            ));
+        }
+        if url.cannot_be_a_base() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: URL cannot be used as a base"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: base URL must not contain a query or fragment"
+            ));
+        }
+
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
+            .pop_if_empty();
+        Ok(url)
     }
 
     /// Reject configured Stellar addresses — the gateway account and any asset
@@ -1095,7 +1132,7 @@ mod tests {
             port: 3000,
             database_url: "sqlite:test.db".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "GPUBLIC".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
@@ -1188,7 +1225,7 @@ mod tests {
             port: 3000,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "UNCONFIGURED".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: String::new(),
@@ -1589,6 +1626,52 @@ mod tests {
                     "a-very-long-and-secure-webhook-signing-secret-32-chars"
                 );
                 assert_eq!(cfg.cors_allowed_origins, vec!["https://example.com"]);
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_horizon_url_fails_during_configuration() {
+        for invalid in [
+            "not a url",
+            "ftp://horizon.example",
+            "https://horizon.example?tenant=wrong",
+            "https://horizon.example/#fragment",
+        ] {
+            run_with_env(
+                &[
+                    ("STELLAR_NETWORK", Some("testnet")),
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    ("STELLAR_HORIZON_URL", Some(invalid)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(
+                        err.contains("STELLAR_HORIZON_URL"),
+                        "startup error must identify the invalid variable; got: {err}"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn horizon_url_is_parsed_and_normalized_during_configuration() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon.example/custom/base/"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(
+                    cfg.horizon_url.as_str(),
+                    "https://horizon.example/custom/base"
+                );
             },
         );
     }

@@ -81,7 +81,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: String::new(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
             // A real-looking Stellar strkey so Config::validate_addresses passes.
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets,

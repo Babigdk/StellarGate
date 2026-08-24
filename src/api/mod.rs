@@ -1338,12 +1338,11 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Probe Horizon with a hard 3-second timeout.
 /// Returns Ok(()) when reachable (any non-5xx response), or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
-    let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let result = tokio::time::timeout(
         Duration::from_millis(3_000),
         state
             .http
-            .get(&url)
+            .get(state.config.horizon_url.clone())
             .header("Accept", "application/json")
             .send(),
     )
