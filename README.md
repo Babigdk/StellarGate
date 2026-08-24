@@ -659,11 +659,38 @@ edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
 always taken the merchant from the API key, so a client that sent it believed
 it was choosing the tenant and was not.
 
+**Query strings are closed too.** The listing endpoints accept exactly the
+parameters documented for them, and anything else is rejected with `400`
+`unknown_parameter` naming the offending key:
+
+```bash
+curl "http://localhost:3000/v1/payments?stauts=completed" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+```json
+{
+  "error": "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`",
+  "code": "unknown_parameter"
+}
+```
+
+The cost of the old behaviour was the same as for bodies, and quieter: a
+discarded filter is an unfiltered page returned as `200 OK`, so
+`?stauts=completed` listed every payment including pending ones and a
+reconciliation script that filtered server-side read unpaid intents as paid.
+`?page` and `?per_page` are the other common shapes of this — plausible
+pagination names that this API has never used. Closing the parameter set also
+keeps it evolvable: while unknown parameters were ignored, adding a real `page`
+later would silently change the behaviour of requests that appeared to work.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
+| `unknown_parameter` | `400` | Query string contained a parameter the endpoint does not accept |
+| `invalid_query` | `400` | Query string could not be deserialized (e.g. a non-numeric `limit`) |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
 | `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
@@ -926,6 +953,9 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
+Any other query parameter is rejected with `400` `unknown_parameter` — see
+[Error Envelope](#error-envelope).
+
 **`200 OK`** — cursor mode (no `cursor` parameter on the first request)
 
 ```json
@@ -1003,6 +1033,9 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
 
+Any other query parameter is rejected with `400` `unknown_parameter` — see
+[Error Envelope](#error-envelope).
+
 `next_cursor` is `null` on the final page. To page through the history, start with a
 request that carries **no** `cursor`, then pass the previous response's `next_cursor`
 on each subsequent request.
@@ -1049,6 +1082,10 @@ look.
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
 | `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+Any other query parameter is rejected with `400` `unknown_parameter`. It matters
+most here, where `status` defaults to `failed`: a typo'd filter would otherwise
+answer with the dead-letter list and look entirely plausible.
 
 ```bash
 curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
