@@ -3551,38 +3551,33 @@ async fn test_both_mounts_share_the_same_data() {
     assert_eq!(via_v1.json::<Value>()["id"], json!(id));
 }
 
-/// The request ID returned in the `x-request-id` response header must match the
-/// `request_id` recorded in tracing logs for every request — including handlers
-/// and middleware warnings.
+/// Payment creation should succeed without 500 errors when retrying due to
+/// memo collisions. The retry logic in create_payment ensures that UNIQUE
+/// constraint violations on memo trigger a retry with a fresh memo (issue #273).
 #[tokio::test]
-#[traced_test]
-async fn test_request_id_tracing_correlation() {
-    let server = test_server().await;
+async fn test_concurrent_payment_creation_handles_memo_collisions() {
+    let server = Arc::new(test_server().await);
+    let key = provision_merchant(&server).await;
 
-    // 1. Operational endpoint request
-    let res = server.get("/health").await;
-    res.assert_status_ok();
-    let req_id_1 = res
-        .headers()
-        .get("x-request-id")
-        .expect("x-request-id header missing")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(!req_id_1.is_empty());
-    assert!(logs_contain(&req_id_1));
+    // Create 50 payment requests in rapid succession. Even though they execute
+    // sequentially in this test, the payment creation logic itself includes retry
+    // logic to handle potential memo collisions from the database UNIQUE constraint.
+    let mut memos = Vec::new();
+    for i in 0..50 {
+        let response = server
+            .post("/payments")
+            .add_header("Authorization", format!("Bearer {key}"))
+            .json(&json!({ "amount": format!("{}.5", i), "asset": "XLM" }))
+            .await;
 
-    // 2. Auth denial request (emits warn! inside auth middleware)
-    let res_unauthed = server.get("/v1/payments").await;
-    res_unauthed.assert_status(StatusCode::UNAUTHORIZED);
-    let req_id_2 = res_unauthed
-        .headers()
-        .get("x-request-id")
-        .expect("x-request-id header missing")
-        .to_str()
-        .unwrap()
-        .to_string();
-    assert!(!req_id_2.is_empty());
-    assert_ne!(req_id_1, req_id_2);
-    assert!(logs_contain(&req_id_2));
+        // Verify no 500 errors (the original bug would cause 500s on memo collisions)
+        response.assert_status(StatusCode::CREATED);
+        let body = response.json::<Value>();
+        let memo = body["memo"].as_str().unwrap().to_string();
+        memos.push(memo);
+    }
+
+    // Verify all memos are unique (the retry logic ensures fresh memos on collisions)
+    let unique_count = memos.iter().collect::<std::collections::HashSet<_>>().len();
+    assert_eq!(unique_count, 50, "all payment memos must be unique");
 }

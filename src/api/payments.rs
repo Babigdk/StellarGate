@@ -423,23 +423,41 @@ pub async fn create(
         }
     }
 
-    let memo = generate_unique_memo(&state.pool).await?;
-
-    let payment = db::create_payment(
-        &state.pool,
-        db::NewPayment {
-            id: &id,
-            merchant_id: &merchant_id,
-            destination_address: &state.config.gateway_public,
-            memo: &memo,
-            amount: &body.amount,
-            asset: &asset,
-            asset_issuer,
-            webhook_url: body.webhook_url.as_deref(),
-            ttl_secs: state.config.payment_ttl_secs as i64,
-        },
-    )
-    .await?;
+    // Retry loop to handle UNIQUE constraint violations on memo generation.
+    // Each iteration generates a fresh memo and attempts to create the payment.
+    // If the memo collides (concurrent request claimed the same memo), we retry
+    // with a new memo. Any other error is returned immediately.
+    let payment = 'retry: {
+        for _ in 0..10 {
+            let memo = generate_unique_memo();
+            match db::create_payment(
+                &state.pool,
+                db::NewPayment {
+                    id: &id,
+                    merchant_id: &merchant_id,
+                    destination_address: &state.config.gateway_public,
+                    memo: &memo,
+                    amount: &body.amount,
+                    asset: &asset,
+                    asset_issuer,
+                    webhook_url: body.webhook_url.as_deref(),
+                    ttl_secs: state.config.payment_ttl_secs as i64,
+                },
+            )
+            .await
+            {
+                Ok(p) => break 'retry p,
+                Err(err) if is_unique_violation(&err) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        // Exhausted retries after UNIQUE constraint violations
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "memo_collision_exhausted",
+            "unable to generate a unique memo after multiple retries",
+        ));
+    };
     state.payment_metrics.record_created();
 
     /* A merchant disputing a charge, or investigating a burst of unexpected
@@ -719,15 +737,9 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 }
 
 /// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
-/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
-/// used by *any* payment intent before — `memo_exists` checks the entire
-/// `payments` table, not just pending ones, so a memo is never reused for the
-/// lifetime of the database. That makes the collision probability for a
-/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
-/// times before giving up; exhausting that before billions of payments exist
-/// is effectively impossible. If traffic ever approaches that scale, widen
-/// the memo (more hex chars, still under the 28-byte limit) rather than
-/// switching scheme.
+/// well within Stellar's 28-byte text memo limit). Unlike a pre-check approach,
+/// this function does not verify uniqueness — the database UNIQUE constraint
+/// on the memo column is relied upon to enforce it.
 ///
 /// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
 /// (32-byte) because it's the simplest scheme that round-trips a
@@ -738,18 +750,21 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 /// same text as one of our hex memos. `horizon::HorizonPayment::memo()`
 /// guards against this by only matching when Horizon reports `memo_type:
 /// "text"` (see issue #17).
-async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
-    for _ in 0..10 {
-        let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
-        if !db::memo_exists(pool, &memo).await? {
-            return Ok(memo);
+fn generate_unique_memo() -> String {
+    Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase()
+}
+
+/// Checks if an error is a UNIQUE constraint violation.
+fn is_unique_violation(err: &anyhow::Error) -> bool {
+    if let Some(db_err) = err.downcast_ref::<sqlx::Error>() {
+        if let sqlx::Error::Database(db_error) = db_err {
+            // Check for UNIQUE constraint violation
+            // SQLite error message format: "UNIQUE constraint failed: table.column"
+            let msg = db_error.message();
+            return msg.contains("UNIQUE constraint failed");
         }
     }
-    Err(AppError::new(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal_error",
-        "memo generation failed",
-    ))
+    false
 }
 
 fn to_json(p: &db::Payment) -> Value {
