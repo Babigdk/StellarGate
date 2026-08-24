@@ -17,7 +17,7 @@ use stellargate::{
     db, horizon, AppState,
 };
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GATEWAY: &str = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
@@ -47,7 +47,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             port: 0,
             database_url: dsn,
             network: "testnet".into(),
-            horizon_url,
+            horizon_url: horizon_url.parse().unwrap(),
             gateway_public: GATEWAY.into(),
             accepted_assets: vec![AcceptedAsset {
                 code: "XLM".into(),
@@ -120,9 +120,10 @@ async fn fetch_recent_payments_reports_retry_after_on_429() {
         .await;
 
     let client = reqwest::Client::new();
-    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-        .await
-        .expect_err("a 429 must be reported as an error");
+    let err =
+        horizon::fetch_recent_payments(&client, &server.uri().parse().unwrap(), GATEWAY, "0", 200)
+            .await
+            .expect_err("a 429 must be reported as an error");
 
     let horizon_err = err
         .downcast_ref::<horizon::HorizonHttpError>()
@@ -143,9 +144,10 @@ async fn fetch_recent_payments_429_without_retry_after_has_none() {
         .await;
 
     let client = reqwest::Client::new();
-    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-        .await
-        .unwrap_err();
+    let err =
+        horizon::fetch_recent_payments(&client, &server.uri().parse().unwrap(), GATEWAY, "0", 200)
+            .await
+            .unwrap_err();
 
     let horizon_err = err.downcast_ref::<horizon::HorizonHttpError>().unwrap();
     assert!(horizon_err.is_rate_limited());
@@ -165,13 +167,47 @@ async fn fetch_recent_payments_500_is_not_rate_limited() {
         .await;
 
     let client = reqwest::Client::new();
-    let err = horizon::fetch_recent_payments(&client, &server.uri(), GATEWAY, "0", 200)
-        .await
-        .unwrap_err();
+    let err =
+        horizon::fetch_recent_payments(&client, &server.uri().parse().unwrap(), GATEWAY, "0", 200)
+            .await
+            .unwrap_err();
 
     let horizon_err = err.downcast_ref::<horizon::HorizonHttpError>().unwrap();
     assert!(!horizon_err.is_rate_limited());
     assert_eq!(horizon_err.retry_after, None);
+}
+
+/// A cursor is one opaque query value even when it contains characters that
+/// would change a manually interpolated query's structure.
+#[tokio::test]
+async fn fetch_recent_payments_encodes_an_opaque_cursor() {
+    let server = MockServer::start().await;
+    let cursor = "opaque&limit=1#+% whitespace";
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}/payments")))
+        .and(query_param("order", "asc"))
+        .and(query_param("cursor", cursor))
+        .and(query_param("limit", "200"))
+        .and(query_param("join", "transactions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "_embedded": { "records": [] }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = reqwest::Client::new();
+    let records = horizon::fetch_recent_payments(
+        &client,
+        &server.uri().parse().unwrap(),
+        GATEWAY,
+        cursor,
+        200,
+    )
+    .await
+    .unwrap();
+
+    assert!(records.is_empty());
 }
 
 /// `poll_once`'s catch-up loop stops after a bounded number of pages even

@@ -32,7 +32,7 @@ fn make_config() -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -406,7 +406,7 @@ async fn test_ready_fails_when_cursor_stale() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.set_last_success_unix(0); // never succeeded → maximally stale
@@ -434,7 +434,7 @@ async fn test_ready_ok_when_cursor_fresh() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.note_success();

@@ -32,7 +32,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: webhook_secret.into(),
