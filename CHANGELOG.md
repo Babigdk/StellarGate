@@ -129,6 +129,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixture is genuinely shared and that the old bare-DSN form is not, so the
   footgun can't be silently reintroduced (issue #309).
 
+- **Removed the stale `migrations/` directory; the live schema now verifies
+  itself.** The schema existed twice: as hand-written DDL inside
+  `db::migrate` (the only one that ever ran) and as SQL files in
+  `migrations/`, which nothing in the codebase read. The files had already
+  drifted — missing `merchants`, `api_keys`, `processed_transactions`, and
+  `webhook_deliveries.event_type` — so a database built from them could not
+  authenticate a request or record a settlement. They looked authoritative
+  (numbered, in the conventional location), which made a contributor or
+  reviewer trusting them actively misled rather than merely working from an
+  incomplete reference. `migrations/` is now deleted, and a new
+  `tests/schema_snapshot_test.rs` asserts a freshly migrated database matches
+  a checked-in `tests/schema_snapshot.sql` exactly, so a schema change that
+  isn't reflected there fails CI instead of drifting silently — the same
+  failure mode the old directory had, closed by making `db::migrate` itself
+  self-verifying instead of hand-copied. `CONTRIBUTING.md`, `DEPLOYMENT.md`,
+  and `SECURITY.md` no longer reference `migrations/`; `DEPLOYMENT.md` in
+  particular had claimed migrations were "recorded in `_sqlx_migrations`",
+  a table that has never existed in this codebase (issue #308).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC
