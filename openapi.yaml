@@ -181,7 +181,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/IssueKeyResponse"
         "400":
-          description: Label exceeds 100 characters, or the request body has an unrecognised field
+          description: Label exceeds 100 characters (or 400 bytes), contains a control character, or the request body has an unrecognised field
           content:
             application/json:
               schema:
@@ -190,7 +190,7 @@ paths:
                 invalid_label:
                   summary: Label too long
                   value:
-                    error: label exceeds max length of 100 characters
+                    error: label must be at most 100 characters
                     code: invalid_label
         "401":
           $ref: "#/components/responses/AdminUnauthorized"

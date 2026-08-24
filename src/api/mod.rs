@@ -600,6 +600,36 @@ struct SetRateLimitRequest {
     rate_limit_per_sec: Option<i64>,
 }
 
+/// A label is human text (rendered as-is in the dashboard), so its limit is
+/// counted in characters, not bytes — `str::len` is a byte count, and bounding
+/// it there means the effective limit depends on the alphabet: 100 ASCII
+/// characters, but only ~33 CJK characters or ~25 emoji (issue: API key label
+/// length-checked in bytes rather than characters). `MAX_LABEL_BYTES` is a
+/// separate, generous byte ceiling so a pathological input (e.g. combining
+/// characters) still can't bloat the stored row despite passing the character
+/// count.
+const MAX_LABEL_CHARS: usize = 100;
+const MAX_LABEL_BYTES: usize = 400;
+
+/// Validate a caller-supplied API key label: bounded in both characters and
+/// bytes, and free of control characters (it is rendered verbatim in the
+/// dashboard).
+fn validate_label(label: &str) -> Result<(), AppError> {
+    if label.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad_request(
+            "invalid_label",
+            "label must not contain control characters",
+        ));
+    }
+    if label.chars().count() > MAX_LABEL_CHARS || label.len() > MAX_LABEL_BYTES {
+        return Err(AppError::bad_request(
+            "invalid_label",
+            format!("label must be at most {MAX_LABEL_CHARS} characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /merchants/:id/keys` — issue an additional API key.
 ///
 /// Rotation is issue-then-revoke rather than replace-in-place: the new key is
@@ -622,12 +652,7 @@ async fn issue_api_key(
 
     let label = body.and_then(|b| b.label);
     if let Some(l) = &label {
-        if l.len() > 100 {
-            return Err(AppError::bad_request(
-                "invalid_label",
-                "label exceeds max length of 100 characters",
-            ));
-        }
+        validate_label(l)?;
     }
 
     let (raw_key, prefix) = db::generate_api_key();
