@@ -1,7 +1,29 @@
 use anyhow::Result;
 use sqlx::{Pool, Row, Sqlite};
+use tracing::info;
 
 pub type Db = Pool<Sqlite>;
+
+/// `kv_state` key namespace for one-time migration flags (issue #266). Distinct
+/// from the horizon poller's cursor keys and anything else `kv_state` holds.
+const MIGRATION_KEY_PREFIX: &str = "migration:";
+
+/// Whether the one-time migration `name` has already run against this
+/// database. Backed by `kv_state` as a cheap interim guard until a proper
+/// schema-version table exists — a full-table backfill or scan gated behind
+/// this runs at most once per database instead of on every boot.
+async fn migration_applied(pool: &Db, name: &str) -> Result<bool> {
+    Ok(get_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"))
+        .await?
+        .as_deref()
+        == Some("done"))
+}
+
+/// Record that the one-time migration `name` has completed, so future calls
+/// to [`migrate`] skip it.
+async fn mark_migration_applied(pool: &Db, name: &str) -> Result<()> {
+    set_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"), "done").await
+}
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
 ///
@@ -327,35 +349,57 @@ pub async fn migrate(pool: &Db) -> Result<()> {
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
     and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
-    it is safe to run on every startup. */
-    let legacy = sqlx::query(
-        "SELECT id, tx_hash, paid_amount FROM payments
-         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
-    )
-    .fetch_all(pool)
-    .await?;
-    for row in &legacy {
-        let id: String = row.get("id");
-        let tx_hash: String = row.get("tx_hash");
-        let paid_amount: String = row.get("paid_amount");
-        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
-            sqlx::query(
-                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-                 VALUES (?, ?, ?)
-                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
-            )
-            .bind(&id)
-            .bind(&tx_hash)
-            .bind(stroops)
-            .execute(pool)
-            .await?;
+    ledger for intents that are still in flight. This is a one-time upgrade
+    step: it only needs to run once per database, so it is gated behind a
+    `kv_state` flag rather than re-scanning the full `payments` table (and
+    re-issuing one INSERT per matching row) on every boot (issue #266).
+    Startup cost would otherwise grow, forever, with lifetime payment volume. */
+    const BACKFILL_PROCESSED_TRANSACTIONS: &str = "backfill_processed_transactions";
+    if migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await? {
+        info!(
+            migration = BACKFILL_PROCESSED_TRANSACTIONS,
+            "migration skipped (already applied)"
+        );
+    } else {
+        let legacy = sqlx::query(
+            "SELECT id, tx_hash, paid_amount FROM payments
+             WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut backfilled = 0u64;
+        for row in &legacy {
+            let id: String = row.get("id");
+            let tx_hash: String = row.get("tx_hash");
+            let paid_amount: String = row.get("paid_amount");
+            if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+                let result = sqlx::query(
+                    "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                     VALUES (?, ?, ?)
+                     ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+                )
+                .bind(&id)
+                .bind(&tx_hash)
+                .bind(stroops)
+                .execute(pool)
+                .await?;
+                backfilled += result.rows_affected();
+            }
         }
+        mark_migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await?;
+        info!(
+            migration = BACKFILL_PROCESSED_TRANSACTIONS,
+            candidates = legacy.len(),
+            backfilled,
+            "migration applied"
+        );
     }
 
     /* Normalise legacy rows that were written by the old datetime('now') default,
-    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). Safe to run on every
-    startup — the WHERE clause skips rows that are already RFC 3339.
+    which produced "YYYY-MM-DD HH:MM:SS" (space, no Z). This is a one-time
+    repair for rows written before the RFC 3339 format was enforced, so — like
+    the backfill above — it is gated behind a `kv_state` flag instead of
+    scanning both tables on every boot forever (issue #266).
 
     `expires_at` is included for the same reason as the others (issue #314):
     left in the legacy space-separated form, it sorts *before* every compliant
@@ -363,18 +407,32 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     in list_pending/expire_overdue/find_pending_by_memo reads such a row as
     already expired. It would never surface as a detectable payment again and
     would be swept on the very next expiry cycle. */
-    for tbl_col in [
-        ("payments", "created_at"),
-        ("payments", "updated_at"),
-        ("payments", "expires_at"),
-        ("webhook_deliveries", "created_at"),
-    ] {
-        let sql = format!(
-            "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
-            tbl_col.0,
-            col = tbl_col.1
+    const NORMALIZE_LEGACY_TIMESTAMPS: &str = "normalize_legacy_timestamps";
+    if migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await? {
+        info!(
+            migration = NORMALIZE_LEGACY_TIMESTAMPS,
+            "migration skipped (already applied)"
         );
-        sqlx::query(&sql).execute(pool).await?;
+    } else {
+        let mut normalized = 0u64;
+        for tbl_col in [
+            ("payments", "created_at"),
+            ("payments", "updated_at"),
+            ("payments", "expires_at"),
+            ("webhook_deliveries", "created_at"),
+        ] {
+            let sql = format!(
+                "UPDATE {} SET {col} = replace({col}, ' ', 'T') || 'Z' WHERE {col} NOT LIKE '%T%'",
+                tbl_col.0,
+                col = tbl_col.1
+            );
+            normalized += sqlx::query(&sql).execute(pool).await?.rows_affected();
+        }
+        mark_migration_applied(pool, NORMALIZE_LEGACY_TIMESTAMPS).await?;
+        info!(
+            migration = NORMALIZE_LEGACY_TIMESTAMPS,
+            normalized, "migration applied"
+        );
     }
 
     Ok(())
@@ -1667,6 +1725,36 @@ mod tests {
         pool
     }
 
+    /// The `payments` table exactly as it looks on disk before this binary's
+    /// first `migrate()` call ever runs against it — every column the current
+    /// code selects, but none of the `CHECK` constraints added since (they are
+    /// not retroactive to a table that already existed, see [`TS_PATTERN`]).
+    /// Used to seed "an existing deployment's database" for tests of one-time
+    /// migrations (issue #266) without going through `migrate()` first.
+    async fn create_legacy_payments_table(pool: &Db) {
+        sqlx::query(
+            "CREATE TABLE payments (
+                id TEXT PRIMARY KEY,
+                merchant_id TEXT NOT NULL DEFAULT 'anonymous',
+                destination_address TEXT NOT NULL,
+                memo TEXT NOT NULL UNIQUE,
+                amount TEXT NOT NULL,
+                asset TEXT NOT NULL DEFAULT 'XLM',
+                asset_issuer TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                webhook_url TEXT,
+                tx_hash TEXT,
+                paid_amount TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     /// An upgrade must not lock out merchants whose keys predate the
     /// `api_keys` table. This simulates a pre-upgrade database — the old
     /// `merchants.api_key_hash` schema with no `api_keys` table — runs the
@@ -1723,6 +1811,59 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    /// The `processed_transactions` backfill (issue #266) must scan the
+    /// `payments` table at most once per database, not on every boot.
+    ///
+    /// Simulates an upgrade: a payment row already carries a legacy
+    /// `tx_hash`/`paid_amount` pair before `migrate()` ever runs. The first
+    /// call must backfill it into `processed_transactions`; a second call
+    /// must leave the table alone rather than re-scanning `payments` and
+    /// re-inserting.
+    #[tokio::test]
+    async fn processed_transactions_backfill_runs_at_most_once() {
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .await
+            .unwrap();
+
+        // Full pre-migration payments schema, with a settled legacy row
+        // already present — exactly what an existing deployment's database
+        // looks like the moment this migration ships.
+        create_legacy_payments_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO payments (id, destination_address, memo, amount, tx_hash, paid_amount)
+             VALUES ('pay1', 'GDEST', 'memo1', '10.0000000', 'legacytxhash', '10.0000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        assert_eq!(
+            sum_processed_stroops(&pool, "pay1").await.unwrap(),
+            100_000_000,
+            "the first migrate() call must backfill the legacy row"
+        );
+
+        // Clear the backfilled row. If the second migrate() call re-scans
+        // `payments` and redoes the backfill, this row comes back; if it
+        // correctly skips, it stays gone.
+        sqlx::query("DELETE FROM processed_transactions")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        migrate(&pool).await.unwrap();
+
+        assert_eq!(
+            sum_processed_stroops(&pool, "pay1").await.unwrap(),
+            0,
+            "a second migrate() call must not re-run the one-time backfill"
         );
     }
 
@@ -1925,17 +2066,11 @@ mod tests {
     /// expired just because it sorts lexically before an RFC 3339 `"…T…Z"`
     /// string, even when the date it encodes is far in the future.
     ///
-    /// Bypasses the `expires_at` `CHECK` constraint via
-    /// `PRAGMA ignore_check_constraints`, on a single held connection so the
-    /// pragma and the write land on the same session — exactly how a
-    /// pre-#314 row would already exist on disk before an upgrade, since the
-    /// constraint is not retroactive for a table that already existed.
+    /// Writes directly into a table created by [`create_legacy_payments_table`],
+    /// which carries none of the `expires_at` `CHECK` constraints added since
+    /// issue #314 — exactly how a pre-#314 row would already exist on disk
+    /// before an upgrade.
     async fn seed_legacy_format_expiry(pool: &Db, id: &str, memo: &str, legacy_expires_at: &str) {
-        let mut conn = pool.acquire().await.unwrap();
-        sqlx::query("PRAGMA ignore_check_constraints = 1")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
         sqlx::query(
             "INSERT INTO payments
                 (id, merchant_id, destination_address, memo, amount, asset, status, expires_at)
@@ -1944,18 +2079,25 @@ mod tests {
         .bind(id)
         .bind(memo)
         .bind(legacy_expires_at)
-        .execute(&mut *conn)
+        .execute(pool)
         .await
         .unwrap();
-        sqlx::query("PRAGMA ignore_check_constraints = 0")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]
     async fn legacy_format_expiry_far_in_the_future_is_fixed_by_normalisation_and_then_findable() {
-        let pool = memory_db().await;
+        // Built directly, not via `memory_db()`: the timestamp-normalisation
+        // migration now runs at most once per database (issue #266), so the
+        // legacy row must exist on disk *before* `migrate()` ever runs, the
+        // same way it would on a real upgrade — seeding it after an initial
+        // `migrate()` call would find nothing to normalise and mark the
+        // migration done with the row still unfixed.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .await
+            .unwrap();
+        create_legacy_payments_table(&pool).await;
         // 5 minutes from now, same calendar day in the overwhelming majority
         // of runs — deliberately *not* a different year or day, since a
         // different leading date digit would make the row compare greater
@@ -2009,7 +2151,14 @@ mod tests {
     /// must not accidentally make every legacy row look perpetually fresh.
     #[tokio::test]
     async fn legacy_format_expiry_in_the_past_is_still_expired_after_normalisation() {
-        let pool = memory_db().await;
+        // See the comment on the sibling test above: seeded before the first
+        // `migrate()` call so there is something for that call to normalise.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
+            .await
+            .unwrap();
+        create_legacy_payments_table(&pool).await;
         seed_legacy_format_expiry(&pool, "legacy-dead", "MEMODEAD", "2020-01-01 00:00:00").await;
 
         migrate(&pool).await.unwrap();
@@ -2349,25 +2498,35 @@ mod tests {
 
     #[tokio::test]
     async fn migrate_backfills_processed_transactions_from_legacy_rows() {
-        let pool = memory_db().await;
-        create_payment(&pool, new_payment("legacy", "MEMOLEG", 3600))
+        // Built directly, not via `memory_db()`: the backfill now runs at
+        // most once per database (issue #266), so the legacy row must exist
+        // on disk before migrate()'s first call, the same way it would on a
+        // real pre-#119 upgrade — see `processed_transactions_backfill_runs_at_most_once`.
+        let pool = SqlitePoolOptions::new()
+            .min_connections(1)
+            .connect_with(SqliteConnectOptions::from_str(&shared_memory_dsn()).unwrap())
             .await
             .unwrap();
-        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and the
-        // cumulative paid_amount were persisted.
-        update_payment_status(&pool, "legacy", "underpaid", "TX_OLD", "3")
-            .await
-            .unwrap();
-        // The join table is empty until a backfill runs.
-        assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
+        create_legacy_payments_table(&pool).await;
+        // Simulate a pre-#119 underpaid intent: only the latest tx_hash and
+        // the cumulative paid_amount were persisted, no join-table row.
+        sqlx::query(
+            "INSERT INTO payments (id, destination_address, memo, amount, status, tx_hash, paid_amount)
+             VALUES ('legacy', 'GGATEWAY', 'MEMOLEG', '10', 'underpaid', 'TX_OLD', '3')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        // A subsequent migrate() (as on the next startup) backfills the ledger.
+        // The first migrate() call (as on the next startup after upgrade)
+        // backfills the ledger.
         migrate(&pool).await.unwrap();
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
             30_000_000
         );
-        // And it is idempotent across restarts.
+        // And it is safe to call again — the backfill runs at most once, so
+        // the ledger is not re-summed or duplicated.
         migrate(&pool).await.unwrap();
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
