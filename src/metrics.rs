@@ -223,6 +223,10 @@ struct HorizonMetricsInner {
     rate_limited: AtomicU64,
     /// Cycles that failed for any other reason.
     error: AtomicU64,
+    /// Distinct incidents where one cursor produced three consecutive
+    /// non-rate-limit 4xx responses. Incremented once per streak so alerts are
+    /// actionable without turning every retry into a second incident.
+    repeated_cursor_4xx: AtomicU64,
     /// Times the SSE stream listener reconnected — a closed connection, an
     /// HTTP error, or (issue #312) an idle timeout with no error at all. A
     /// persistently-reconnecting stream is the alertable signal that a
@@ -242,6 +246,7 @@ impl Default for HorizonMetricsInner {
             success: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             error: AtomicU64::new(0),
+            repeated_cursor_4xx: AtomicU64::new(0),
             stream_reconnects: AtomicU64::new(0),
             cursor_age_secs: AtomicI64::new(0),
         }
@@ -263,6 +268,11 @@ impl HorizonMetrics {
     }
     pub fn record_error(&self) {
         self.inner.error.fetch_add(1, Ordering::Relaxed);
+    }
+    pub fn record_repeated_cursor_4xx(&self) {
+        self.inner
+            .repeated_cursor_4xx
+            .fetch_add(1, Ordering::Relaxed);
     }
     pub fn record_stream_reconnect(&self) {
         self.inner.stream_reconnects.fetch_add(1, Ordering::Relaxed);
@@ -286,6 +296,9 @@ impl HorizonMetrics {
     }
     pub fn error(&self) -> u64 {
         self.inner.error.load(Ordering::Relaxed)
+    }
+    pub fn repeated_cursor_4xx(&self) -> u64 {
+        self.inner.repeated_cursor_4xx.load(Ordering::Relaxed)
     }
     pub fn stream_reconnects(&self) -> u64 {
         self.inner.stream_reconnects.load(Ordering::Relaxed)
@@ -842,6 +855,15 @@ pub fn render(
         horizon.error()
     ));
 
+    out.push_str(
+        "# HELP stellargate_horizon_repeated_cursor_4xx_total Horizon cursor incidents that reached three consecutive non-rate-limit 4xx responses.\n",
+    );
+    out.push_str("# TYPE stellargate_horizon_repeated_cursor_4xx_total counter\n");
+    out.push_str(&format!(
+        "stellargate_horizon_repeated_cursor_4xx_total {}\n",
+        horizon.repeated_cursor_4xx()
+    ));
+
     // stellargate_horizon_stream_reconnects_total — counter (#312)
     out.push_str(
         "# HELP stellargate_horizon_stream_reconnects_total Total times the Horizon SSE stream listener reconnected.\n",
@@ -1227,6 +1249,25 @@ mod tests {
             rendered.contains("stellargate_horizon_cursor_age_seconds 37"),
             "got:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn repeated_cursor_4xx_incidents_are_exported_as_a_counter() {
+        let horizon = HorizonMetrics::new();
+        horizon.record_repeated_cursor_4xx();
+        assert_eq!(horizon.repeated_cursor_4xx(), 1);
+
+        let rendered = render_all(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &horizon,
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+        );
+        assert!(rendered.contains("# TYPE stellargate_horizon_repeated_cursor_4xx_total counter"));
+        assert!(rendered.contains("stellargate_horizon_repeated_cursor_4xx_total 1"));
     }
 
     // ── DbSnapshot ───────────────────────────────────────────────────────

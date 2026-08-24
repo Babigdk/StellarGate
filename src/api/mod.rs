@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -175,7 +175,22 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+                let request_id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .and_then(|id| id.header_value().to_str().ok())
+                    .unwrap_or("-");
+                tracing::info_span!(
+                    "http",
+                    %request_id,
+                    method = %req.method(),
+                    uri = %req.uri(),
+                    version = ?req.version()
+                )
+            }),
+        )
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
         .layer(middleware::from_fn_with_state(
@@ -187,6 +202,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        /* Outer to every layer that can answer with a bare, framework-generated
+        405/413/408 (the router's own method-not-allowed fallback, the
+        `RequestBodyLimitLayer` short-circuit on a known-oversized
+        Content-Length, and the timeout above), so it sees and rewrites all of
+        them into the documented JSON envelope (issue #256). */
+        .layer(middleware::from_fn(json_error_envelope_middleware))
         /* Outermost so it measures the complete request lifecycle — including
         a 429 from the rate limiter or a 408 from the timeout above — and
         records the true final status and total latency (issue: missing
@@ -196,6 +217,51 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             http_metrics_middleware,
         ))
         .with_state(state)
+}
+
+/// Rewrites the bare, empty-body responses axum and `tower_http` generate for
+/// `405 Method Not Allowed`, `413 Payload Too Large`, and `408 Request
+/// Timeout` into the documented `{"error": "...", "code": "..."}` envelope
+/// (issue #256). Without this, a client parsing the documented contract gets
+/// a JSON decode failure instead of an error it can act on — the dashboard's
+/// own `api()` helper illustrates the cost, falling back to `res.json().catch(()
+/// => ({}))` and reporting just the bare status.
+///
+/// Applied outer to the router, CORS, the rate limiters, `RequestBodyLimitLayer`
+/// and `TimeoutLayer`, so it sees every response those can produce. A response
+/// that already carries a JSON body (an oversized body caught by `JsonBody`'s
+/// own rejection handling, for instance — see issue #257) is left untouched
+/// rather than risk overwriting it.
+async fn json_error_envelope_middleware(req: Request, next: Next) -> axum::response::Response {
+    let mut res = next.run(req).await;
+
+    let (code, message) = match res.status() {
+        StatusCode::METHOD_NOT_ALLOWED => ("method_not_allowed", "method not allowed"),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "payload_too_large",
+            "request body exceeds the maximum allowed size",
+        ),
+        StatusCode::REQUEST_TIMEOUT => ("request_timeout", "request timed out"),
+        _ => return res,
+    };
+
+    let already_json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if already_json {
+        return res;
+    }
+
+    *res.body_mut() = axum::body::Body::from(json!({ "error": message, "code": code }).to_string());
+    let headers = res.headers_mut();
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    res
 }
 
 /// The versioned API surface: everything that forms the public contract.
@@ -926,8 +992,9 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
-fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    let path = req.uri().path();
+pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
+    let raw_path = req.uri().path();
+    let path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
     if path == "/health" || path == "/ready" || path == "/metrics" {
         return None;
     }
@@ -951,7 +1018,7 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
 ///
 /// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
 /// higher allowance (× 5) so normal API consumers aren't throttled by polling.
-fn bucket_rate_multiplier(bucket: &str) -> u32 {
+pub fn bucket_rate_multiplier(bucket: &str) -> u32 {
     match bucket {
         "payments" | "merchants" | "redeliver" => 1,
         _ => 5,
@@ -1287,12 +1354,11 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Probe Horizon with a hard 3-second timeout.
 /// Returns Ok(()) when reachable (any non-5xx response), or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
-    let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let result = tokio::time::timeout(
         Duration::from_millis(3_000),
         state
             .http
-            .get(&url)
+            .get(state.config.horizon_url.clone())
             .header("Accept", "application/json")
             .send(),
     )
@@ -1658,5 +1724,46 @@ mod tests {
             rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
             Some("default")
         );
+    }
+
+    #[test]
+    fn test_rate_limit_bucket_assignment_all_routes() {
+        use axum::http::Method;
+        let cases = [
+            (Method::POST, "/payments", Some("payments")),
+            (Method::POST, "/v1/payments", Some("payments")),
+            (Method::POST, "/merchants", Some("merchants")),
+            (Method::POST, "/v1/merchants", Some("merchants")),
+            (
+                Method::POST,
+                "/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (
+                Method::POST,
+                "/v1/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (Method::GET, "/health", None),
+            (Method::GET, "/v1/health", None),
+        ];
+
+        for (method, path, expected_bucket) in cases {
+            let req = method_req(method.clone(), path);
+            assert_eq!(
+                rate_limited_bucket(&req),
+                expected_bucket,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_rate_multiplier() {
+        assert_eq!(bucket_rate_multiplier("payments"), 1);
+        assert_eq!(bucket_rate_multiplier("merchants"), 1);
+        assert_eq!(bucket_rate_multiplier("redeliver"), 1);
+        assert_eq!(bucket_rate_multiplier("default"), 5);
+        assert_eq!(bucket_rate_multiplier("unknown"), 5);
     }
 }

@@ -3,7 +3,7 @@
 //! The broader API tests run at a high limit and exercise merchant auth heavily.
 //! Keeping the low-quota assertion here makes the expected 429 path explicit.
 
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -29,7 +29,7 @@ fn make_config(rate_limit_requests_per_sec: u32) -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -652,4 +652,256 @@ async fn probe_responses_carry_no_rate_limit_headers() {
              a generous quota"
         );
     }
+}
+
+// ── Rate-limit bucket assignment & route enumeration guard (Issue #291) ──────
+
+/// Complete test matrix of (Method, Path, ExpectedBucket).
+///
+/// Contains explicit expectations for all registered routes in the application
+/// (both unversioned legacy routes and `/v1`-prefixed routes) as well as
+/// acceptance criteria cases with dynamic parameter values.
+const ROUTE_BUCKET_EXPECTATIONS: &[(Method, &str, Option<&str>)] = &[
+    // Acceptance criteria exact cases
+    (Method::POST, "/payments", Some("payments")),
+    (Method::POST, "/v1/payments", Some("payments")),
+    (Method::POST, "/merchants", Some("merchants")),
+    (Method::POST, "/v1/merchants", Some("merchants")),
+    (
+        Method::POST,
+        "/payments/x/webhooks/y/redeliver",
+        Some("redeliver"),
+    ),
+    (
+        Method::POST,
+        "/v1/payments/x/webhooks/y/redeliver",
+        Some("redeliver"),
+    ),
+    (Method::GET, "/health", None),
+    (Method::GET, "/v1/health", None),
+    // Operational endpoints (exempt from rate limiting)
+    (Method::GET, "/", Some("default")),
+    (Method::GET, "/ready", None),
+    (Method::GET, "/v1/ready", None),
+    (Method::GET, "/metrics", None),
+    (Method::GET, "/v1/metrics", None),
+    (Method::GET, "/dashboard", Some("default")),
+    (Method::GET, "/dashboard/app.css", Some("default")),
+    (Method::GET, "/dashboard/app.js", Some("default")),
+    // Merchants endpoints
+    (Method::POST, "/merchants/:id/keys", Some("default")),
+    (Method::POST, "/v1/merchants/:id/keys", Some("default")),
+    (Method::GET, "/merchants/:id/keys", Some("default")),
+    (Method::GET, "/v1/merchants/:id/keys", Some("default")),
+    (
+        Method::DELETE,
+        "/merchants/:id/keys/:key_id",
+        Some("default"),
+    ),
+    (
+        Method::DELETE,
+        "/v1/merchants/:id/keys/:key_id",
+        Some("default"),
+    ),
+    (Method::PUT, "/merchants/:id/rate-limit", Some("default")),
+    (Method::PUT, "/v1/merchants/:id/rate-limit", Some("default")),
+    // Payments endpoints
+    (Method::GET, "/payments", Some("default")),
+    (Method::GET, "/v1/payments", Some("default")),
+    (Method::GET, "/payments/webhooks", Some("default")),
+    (Method::GET, "/v1/payments/webhooks", Some("default")),
+    (
+        Method::POST,
+        "/payments/webhooks/redeliver",
+        Some("redeliver"),
+    ),
+    (
+        Method::POST,
+        "/v1/payments/webhooks/redeliver",
+        Some("redeliver"),
+    ),
+    (Method::GET, "/payments/:id/webhooks", Some("default")),
+    (Method::GET, "/v1/payments/:id/webhooks", Some("default")),
+    (
+        Method::POST,
+        "/payments/:id/webhooks/:delivery_id/redeliver",
+        Some("redeliver"),
+    ),
+    (
+        Method::POST,
+        "/v1/payments/:id/webhooks/:delivery_id/redeliver",
+        Some("redeliver"),
+    ),
+    (Method::GET, "/payments/:id", Some("default")),
+    (Method::GET, "/v1/payments/:id", Some("default")),
+];
+
+#[test]
+fn test_rate_limit_bucket_assignment_all_routes() {
+    for (method, path, expected_bucket) in ROUTE_BUCKET_EXPECTATIONS {
+        let req = axum::extract::Request::builder()
+            .method(method.clone())
+            .uri(*path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            api::rate_limited_bucket(&req),
+            *expected_bucket,
+            "{method} {path}"
+        );
+    }
+}
+
+/// Helper to parse `.route("path", handlers)` declarations from a Rust code block.
+fn parse_route_declarations(code_block: &str) -> Vec<(Vec<Method>, String)> {
+    let mut results = Vec::new();
+    let mut cursor = 0;
+    while let Some(route_idx) = code_block[cursor..].find(".route(") {
+        let start = cursor + route_idx + ".route(".len();
+        let rem = &code_block[start..];
+
+        if let Some(quote_start) = rem.find('"') {
+            if let Some(quote_end) = rem[quote_start + 1..].find('"') {
+                let path = &rem[quote_start + 1..quote_start + 1 + quote_end];
+                let after_path = &rem[quote_start + 1 + quote_end + 1..];
+
+                let mut depth = 1;
+                let mut end_idx = 0;
+                for (i, c) in after_path.char_indices() {
+                    if c == '(' {
+                        depth += 1;
+                    } else if c == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end_idx = i;
+                            break;
+                        }
+                    }
+                }
+
+                let handler_str = &after_path[..end_idx];
+                let mut methods = Vec::new();
+                if handler_str.contains("get(") || handler_str.contains(".get(") {
+                    methods.push(Method::GET);
+                }
+                if handler_str.contains("post(") || handler_str.contains(".post(") {
+                    methods.push(Method::POST);
+                }
+                if handler_str.contains("put(") || handler_str.contains(".put(") {
+                    methods.push(Method::PUT);
+                }
+                if handler_str.contains("delete(") || handler_str.contains(".delete(") {
+                    methods.push(Method::DELETE);
+                }
+                if handler_str.contains("patch(") || handler_str.contains(".patch(") {
+                    methods.push(Method::PATCH);
+                }
+
+                results.push((methods, path.to_string()));
+                cursor = start + quote_start + 1 + quote_end + 1 + end_idx;
+                continue;
+            }
+        }
+        cursor = start;
+    }
+    results
+}
+
+/// Enumerate all routes registered in the application's main router by introspecting `src/api/mod.rs`.
+fn enumerate_registered_routes() -> Vec<(Method, String)> {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
+        .expect("src/api/mod.rs must be readable");
+
+    let mut routes = Vec::new();
+
+    // Extract router() function body
+    let router_fn = source
+        .split("pub fn router(")
+        .nth(1)
+        .and_then(|s| s.split("pub fn ").next())
+        .and_then(|s| s.split("fn ").next())
+        .expect("router function must exist");
+
+    // Root router routes (before .nest("/v1", ...))
+    let root_block = router_fn
+        .split(".nest(\"/v1\"")
+        .next()
+        .expect("root routes block");
+    for (methods, subpath) in parse_route_declarations(root_block) {
+        for method in methods {
+            routes.push((method, subpath.clone()));
+        }
+    }
+
+    // Extract api_v1() function body
+    let api_v1_fn = source
+        .split("fn api_v1(")
+        .nth(1)
+        .and_then(|s| s.split("\n}\n").next())
+        .expect("api_v1 function must exist");
+
+    // Merchants router inside api_v1
+    let merchants_block = api_v1_fn
+        .split("let merchants =")
+        .nth(1)
+        .and_then(|s| s.split("let payments_authed =").next())
+        .expect("merchants block");
+    for (methods, subpath) in parse_route_declarations(merchants_block) {
+        let full_path = if subpath == "/" {
+            "/merchants".to_string()
+        } else {
+            format!("/merchants{subpath}")
+        };
+        for method in methods {
+            routes.push((method.clone(), full_path.clone()));
+            routes.push((method, format!("/v1{full_path}")));
+        }
+    }
+
+    // Payments router inside api_v1
+    let payments_block = api_v1_fn
+        .split("let payments_authed =")
+        .nth(1)
+        .expect("payments block");
+    for (methods, subpath) in parse_route_declarations(payments_block) {
+        let full_path = if subpath == "/" {
+            "/payments".to_string()
+        } else {
+            format!("/payments{subpath}")
+        };
+        for method in methods {
+            routes.push((method.clone(), full_path.clone()));
+            routes.push((method, format!("/v1{full_path}")));
+        }
+    }
+
+    routes
+}
+
+#[test]
+fn test_all_registered_routes_have_bucket_expectation() {
+    let registered_routes = enumerate_registered_routes();
+    assert!(
+        !registered_routes.is_empty(),
+        "Must discover registered routes from the application router"
+    );
+
+    for (method, path) in &registered_routes {
+        let exists = ROUTE_BUCKET_EXPECTATIONS
+            .iter()
+            .any(|(m, p, _)| m == method && *p == path.as_str());
+        assert!(
+            exists,
+            "Missing explicit bucket expectation for route: {method} {path}"
+        );
+    }
+}
+
+#[test]
+fn test_bucket_rate_multiplier() {
+    assert_eq!(api::bucket_rate_multiplier("payments"), 1);
+    assert_eq!(api::bucket_rate_multiplier("merchants"), 1);
+    assert_eq!(api::bucket_rate_multiplier("redeliver"), 1);
+    assert_eq!(api::bucket_rate_multiplier("default"), 5);
+    assert_eq!(api::bucket_rate_multiplier("unknown_bucket"), 5);
 }

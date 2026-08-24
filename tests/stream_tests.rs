@@ -39,7 +39,7 @@ fn make_config(horizon_url: &str) -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: horizon_url.into(),
+        horizon_url: horizon_url.parse().unwrap(),
         gateway_public: "GDESTINATION".into(),
         accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: "test-secret-32-bytes-minimum-len".into(),
@@ -372,9 +372,10 @@ async fn open_greeting_and_keep_alive_are_ignored() {
 #[tokio::test]
 async fn dropped_connection_reconnects_with_last_seen_cursor() {
     let server = MockServer::start().await;
+    let reconnect_cursor = "CURSOR&next=1#+% whitespace";
 
-    // First connection: one event with id=CURSOR_42, then the server closes.
-    let first_body = sse_body(&[("", "CURSOR_42", &payment_json())]);
+    // First connection: one event with an opaque id, then the server closes.
+    let first_body = sse_body(&[("", reconnect_cursor, &payment_json())]);
 
     // Second connection (reconnect): keep-alive so the connection stays open
     // until we send the shutdown signal.
@@ -396,7 +397,7 @@ async fn dropped_connection_reconnects_with_last_seen_cursor() {
     // Second request — cursor must be the last event id from the first stream.
     Mock::given(method("GET"))
         .and(path("/accounts/GDESTINATION/payments"))
-        .and(query_param("cursor", "CURSOR_42"))
+        .and(query_param("cursor", reconnect_cursor))
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
@@ -429,9 +430,8 @@ async fn dropped_connection_reconnects_with_last_seen_cursor() {
     let requests = server.received_requests().await.unwrap();
     let reconnect = requests.iter().any(|r| {
         r.url
-            .query()
-            .map(|q| q.contains("cursor=CURSOR_42"))
-            .unwrap_or(false)
+            .query_pairs()
+            .any(|(key, value)| key == "cursor" && value == reconnect_cursor)
     });
     assert!(
         reconnect,

@@ -10,6 +10,7 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use tracing_test::traced_test;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -31,7 +32,7 @@ fn make_config() -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
@@ -405,7 +406,7 @@ async fn test_ready_fails_when_cursor_stale() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.set_last_success_unix(0); // never succeeded → maximally stale
@@ -433,7 +434,7 @@ async fn test_ready_ok_when_cursor_fresh() {
 
     let mut cfg = make_config();
     cfg.gateway_public = CONFIGURED_GATEWAY.into();
-    cfg.horizon_url = mock.uri();
+    cfg.horizon_url = mock.uri().parse().unwrap();
 
     let health = stellargate::TaskHealth::new();
     health.note_success();
@@ -2351,10 +2352,11 @@ async fn test_list_webhooks_status_filter() {
     assert_eq!(res.json::<Value>()["code"], "invalid_status");
 }
 
-/// Regression for #326: an undecodable `cursor` is rejected with a 400, and
-/// `limit` is clamped into the acknowledged range.
+/// Regression for #326 (cursor) and #258 (limit): an undecodable `cursor` is
+/// rejected with a 400, and an out-of-range `limit` is rejected rather than
+/// silently clamped.
 #[tokio::test]
-async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
+async fn test_list_webhooks_invalid_cursor_and_limit_out_of_range() {
     let server = test_server().await;
     let key = provision_merchant(&server).await;
     let auth = format!("Bearer {key}");
@@ -2375,13 +2377,15 @@ async fn test_list_webhooks_invalid_cursor_and_limit_clamp() {
     res.assert_status(StatusCode::BAD_REQUEST);
     assert_eq!(res.json::<Value>()["code"], "invalid_cursor");
 
-    // Above MAX_LIMIT is clamped down to 100, not an error.
+    // Above MAX_LIMIT is now rejected rather than silently clamped down to
+    // 100 (issue #258) — a paginating client trusting the echoed limit would
+    // otherwise read the short page as "end of results" and stop early.
     let res = server
         .get(&format!("/payments/{id}/webhooks?limit=5000"))
         .add_header("Authorization", auth)
         .await;
-    res.assert_status_ok();
-    assert_eq!(res.json::<Value>()["limit"], 100);
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_limit");
 }
 
 #[tokio::test]

@@ -66,6 +66,17 @@ impl From<anyhow::Error> for AppError {
     }
 }
 
+/// Stable machine-readable code for a `JsonRejection` variant not given its
+/// own dedicated code, keyed on the HTTP status axum already chose for it —
+/// `413` for an oversized body (issue #257), `400` for everything else this
+/// catch-all can still see.
+fn rejection_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+        _ => "invalid_request",
+    }
+}
+
 /// A drop-in replacement for `Json<T>` that maps any deserialization or
 /// content-type failure into our standard `{"error": "..."}` 400 response
 /// instead of axum's default 422 plaintext rejection.
@@ -114,10 +125,23 @@ where
                             "Content-Type must be application/json",
                         ))
                     }
-                    _ => Err(AppError::bad_request(
-                        "invalid_request",
-                        "invalid request body",
-                    )),
+                    // `JsonRejection` is `#[non_exhaustive]`, so a catch-all is
+                    // required — but it must preserve the rejection's own status
+                    // and reason rather than flattening everything into a
+                    // generic 400. This is where `BytesRejection` lands,
+                    // covering an oversized body (`RequestBodyLimitLayer`) and a
+                    // truncated/aborted one: telling a client its JSON was
+                    // malformed when the real problem was the body's size or a
+                    // dropped connection sends it chasing the wrong fix (issue
+                    // #257).
+                    other => {
+                        tracing::debug!(rejection = %other, "unhandled JSON rejection");
+                        Err(AppError::new(
+                            other.status(),
+                            rejection_code(other.status()),
+                            other.body_text(),
+                        ))
+                    }
                 }
             }
         }
@@ -557,6 +581,24 @@ const MAX_OFFSET: i64 = 10_000;
 /// a guaranteed-empty filter and is rejected as invalid.
 const VALID_STATUSES: [&str; 4] = ["pending", "completed", "underpaid", "expired"];
 
+/// Validates a caller-supplied `limit` against `(1..=max)`, rather than
+/// silently clamping it. Clamping absorbs three distinct bad inputs — too
+/// large, zero, negative — into a `200` that gives the caller no signal
+/// anything was wrong; a client paginating past `max` would read the
+/// silently-shortened page as "end of results" and stop early (issue #258).
+/// Matches the existing `invalid_status`/`invalid_cursor` convention: reject
+/// rather than coerce.
+fn validate_limit(limit: Option<i64>, default: i64, max: i64) -> Result<i64, AppError> {
+    match limit {
+        None => Ok(default),
+        Some(n) if (1..=max).contains(&n) => Ok(n),
+        Some(n) => Err(AppError::bad_request(
+            "invalid_limit",
+            format!("limit must be between 1 and {max} (got {n})"),
+        )),
+    }
+}
+
 /// Statuses a webhook delivery can hold: `pending` while attempts are still
 /// possible, `delivered` on success, `failed` when the attempt budget is
 /// exhausted. Nothing writes any other value, so a filter on anything else is
@@ -581,10 +623,11 @@ pub async fn list(
         }
     }
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     if let Some(raw_cursor) = &q.cursor {
         // Keyset (cursor) pagination — stable, O(log n) regardless of page depth.
@@ -801,10 +844,11 @@ pub async fn list_webhooks(
             )
         })?;
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match q.cursor.as_deref() {
         Some(raw_cursor) => {
@@ -886,10 +930,11 @@ pub async fn list_merchant_webhooks(
         ));
     }
 
-    let limit = q
-        .limit
-        .unwrap_or(state.config.pagination_default_limit)
-        .clamp(1, state.config.pagination_max_limit);
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
 
     let cursor = match &q.cursor {
         Some(raw) => Some(

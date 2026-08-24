@@ -48,7 +48,7 @@ async fn make_state(horizon_url: String, stream_idle_timeout_secs: u64) -> Arc<A
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url,
+            horizon_url: horizon_url.parse().unwrap(),
             gateway_public: GATEWAY.into(),
             accepted_assets: vec![AcceptedAsset {
                 code: "XLM".into(),
