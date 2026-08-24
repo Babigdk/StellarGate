@@ -1022,6 +1022,86 @@ async fn test_issue_key_without_a_body_still_succeeds() {
     assert!(res.json::<Value>()["label"].is_null());
 }
 
+/// The label limit is counted in characters, not bytes: a multi-byte label
+/// under the character cap must be accepted even though its byte length
+/// alone would trip a naive `str::len() > 100` check.
+#[tokio::test]
+async fn test_issue_key_accepts_a_multibyte_label_under_the_character_limit() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 40 CJK characters — 120 bytes in UTF-8, comfortably over the old
+    // byte-based 100 limit, but well under the 100-character limit.
+    let label: String = "測".repeat(40);
+    assert!(label.len() > 100);
+    assert_eq!(label.chars().count(), 40);
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": label }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    assert_eq!(res.json::<Value>()["label"], label);
+}
+
+/// A label over the 100-*character* limit is rejected, and the error message
+/// must describe what is actually being measured.
+#[tokio::test]
+async fn test_issue_key_rejects_a_label_over_the_character_limit() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let label = "a".repeat(101);
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": label }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body = res.json::<Value>();
+    assert_eq!(body["code"], "invalid_label");
+    assert!(body["error"].as_str().unwrap().contains("100 characters"));
+}
+
+/// Control characters are rejected outright — a label is rendered verbatim in
+/// the dashboard, so one must not be able to smuggle e.g. a newline or an ANSI
+/// escape into it.
+#[tokio::test]
+async fn test_issue_key_rejects_a_label_with_control_characters() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": "prod\nkey" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "invalid_label");
+}
+
 /// A wrong *type* on a known field is still `invalid_request` — the new code is
 /// specific to unrecognised field names, not a rename of the generic one.
 #[tokio::test]
