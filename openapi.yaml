@@ -453,11 +453,18 @@ paths:
             `cursor`). SQLite implements OFFSET by producing and discarding
             every skipped row, so cost grows with depth; values above 10000
             are rejected with `400 invalid_offset` rather than answered.
+            Mutually exclusive with `cursor`: sending both is
+            `400 conflicting_pagination`, decided on presence rather than
+            value, so even `offset=0` alongside a cursor is rejected.
         - name: cursor
           in: query
           schema:
             type: string
-          description: Opaque cursor for keyset pagination (returned as next_cursor)
+          description: >-
+            Opaque cursor for keyset pagination (returned as next_cursor).
+            Selects keyset mode, whose response carries `payments`, `limit` and
+            `next_cursor` but no `offset` or `total`. Mutually exclusive with
+            `offset`: sending both is `400 conflicting_pagination`.
         - name: include_total
           in: query
           schema:
@@ -499,6 +506,11 @@ paths:
                   value:
                     error: "offset exceeds maximum of 10000; use cursor pagination instead (see the `cursor` parameter and `next_cursor` in the response)"
                     code: invalid_offset
+                conflicting_pagination:
+                  summary: Both cursor and offset supplied
+                  value:
+                    error: "cursor and offset are mutually exclusive; use cursor for keyset pagination"
+                    code: conflicting_pagination
                 invalid_limit:
                   summary: limit outside 1..=100
                   value:
@@ -1136,6 +1148,12 @@ components:
 
     ListPaymentsResponse:
       type: object
+      description: >-
+        One shape per pagination mode, chosen by the request. Keyset mode
+        (`cursor` set) returns `payments`, `limit` and `next_cursor`. Offset
+        mode (`cursor` absent) returns those plus `offset`, and `total` when
+        `include_total=true`. The modes cannot be combined: `cursor` together
+        with `offset` is `400 conflicting_pagination`.
       required: [payments, limit]
       properties:
         payments:
@@ -1154,7 +1172,9 @@ components:
           type: integer
         offset:
           type: integer
-          description: Present when using offset pagination
+          description: >-
+            Rows skipped. Offset pagination only; absent in keyset (cursor)
+            mode.
         next_cursor:
           type: string
           nullable: true
@@ -1306,7 +1326,8 @@ components:
             invalid_request, unknown_field, unsupported_media_type,
             payload_too_large, unsupported_asset, invalid_amount,
             amount_out_of_range, invalid_webhook_url, invalid_status,
-            invalid_cursor, invalid_limit, payment_not_found,
+            invalid_cursor, invalid_limit, invalid_offset,
+            conflicting_pagination, payment_not_found,
             delivery_not_found, rate_limit_exceeded, not_found, webhook_target_blocked,
             webhook_delivery_failed, idempotency_conflict, merchant_not_found,
             invalid_label, last_active_key, trustline_missing, and

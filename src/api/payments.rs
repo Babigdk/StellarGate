@@ -685,6 +685,20 @@ pub async fn list(
         }
     }
 
+    /* A client migrating from offset to keyset pagination naturally sends both
+    for a request or two — the offset branch hands out a `next_cursor` to invite
+    exactly that. Answering from the cursor branch would discard `offset` with
+    no signal, and return a differently shaped body while it's at it, so refuse
+    rather than guess which mode was meant (issue #259). Presence, not value: an
+    explicit `offset=0` alongside a cursor is still a caller asserting a
+    pagination mode. */
+    if q.cursor.is_some() && q.offset.is_some() {
+        return Err(AppError::bad_request(
+            "conflicting_pagination",
+            "cursor and offset are mutually exclusive; use cursor for keyset pagination",
+        ));
+    }
+
     let limit = validate_limit(
         q.limit,
         state.config.pagination_default_limit,

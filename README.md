@@ -698,6 +698,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
+| `conflicting_pagination` | `400` | `cursor` and `offset` were sent together |
 | `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
 | `merchant_not_found` | `404` | No merchant with that id |
@@ -949,14 +950,11 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 |---|---|---|
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
 | `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
-| `cursor` | Keyset cursor from a previous `next_cursor` | — |
-| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
+| `cursor` | Keyset cursor from a previous `next_cursor`. Mutually exclusive with `offset`. | — |
+| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. Mutually exclusive with `cursor`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
-Any other query parameter is rejected with `400` `unknown_parameter` — see
-[Error Envelope](#error-envelope).
-
-**`200 OK`** — cursor mode (no `cursor` parameter on the first request)
+**`200 OK`** — cursor mode (`cursor` set)
 
 ```json
 {
@@ -966,7 +964,7 @@ Any other query parameter is rejected with `400` `unknown_parameter` — see
 }
 ```
 
-**`200 OK`** — offset mode (no `cursor` parameter, `offset` set)
+**`200 OK`** — offset mode (no `cursor` parameter; `offset` set, or neither set)
 
 ```json
 {
@@ -981,6 +979,16 @@ Both modes order rows identically (`created_at DESC`, then `id DESC` to break
 the whole-second `created_at` ties), so a `next_cursor` returned by an offset
 page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
 of either mode. Offset mode additionally returns `offset`.
+
+**Pick one mode per request.** Sending `cursor` and `offset` together is `400
+conflicting_pagination`. The two modes answer from different queries and return
+different bodies, so there is no reading of "both" that is not a guess: the
+request would be served from the cursor, `offset` silently discarded, and the
+`offset` field absent from the response. That matters most during the very
+migration the `next_cursor` above exists to encourage, which is when a client is
+most likely to still be sending its old `offset`. Presence is what counts, not
+the value, so `?cursor=...&offset=0` is rejected too. Drop `offset` from the
+request once you start passing `cursor`.
 
 > **`total` is opt-in (`?include_total=true`), not sent by default.** SQLite
 > has no cached row count, so computing `total` is a full `COUNT(*)` scan over

@@ -96,6 +96,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /payments` no longer discards `offset` when a `cursor` is also
+  supplied.** The handler branched on the presence of `cursor`: the keyset
+  path read `cursor` and `limit` and never looked at `offset`, so a request
+  carrying both was answered from the cursor with the offset dropped and no
+  indication that it had been. The response shapes differ too, so the caller
+  also silently lost the `offset` field it was reading. This landed hardest on
+  the migration the endpoint itself encourages, since the offset branch
+  returns a `next_cursor` specifically to invite a move to keyset paging, and
+  a client following that hint naturally sends both for a request or two.
+  Sending both is now `400 conflicting_pagination`, decided on presence rather
+  than value so an old `offset=0` alongside a new cursor is rejected too, and
+  the two modes with their distinct response shapes are documented side by
+  side in the README and modelled in `openapi.yaml` (issue #259).
+
 - **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive
   limit the system can apply.** `Config::validate_timing` rejects
   `POLL_INTERVAL_SECS=0`, `PAYMENT_TTL_SECS=0`, `WEBHOOK_RETRY_ATTEMPTS=0`,
