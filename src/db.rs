@@ -1529,29 +1529,19 @@ pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<Str
     Ok(Some(merchant_id))
 }
 
-/// Every key issued to a merchant, newest first, including revoked ones so the
-/// history stays visible.
-pub async fn list_api_keys(pool: &Db, merchant_id: &str) -> Result<Vec<ApiKeyInfo>> {
-    /// (id, prefix, label, created_at, last_used_at, revoked_at) as selected below.
-    type KeyRow = (
-        String,
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        Option<String>,
-    );
+/// (id, prefix, label, created_at, last_used_at, revoked_at) as selected by
+/// every `api_keys` listing query below.
+type KeyRow = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
-    let rows: Vec<KeyRow> = sqlx::query_as(
-        "SELECT id, prefix, label, created_at, last_used_at, revoked_at
-               FROM api_keys WHERE merchant_id = ? ORDER BY created_at DESC, id DESC",
-    )
-    .bind(merchant_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
+fn key_rows_to_info(rows: Vec<KeyRow>) -> Vec<ApiKeyInfo> {
+    rows.into_iter()
         .map(
             |(id, prefix, label, created_at, last_used_at, revoked_at)| ApiKeyInfo {
                 id,
@@ -1562,7 +1552,111 @@ pub async fn list_api_keys(pool: &Db, merchant_id: &str) -> Result<Vec<ApiKeyInf
                 revoked_at,
             },
         )
-        .collect())
+        .collect()
+}
+
+/// A page of a merchant's API keys, newest first (`created_at DESC, id DESC`
+/// keyset ordering — the same convention `GET /payments` and the webhook
+/// delivery listings use). Revoked keys are retained deliberately as an audit
+/// trail and are included by default; pass `active = Some(true)` to skip
+/// straight past the history to the keys someone would actually reach for
+/// (issue #262).
+pub async fn list_api_keys_keyset(
+    pool: &Db,
+    merchant_id: &str,
+    active: Option<bool>,
+    limit: i64,
+    cursor: Option<(&str, &str)>,
+) -> Result<Vec<ApiKeyInfo>> {
+    let rows: Vec<KeyRow> = match (active, cursor) {
+        (None, None) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys WHERE merchant_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (None, Some((ts, cid))) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys
+                 WHERE merchant_id = ? AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(true), None) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys WHERE merchant_id = ? AND revoked_at IS NULL
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(true), Some((ts, cid))) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys
+                 WHERE merchant_id = ? AND revoked_at IS NULL
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(false), None) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys WHERE merchant_id = ? AND revoked_at IS NOT NULL
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+
+        (Some(false), Some((ts, cid))) => {
+            sqlx::query_as(
+                "SELECT id, prefix, label, created_at, last_used_at, revoked_at
+                 FROM api_keys
+                 WHERE merchant_id = ? AND revoked_at IS NOT NULL
+                   AND (created_at < ? OR (created_at = ? AND id < ?))
+                 ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(merchant_id)
+            .bind(ts)
+            .bind(ts)
+            .bind(cid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?
+        }
+    };
+
+    Ok(key_rows_to_info(rows))
 }
 
 /// Revoke a key. Scoped by merchant so one merchant cannot revoke another's.
@@ -1711,7 +1805,9 @@ mod tests {
         );
 
         // It is now a first-class key: listable, and revocable once replaced.
-        let keys = list_api_keys(&pool, "legacy-merchant").await.unwrap();
+        let keys = list_api_keys_keyset(&pool, "legacy-merchant", None, 100, None)
+            .await
+            .unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].prefix, "legacy");
         assert!(keys[0].revoked_at.is_none());

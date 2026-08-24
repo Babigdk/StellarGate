@@ -3177,6 +3177,157 @@ async fn test_listing_keys_never_returns_the_secret() {
     assert!(entry["prefix"].as_str().unwrap().len() < raw_key.len());
 }
 
+/// Regression for #262: `GET /merchants/:id/keys` ran an unbounded `SELECT`
+/// with no `LIMIT`, and revoked keys are kept forever as an audit trail, so a
+/// merchant that rotates regularly accumulates rows without bound. This
+/// creates more keys than one page holds, then walks the keyset cursor until
+/// it runs dry, asserting every key is seen exactly once and the final page
+/// reports a null `next_cursor` — the same contract `GET /payments` and the
+/// webhook-delivery listings already use.
+#[tokio::test]
+async fn test_list_api_keys_walks_cursor_across_pages() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let merchant_id = res.json::<Value>()["merchant_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Provisioning already minted one key; issue six more so there are 7 in
+    // total — more than a single page at limit=3 (3, 3, 1).
+    for i in 0..6 {
+        server
+            .post(&format!("/merchants/{merchant_id}/keys"))
+            .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+            .json(&json!({ "label": format!("key-{i}") }))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    // Page 1 — a full page of 3 must mint a cursor.
+    let res = server
+        .get(&format!("/merchants/{merchant_id}/keys?limit=3"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res.assert_status_ok();
+    let body: Value = res.json();
+    assert_eq!(body["keys"].as_array().unwrap().len(), 3);
+    assert_eq!(body["limit"], 3);
+    let cursor = body["next_cursor"]
+        .as_str()
+        .expect("a full page must mint next_cursor");
+
+    // Page 2 — also full, also mints a cursor.
+    let res2 = server
+        .get(&format!(
+            "/merchants/{merchant_id}/keys?limit=3&cursor={cursor}"
+        ))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res2.assert_status_ok();
+    let body2: Value = res2.json();
+    assert_eq!(body2["keys"].as_array().unwrap().len(), 3);
+    let cursor2 = body2["next_cursor"]
+        .as_str()
+        .expect("second full page must mint next_cursor");
+
+    // Page 3 — the remainder, short of a full page, ends pagination.
+    let res3 = server
+        .get(&format!(
+            "/merchants/{merchant_id}/keys?limit=3&cursor={cursor2}"
+        ))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    res3.assert_status_ok();
+    let body3: Value = res3.json();
+    assert_eq!(body3["keys"].as_array().unwrap().len(), 1);
+    assert!(
+        body3["next_cursor"].is_null(),
+        "last page must have null next_cursor"
+    );
+
+    // All 7 key ids walked exactly once, none repeated or skipped.
+    let ids: Vec<String> = [&body, &body2, &body3]
+        .iter()
+        .flat_map(|b| b["keys"].as_array().unwrap().iter())
+        .map(|k| k["key_id"].as_str().unwrap().to_string())
+        .collect();
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 7);
+}
+
+/// `active=true` filters out the revoked audit trail so an operator looking
+/// for currently-usable keys does not have to page through history to find
+/// them (issue #262).
+#[tokio::test]
+async fn test_list_api_keys_active_filter() {
+    let server = test_server().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
+    let old_key_id = body["key_id"].as_str().unwrap().to_string();
+
+    let new_key_id = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json::<Value>()["key_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    server
+        .delete(&format!("/merchants/{merchant_id}/keys/{old_key_id}"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .assert_status_ok();
+
+    let active_ids: Vec<String> = server
+        .get(&format!("/merchants/{merchant_id}/keys?active=true"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json::<Value>()["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(active_ids, vec![new_key_id.clone()]);
+
+    let revoked_ids: Vec<String> = server
+        .get(&format!("/merchants/{merchant_id}/keys?active=false"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json::<Value>()["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(revoked_ids, vec![old_key_id]);
+
+    // No filter still returns both, including the revoked one.
+    let all_ids: Vec<String> = server
+        .get(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await
+        .json::<Value>()["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key_id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(all_ids.len(), 2);
+    assert!(all_ids.contains(&new_key_id));
+}
+
 /// Key management is an operator action — it must not be reachable with a
 /// merchant's own key, only the admin secret.
 #[tokio::test]

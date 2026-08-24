@@ -1,7 +1,9 @@
-use crate::api::payments::{AppError, JsonBody, OptionalJsonBody};
+use crate::api::payments::{
+    decode_cursor, encode_cursor, validate_limit, AppError, JsonBody, OptionalJsonBody,
+};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, MatchedPath, Path, Request, State},
+    extract::{ConnectInfo, MatchedPath, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -665,14 +667,35 @@ async fn issue_api_key(
     ))
 }
 
+/// Query parameters for the key listing. Matches the payments/webhook-delivery
+/// listing conventions: a `limit` (default 20, max 100) and an opaque keyset
+/// `cursor` whose value comes from a previous response's `next_cursor`
+/// (issue #262).
+#[derive(serde::Deserialize)]
+struct ListKeysQuery {
+    /// `true` to see only usable keys, `false` for only revoked ones. Omitted
+    /// (the default) returns both, including the revoked audit trail.
+    active: Option<bool>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
 /// `GET /merchants/:id/keys` — list a merchant's keys.
 ///
 /// Returns metadata only. The secret is unrecoverable by design, so this can
 /// never leak a usable credential; `prefix` exists so an operator can identify
 /// which key to revoke.
+///
+/// Keyset-paginated like `GET /payments`: revoked keys are kept forever as an
+/// audit trail, so a merchant that rotates regularly accumulates rows without
+/// bound, and this endpoint sat in the admin × 5 rate-limit bucket with no
+/// `LIMIT` at all — an authenticated admin script in a loop could stall the
+/// single-writer database (issue #262). `active=true` skips straight past the
+/// history for the common case of "which keys can I use right now".
 async fn list_api_keys(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
+    Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Value>, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -681,7 +704,35 @@ async fn list_api_keys(
         ));
     }
 
-    let keys = db::list_api_keys(&state.pool, &merchant_id).await?;
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
+
+    let cursor = match q.cursor.as_deref() {
+        Some(raw) => Some(
+            decode_cursor(raw)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
+        ),
+        None => None,
+    };
+
+    let keys = db::list_api_keys_keyset(
+        &state.pool,
+        &merchant_id,
+        q.active,
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    let next_cursor = if keys.len() == limit as usize {
+        keys.last().map(|k| encode_cursor(&k.created_at, &k.id))
+    } else {
+        None
+    };
+
     Ok(Json(json!({
         "merchant_id": merchant_id,
         "keys": keys.iter().map(|k| json!({
@@ -693,6 +744,8 @@ async fn list_api_keys(
             "revoked_at": k.revoked_at,
             "active": k.revoked_at.is_none(),
         })).collect::<Vec<_>>(),
+        "limit": limit,
+        "next_cursor": next_cursor,
     })))
 }
 

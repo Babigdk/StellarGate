@@ -213,6 +213,11 @@ paths:
       description: >-
         Metadata only — never the secret, which is unrecoverable by design.
         `prefix` is enough for an operator to identify which key to revoke.
+        Keyset (cursor) paginated with the same conventions as `GET
+        /payments`: revoked keys are kept forever as an audit trail, so a
+        merchant that rotates regularly accumulates rows without bound, and
+        this endpoint used to return every one of them in a single unbounded
+        response (issue #262).
       security:
         - adminSecret: []
       parameters:
@@ -223,13 +228,51 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: active
+          in: query
+          schema:
+            type: boolean
+          description: >-
+            `true` returns only usable keys, `false` only revoked ones.
+            Omitted (the default) returns both, including the revoked audit
+            trail.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
       responses:
         "200":
-          description: The merchant's keys
+          description: A page of the merchant's keys
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListApiKeysResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
         "401":
           $ref: "#/components/responses/AdminUnauthorized"
         "404":
@@ -978,7 +1021,7 @@ components:
 
     ListApiKeysResponse:
       type: object
-      required: [merchant_id, keys]
+      required: [merchant_id, keys, limit]
       properties:
         merchant_id:
           type: string
@@ -987,6 +1030,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ApiKeySummary"
+        limit:
+          type: integer
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
 
     RevokeApiKeyResponse:
       type: object
