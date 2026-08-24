@@ -10,7 +10,6 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
-use tracing_test::traced_test;
 use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1793,6 +1792,86 @@ async fn test_list_offset_above_max_is_rejected() {
         body["error"].as_str().unwrap().contains("cursor"),
         "error message should point callers at cursor pagination, got: {}",
         body["error"]
+    );
+}
+
+/// Hex of "2026-01-01T00:00:00Z\t11111111-1111-1111-1111-111111111111", the
+/// wire form `encode_cursor` produces. Spelled out rather than encoded here
+/// because `hex` is a dependency of the crate, not a dev-dependency available
+/// to this test binary.
+const WELL_FORMED_CURSOR: &str = "323032362d30312d30315430303a30303a30305a0931313131\
+313131312d313131312d313131312d313131312d313131313131313131313131";
+
+/// Regression for #259: the two pagination modes read different parameters and
+/// return differently shaped bodies, so a request carrying both must be refused
+/// rather than answered from the cursor with `offset` silently dropped.
+#[tokio::test]
+async fn test_list_rejects_cursor_and_offset_together() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}&offset=20"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "conflicting_pagination");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("mutually exclusive"),
+        "error message should say the two are mutually exclusive, got: {}",
+        body["error"]
+    );
+}
+
+/// The check is on presence, not value: a client still sending its old
+/// `offset=0` alongside a new cursor is the exact migration case #259 is about,
+/// so it must be rejected too rather than quietly treated as cursor-only.
+#[tokio::test]
+async fn test_list_rejects_cursor_and_zero_offset() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}&offset=0"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "conflicting_pagination");
+}
+
+/// The conflict is rejected before the cursor is decoded, so a client sending
+/// both gets the error that names its actual mistake instead of being sent
+/// after a malformed cursor it did not have.
+#[tokio::test]
+async fn test_list_conflicting_pagination_wins_over_invalid_cursor() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?cursor=notvalidhex!!&offset=20")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "conflicting_pagination");
+}
+
+/// Each mode alone stays untouched — the guard fires only on the combination.
+#[tokio::test]
+async fn test_list_cursor_alone_is_still_accepted() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get(&format!("/payments?cursor={WELL_FORMED_CURSOR}"))
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::OK);
+    let body: Value = res.json();
+    assert!(
+        body.get("offset").is_none(),
+        "cursor mode must not carry an offset field, got: {body}"
     );
 }
 
