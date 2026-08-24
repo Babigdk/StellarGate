@@ -837,7 +837,6 @@ pub async fn set_state(pool: &Db, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-
 /// Record an outbound webhook delivery. `event_type` is the event name the
 /// payload carries (e.g. `payment.underpaid`); it is persisted so a later
 /// redelivery can reproduce the original `X-StellarGate-Event` header.
