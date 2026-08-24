@@ -418,6 +418,13 @@ paths:
       description: >-
         Scoped to the merchant that owns the API key. There is no parameter for
         selecting a different merchant.
+
+
+        The parameter set is closed: a query parameter not listed below is
+        rejected with `400 unknown_parameter` naming it, rather than ignored.
+        A discarded filter would otherwise be returned as an unfiltered `200`
+        page, so `?stauts=completed` listed every payment including pending
+        ones.
       security:
         - bearerAuth: []
       parameters:
@@ -497,6 +504,11 @@ paths:
                   value:
                     error: "limit must be between 1 and 100 (got 5000)"
                     code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`"
+                    code: unknown_parameter
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -604,7 +616,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/ListMerchantWebhookDeliveriesResponse"
         "400":
-          description: Invalid `status`, `cursor`, or `limit`
+          description: >-
+            Invalid `status`, `cursor`, or `limit`, or a query parameter this
+            endpoint does not accept. The parameter set is closed: anything not
+            listed above is rejected with `400 unknown_parameter` naming it.
+            That matters most here, where `status` defaults to `failed` — a
+            typo'd filter would otherwise answer with the dead-letter list and
+            look entirely plausible.
           content:
             application/json:
               schema:
@@ -615,6 +633,11 @@ paths:
                   value:
                     error: "limit must be between 1 and 100 (got 5000)"
                     code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `staus`, expected one of `status`, `limit`, `cursor`"
+                    code: unknown_parameter
 
   /payments/webhooks/redeliver:
     post:
@@ -711,6 +734,11 @@ paths:
                   value:
                     error: "limit must be between 1 and 100 (got 5000)"
                     code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `staus`, expected one of `status`, `limit`, `cursor`"
+                    code: unknown_parameter
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

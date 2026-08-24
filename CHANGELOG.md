@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unknown query parameters on the listing endpoints are now rejected
+  instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
+  `GET /payments/webhooks` deserialized the parameters they knew and discarded
+  everything else, so a typo returned `200 OK` with an unfiltered first page:
+  `?stauts=completed` listed every payment including pending ones, and a
+  merchant reconciliation script that filtered server-side would read unpaid
+  intents as paid (issue #352). All three parameter sets are now closed, and
+  an unrecognised key is a `400` `unknown_parameter` naming it — the same
+  treatment request bodies already got via `unknown_field` (issue #329). A
+  malformed *value* (`?limit=abc`) now also returns the standard JSON error
+  envelope under `invalid_query`, where it previously produced axum's
+  plaintext `400`. **Breaking for any client currently sending a stray
+  parameter**, which is the point: it was never being applied.
+
 - **Manual webhook redelivery no longer consumes the automatic redrive
   budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
   increment the same `attempts` counter the background redrive worker
