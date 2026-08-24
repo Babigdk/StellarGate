@@ -23,6 +23,9 @@ CREATE INDEX idx_payments_memo ON payments(memo)
 ;
 CREATE INDEX idx_payments_status ON payments(status)
 ;
+CREATE INDEX idx_payments_status_expires_at ON payments(status, expires_at)
+         WHERE status IN ('pending', 'underpaid')
+;
 CREATE INDEX idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)
 ;
@@ -59,7 +62,7 @@ CREATE TABLE merchants (
             api_key_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
                 CHECK (created_at LIKE '____-__-__T__:__:__Z')
-        )
+        , rate_limit_per_sec INTEGER)
 ;
 CREATE TABLE payments (
             id TEXT PRIMARY KEY,
@@ -98,6 +101,7 @@ CREATE TABLE webhook_deliveries (
             event_type TEXT,
             status TEXT NOT NULL DEFAULT 'pending',
             attempts INTEGER NOT NULL DEFAULT 0,
+            manual_attempts INTEGER NOT NULL DEFAULT 0,
             last_attempt TEXT CHECK (last_attempt IS NULL OR last_attempt LIKE '____-__-__T__:__:__Z'),
             acknowledged_at TEXT CHECK (acknowledged_at IS NULL OR acknowledged_at LIKE '____-__-__T__:__:__Z'),
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
