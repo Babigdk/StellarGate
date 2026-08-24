@@ -77,10 +77,14 @@ docker compose up --build
    should come with test coverage in `tests/api_tests.rs` (integration) or
    inline `#[cfg(test)]` modules (unit). If you're fixing a bug, add a test
    that fails before your fix and passes after.
-4. **Add a migration if you touch the schema.** New migrations go in
-   `migrations/<next_number>_<short_description>.sql`. Never edit an
-   already-merged migration — schema changes are append-only so existing
-   databases upgrade cleanly. See "Database Migrations" in the README.
+4. **Add the statement to `db::migrate` if you touch the schema.** `src/db.rs`'s
+   `db::migrate` is the only schema definition in this repository — there is
+   no `migrations/` directory. Add your `CREATE TABLE IF NOT EXISTS` /
+   `ALTER TABLE ... ADD COLUMN` statement there, keep it idempotent (it runs
+   on every startup of every existing deployment), and update
+   `tests/schema_snapshot.sql` to match (`cargo test --test
+   schema_snapshot_test -- --nocapture` prints the exact text to paste in on
+   a mismatch). See "Database Migrations" in the README.
 5. **Update docs.** If you change environment variables, API request/response
    shapes, or webhook payloads, update the README and (for `.env.example`-
    affecting changes) `.env.example` in the same PR.

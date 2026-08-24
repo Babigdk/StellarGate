@@ -819,8 +819,10 @@ fn generate_unique_memo() -> String {
 /// Checks if an error is a UNIQUE constraint violation.
 fn is_unique_violation(err: &anyhow::Error) -> bool {
     if let Some(sqlx::Error::Database(db_error)) = err.downcast_ref::<sqlx::Error>() {
+        // Check for UNIQUE constraint violation
         // SQLite error message format: "UNIQUE constraint failed: table.column"
-        return db_error.message().contains("UNIQUE constraint failed");
+        let msg = db_error.message();
+        return msg.contains("UNIQUE constraint failed");
     }
     false
 }
