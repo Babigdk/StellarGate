@@ -675,16 +675,21 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
     Some((ts.to_string(), id.to_string()))
 }
 
-/// Generates an 8-character uppercase-hex `text` memo (32 bits of entropy,
-/// well within Stellar's 28-byte text memo limit) and confirms it hasn't been
-/// used by *any* payment intent before — `memo_exists` checks the entire
-/// `payments` table, not just pending ones, so a memo is never reused for the
-/// lifetime of the database. That makes the collision probability for a
-/// single call simply `rows-in-table / 2^32`, and the loop retries up to 10
-/// times before giving up; exhausting that before billions of payments exist
-/// is effectively impossible. If traffic ever approaches that scale, widen
-/// the memo (more hex chars, still under the 28-byte limit) rather than
-/// switching scheme.
+/// Generates a 16-character uppercase-hex `text` memo (64 bits of entropy,
+/// drawn straight from the OS CSPRNG via `rand::rng()` — the same source
+/// `generate_api_key` uses — rather than sliced from a UUID, since a memo is
+/// what a third party must know to direct a payment at a specific intent and
+/// so belongs to the credential side of that tradeoff, not the identifier
+/// side) and confirms it hasn't been used by *any* payment intent before —
+/// `memo_exists` checks the entire `payments` table, not just pending ones,
+/// so a memo is never reused for the lifetime of the database. That makes
+/// the collision probability for a single call simply `rows-in-table /
+/// 2^64`, which stays negligible even at billions of lifetime payments, and
+/// the loop retries up to 10 times before giving up. 16 hex characters is
+/// well within Stellar's 28-byte text memo limit; if the entropy budget ever
+/// needs to grow, widen further (more hex chars, or base32 for more bits per
+/// byte) rather than switching scheme. Existing 8-character memos from
+/// before this change remain valid and continue to match and settle.
 ///
 /// We chose a `text` memo over `memo_id` (a u64) or `memo_hash`/`memo_return`
 /// (32-byte) because it's the simplest scheme that round-trips a
@@ -696,8 +701,11 @@ fn decode_cursor(raw: &str) -> Option<(String, String)> {
 /// guards against this by only matching when Horizon reports `memo_type:
 /// "text"` (see issue #17).
 async fn generate_unique_memo(pool: &db::Db) -> Result<String, AppError> {
+    use rand::RngCore;
     for _ in 0..10 {
-        let memo = Uuid::new_v4().to_string().replace('-', "")[..8].to_uppercase();
+        let mut bytes = [0u8; 8];
+        rand::rng().fill_bytes(&mut bytes);
+        let memo = hex::encode(bytes).to_uppercase();
         if !db::memo_exists(pool, &memo).await? {
             return Ok(memo);
         }
