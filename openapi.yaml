@@ -409,6 +409,25 @@ paths:
                     code: amount_out_of_range
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: >-
+            The request carried an `Idempotency-Key` that another in-flight
+            request for the same merchant is already creating a payment for,
+            and that request had not committed yet. Transient: retry after
+            the interval in `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                idempotency_conflict:
+                  summary: Concurrent create raced on the same idempotency key
+                  value:
+                    error: concurrent request conflict, please retry
+                    code: idempotency_conflict
         "429":
           description: >-
             Rate limit exceeded. The request fell into the `payments` bucket,

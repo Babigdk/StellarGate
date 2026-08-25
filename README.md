@@ -709,7 +709,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
-| `idempotency_conflict` | `500` | Concurrent creates raced on one idempotency key |
+| `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
 | `not_found` | `404` | No matching route |
 | `method_not_allowed` | `405` | Path exists, but not for this HTTP method |
 | `request_timeout` | `408` | Request exceeded `REQUEST_TIMEOUT_SECS` |
