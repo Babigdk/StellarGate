@@ -50,7 +50,7 @@ async fn make_state(horizon_url: String) -> Arc<AppState> {
             port: 0,
             database_url: dsn,
             network: "testnet".into(),
-            horizon_url,
+            horizon_url: horizon_url.parse().unwrap(),
             gateway_public: GATEWAY.into(),
             accepted_assets: vec![
                 AcceptedAsset {

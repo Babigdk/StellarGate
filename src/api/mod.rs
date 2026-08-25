@@ -1,7 +1,9 @@
-use crate::api::payments::{AppError, JsonBody, OptionalJsonBody};
+use crate::api::payments::{
+    decode_cursor, encode_cursor, validate_limit, AppError, JsonBody, OptionalJsonBody,
+};
 use crate::{db, AppState};
 use axum::{
-    extract::{ConnectInfo, MatchedPath, Path, Request, State},
+    extract::{ConnectInfo, MatchedPath, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -175,7 +177,22 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+                let request_id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .and_then(|id| id.header_value().to_str().ok())
+                    .unwrap_or("-");
+                tracing::info_span!(
+                    "http",
+                    %request_id,
+                    method = %req.method(),
+                    uri = %req.uri(),
+                    version = ?req.version()
+                )
+            }),
+        )
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
         .layer(middleware::from_fn_with_state(
@@ -187,6 +204,12 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,
         ))
+        /* Outer to every layer that can answer with a bare, framework-generated
+        405/413/408 (the router's own method-not-allowed fallback, the
+        `RequestBodyLimitLayer` short-circuit on a known-oversized
+        Content-Length, and the timeout above), so it sees and rewrites all of
+        them into the documented JSON envelope (issue #256). */
+        .layer(middleware::from_fn(json_error_envelope_middleware))
         /* Outermost so it measures the complete request lifecycle — including
         a 429 from the rate limiter or a 408 from the timeout above — and
         records the true final status and total latency (issue: missing
@@ -196,6 +219,51 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             http_metrics_middleware,
         ))
         .with_state(state)
+}
+
+/// Rewrites the bare, empty-body responses axum and `tower_http` generate for
+/// `405 Method Not Allowed`, `413 Payload Too Large`, and `408 Request
+/// Timeout` into the documented `{"error": "...", "code": "..."}` envelope
+/// (issue #256). Without this, a client parsing the documented contract gets
+/// a JSON decode failure instead of an error it can act on — the dashboard's
+/// own `api()` helper illustrates the cost, falling back to `res.json().catch(()
+/// => ({}))` and reporting just the bare status.
+///
+/// Applied outer to the router, CORS, the rate limiters, `RequestBodyLimitLayer`
+/// and `TimeoutLayer`, so it sees every response those can produce. A response
+/// that already carries a JSON body (an oversized body caught by `JsonBody`'s
+/// own rejection handling, for instance — see issue #257) is left untouched
+/// rather than risk overwriting it.
+async fn json_error_envelope_middleware(req: Request, next: Next) -> axum::response::Response {
+    let mut res = next.run(req).await;
+
+    let (code, message) = match res.status() {
+        StatusCode::METHOD_NOT_ALLOWED => ("method_not_allowed", "method not allowed"),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "payload_too_large",
+            "request body exceeds the maximum allowed size",
+        ),
+        StatusCode::REQUEST_TIMEOUT => ("request_timeout", "request timed out"),
+        _ => return res,
+    };
+
+    let already_json = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("application/json"));
+    if already_json {
+        return res;
+    }
+
+    *res.body_mut() = axum::body::Body::from(json!({ "error": message, "code": code }).to_string());
+    let headers = res.headers_mut();
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    res
 }
 
 /// The versioned API surface: everything that forms the public contract.
@@ -534,6 +602,36 @@ struct SetRateLimitRequest {
     rate_limit_per_sec: Option<i64>,
 }
 
+/// A label is human text (rendered as-is in the dashboard), so its limit is
+/// counted in characters, not bytes — `str::len` is a byte count, and bounding
+/// it there means the effective limit depends on the alphabet: 100 ASCII
+/// characters, but only ~33 CJK characters or ~25 emoji (issue: API key label
+/// length-checked in bytes rather than characters). `MAX_LABEL_BYTES` is a
+/// separate, generous byte ceiling so a pathological input (e.g. combining
+/// characters) still can't bloat the stored row despite passing the character
+/// count.
+const MAX_LABEL_CHARS: usize = 100;
+const MAX_LABEL_BYTES: usize = 400;
+
+/// Validate a caller-supplied API key label: bounded in both characters and
+/// bytes, and free of control characters (it is rendered verbatim in the
+/// dashboard).
+fn validate_label(label: &str) -> Result<(), AppError> {
+    if label.chars().any(|c| c.is_control()) {
+        return Err(AppError::bad_request(
+            "invalid_label",
+            "label must not contain control characters",
+        ));
+    }
+    if label.chars().count() > MAX_LABEL_CHARS || label.len() > MAX_LABEL_BYTES {
+        return Err(AppError::bad_request(
+            "invalid_label",
+            format!("label must be at most {MAX_LABEL_CHARS} characters"),
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /merchants/:id/keys` — issue an additional API key.
 ///
 /// Rotation is issue-then-revoke rather than replace-in-place: the new key is
@@ -556,12 +654,7 @@ async fn issue_api_key(
 
     let label = body.and_then(|b| b.label);
     if let Some(l) = &label {
-        if l.len() > 100 {
-            return Err(AppError::bad_request(
-                "invalid_label",
-                "label exceeds max length of 100 characters",
-            ));
-        }
+        validate_label(l)?;
     }
 
     let (raw_key, prefix) = db::generate_api_key();
@@ -599,14 +692,35 @@ async fn issue_api_key(
     ))
 }
 
+/// Query parameters for the key listing. Matches the payments/webhook-delivery
+/// listing conventions: a `limit` (default 20, max 100) and an opaque keyset
+/// `cursor` whose value comes from a previous response's `next_cursor`
+/// (issue #262).
+#[derive(serde::Deserialize)]
+struct ListKeysQuery {
+    /// `true` to see only usable keys, `false` for only revoked ones. Omitted
+    /// (the default) returns both, including the revoked audit trail.
+    active: Option<bool>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
 /// `GET /merchants/:id/keys` — list a merchant's keys.
 ///
 /// Returns metadata only. The secret is unrecoverable by design, so this can
 /// never leak a usable credential; `prefix` exists so an operator can identify
 /// which key to revoke.
+///
+/// Keyset-paginated like `GET /payments`: revoked keys are kept forever as an
+/// audit trail, so a merchant that rotates regularly accumulates rows without
+/// bound, and this endpoint sat in the admin × 5 rate-limit bucket with no
+/// `LIMIT` at all — an authenticated admin script in a loop could stall the
+/// single-writer database (issue #262). `active=true` skips straight past the
+/// history for the common case of "which keys can I use right now".
 async fn list_api_keys(
     State(state): State<Arc<AppState>>,
     Path(merchant_id): Path<String>,
+    Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Value>, AppError> {
     if !db::merchant_exists(&state.pool, &merchant_id).await? {
         return Err(AppError::not_found(
@@ -615,7 +729,35 @@ async fn list_api_keys(
         ));
     }
 
-    let keys = db::list_api_keys(&state.pool, &merchant_id).await?;
+    let limit = validate_limit(
+        q.limit,
+        state.config.pagination_default_limit,
+        state.config.pagination_max_limit,
+    )?;
+
+    let cursor = match q.cursor.as_deref() {
+        Some(raw) => Some(
+            decode_cursor(raw)
+                .ok_or_else(|| AppError::bad_request("invalid_cursor", "invalid cursor"))?,
+        ),
+        None => None,
+    };
+
+    let keys = db::list_api_keys_keyset(
+        &state.pool,
+        &merchant_id,
+        q.active,
+        limit,
+        cursor.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str())),
+    )
+    .await?;
+
+    let next_cursor = if keys.len() == limit as usize {
+        keys.last().map(|k| encode_cursor(&k.created_at, &k.id))
+    } else {
+        None
+    };
+
     Ok(Json(json!({
         "merchant_id": merchant_id,
         "keys": keys.iter().map(|k| json!({
@@ -627,6 +769,8 @@ async fn list_api_keys(
             "revoked_at": k.revoked_at,
             "active": k.revoked_at.is_none(),
         })).collect::<Vec<_>>(),
+        "limit": limit,
+        "next_cursor": next_cursor,
     })))
 }
 
@@ -926,8 +1070,9 @@ fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, r
 /// Redelivery is bucketed by shape rather than by path: the URL carries a
 /// payment and delivery id, and keying on those would let every id mint its
 /// own limiter entry — both an unbounded map and a trivially bypassed limit.
-fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
-    let path = req.uri().path();
+pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
+    let raw_path = req.uri().path();
+    let path = raw_path.strip_prefix("/v1").unwrap_or(raw_path);
     if path == "/health" || path == "/ready" || path == "/metrics" {
         return None;
     }
@@ -951,7 +1096,7 @@ fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
 ///
 /// Write/sensitive buckets get the base rate (× 1). Read-only traffic gets a
 /// higher allowance (× 5) so normal API consumers aren't throttled by polling.
-fn bucket_rate_multiplier(bucket: &str) -> u32 {
+pub fn bucket_rate_multiplier(bucket: &str) -> u32 {
     match bucket {
         "payments" | "merchants" | "redeliver" => 1,
         _ => 5,
@@ -1287,12 +1432,11 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// Probe Horizon with a hard 3-second timeout.
 /// Returns Ok(()) when reachable (any non-5xx response), or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
-    let url = state.config.horizon_url.trim_end_matches('/').to_string();
     let result = tokio::time::timeout(
         Duration::from_millis(3_000),
         state
             .http
-            .get(&url)
+            .get(state.config.horizon_url.clone())
             .header("Accept", "application/json")
             .send(),
     )
@@ -1658,5 +1802,46 @@ mod tests {
             rate_limited_bucket(&method_req(axum::http::Method::GET, "/payments/abc")),
             Some("default")
         );
+    }
+
+    #[test]
+    fn test_rate_limit_bucket_assignment_all_routes() {
+        use axum::http::Method;
+        let cases = [
+            (Method::POST, "/payments", Some("payments")),
+            (Method::POST, "/v1/payments", Some("payments")),
+            (Method::POST, "/merchants", Some("merchants")),
+            (Method::POST, "/v1/merchants", Some("merchants")),
+            (
+                Method::POST,
+                "/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (
+                Method::POST,
+                "/v1/payments/x/webhooks/y/redeliver",
+                Some("redeliver"),
+            ),
+            (Method::GET, "/health", None),
+            (Method::GET, "/v1/health", None),
+        ];
+
+        for (method, path, expected_bucket) in cases {
+            let req = method_req(method.clone(), path);
+            assert_eq!(
+                rate_limited_bucket(&req),
+                expected_bucket,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bucket_rate_multiplier() {
+        assert_eq!(bucket_rate_multiplier("payments"), 1);
+        assert_eq!(bucket_rate_multiplier("merchants"), 1);
+        assert_eq!(bucket_rate_multiplier("redeliver"), 1);
+        assert_eq!(bucket_rate_multiplier("default"), 5);
+        assert_eq!(bucket_rate_multiplier("unknown"), 5);
     }
 }

@@ -1,7 +1,18 @@
 openapi: 3.1.0
 info:
   title: StellarGate
-  description: Payment gateway API built on Stellar for accepting and managing payments in XLM and USDC.
+  description: >-
+    Payment gateway API built on Stellar for accepting and managing payments
+    in XLM and USDC.
+
+
+    Every operation below can additionally answer with the framework-level
+    failures documented as `#/components/responses/MethodNotAllowed`,
+    `#/components/responses/PayloadTooLarge`, and
+    `#/components/responses/RequestTimeout` — a `405`, `413`, or `408` in the
+    same `ErrorResponse` envelope as every other error, not left to a
+    per-operation listing that would just repeat the same three entries
+    everywhere.
   version: 0.1.0
 
 servers:
@@ -170,7 +181,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/IssueKeyResponse"
         "400":
-          description: Label exceeds 100 characters, or the request body has an unrecognised field
+          description: Label exceeds 100 characters (or 400 bytes), contains a control character, or the request body has an unrecognised field
           content:
             application/json:
               schema:
@@ -179,7 +190,7 @@ paths:
                 invalid_label:
                   summary: Label too long
                   value:
-                    error: label exceeds max length of 100 characters
+                    error: label must be at most 100 characters
                     code: invalid_label
         "401":
           $ref: "#/components/responses/AdminUnauthorized"
@@ -202,6 +213,11 @@ paths:
       description: >-
         Metadata only — never the secret, which is unrecoverable by design.
         `prefix` is enough for an operator to identify which key to revoke.
+        Keyset (cursor) paginated with the same conventions as `GET
+        /payments`: revoked keys are kept forever as an audit trail, so a
+        merchant that rotates regularly accumulates rows without bound, and
+        this endpoint used to return every one of them in a single unbounded
+        response (issue #262).
       security:
         - adminSecret: []
       parameters:
@@ -212,13 +228,51 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: active
+          in: query
+          schema:
+            type: boolean
+          description: >-
+            `true` returns only usable keys, `false` only revoked ones.
+            Omitted (the default) returns both, including the revoked audit
+            trail.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+          description: Page size
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Opaque cursor for keyset pagination (returned as next_cursor)
       responses:
         "200":
-          description: The merchant's keys
+          description: A page of the merchant's keys
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ListApiKeysResponse"
+        "400":
+          description: Invalid query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
         "401":
           $ref: "#/components/responses/AdminUnauthorized"
         "404":
@@ -355,6 +409,25 @@ paths:
                     code: amount_out_of_range
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: >-
+            The request carried an `Idempotency-Key` that another in-flight
+            request for the same merchant is already creating a payment for,
+            and that request had not committed yet. Transient: retry after
+            the interval in `Retry-After`.
+          headers:
+            Retry-After:
+              $ref: "#/components/headers/RetryAfter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                idempotency_conflict:
+                  summary: Concurrent create raced on the same idempotency key
+                  value:
+                    error: concurrent request conflict, please retry
+                    code: idempotency_conflict
         "429":
           description: >-
             Rate limit exceeded. The request fell into the `payments` bucket,
@@ -407,6 +480,13 @@ paths:
       description: >-
         Scoped to the merchant that owns the API key. There is no parameter for
         selecting a different merchant.
+
+
+        The parameter set is closed: a query parameter not listed below is
+        rejected with `400 unknown_parameter` naming it, rather than ignored.
+        A discarded filter would otherwise be returned as an unfiltered `200`
+        page, so `?stauts=completed` listed every payment including pending
+        ones.
       security:
         - bearerAuth: []
       parameters:
@@ -435,11 +515,18 @@ paths:
             `cursor`). SQLite implements OFFSET by producing and discarding
             every skipped row, so cost grows with depth; values above 10000
             are rejected with `400 invalid_offset` rather than answered.
+            Mutually exclusive with `cursor`: sending both is
+            `400 conflicting_pagination`, decided on presence rather than
+            value, so even `offset=0` alongside a cursor is rejected.
         - name: cursor
           in: query
           schema:
             type: string
-          description: Opaque cursor for keyset pagination (returned as next_cursor)
+          description: >-
+            Opaque cursor for keyset pagination (returned as next_cursor).
+            Selects keyset mode, whose response carries `payments`, `limit` and
+            `next_cursor` but no `offset` or `total`. Mutually exclusive with
+            `offset`: sending both is `400 conflicting_pagination`.
         - name: include_total
           in: query
           schema:
@@ -481,6 +568,21 @@ paths:
                   value:
                     error: "offset exceeds maximum of 10000; use cursor pagination instead (see the `cursor` parameter and `next_cursor` in the response)"
                     code: invalid_offset
+                conflicting_pagination:
+                  summary: Both cursor and offset supplied
+                  value:
+                    error: "cursor and offset are mutually exclusive; use cursor for keyset pagination"
+                    code: conflicting_pagination
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`"
+                    code: unknown_parameter
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -588,11 +690,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/ListMerchantWebhookDeliveriesResponse"
         "400":
-          description: Invalid `status` or `cursor`
+          description: >-
+            Invalid `status`, `cursor`, or `limit`, or a query parameter this
+            endpoint does not accept. The parameter set is closed: anything not
+            listed above is rejected with `400 unknown_parameter` naming it.
+            That matters most here, where `status` defaults to `failed` — a
+            typo'd filter would otherwise answer with the dead-letter list and
+            look entirely plausible.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `staus`, expected one of `status`, `limit`, `cursor`"
+                    code: unknown_parameter
 
   /payments/webhooks/redeliver:
     post:
@@ -678,6 +797,22 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_cursor:
+                  summary: Invalid cursor
+                  value:
+                    error: invalid cursor
+                    code: invalid_cursor
+                invalid_limit:
+                  summary: limit outside 1..=100
+                  value:
+                    error: "limit must be between 1 and 100 (got 5000)"
+                    code: invalid_limit
+                unknown_parameter:
+                  summary: Unrecognised query parameter
+                  value:
+                    error: "invalid query string: Failed to deserialize query string: unknown field `staus`, expected one of `status`, `limit`, `cursor`"
+                    code: unknown_parameter
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -777,6 +912,53 @@ components:
               value:
                 error: invalid API key
                 code: unauthorized
+
+    MethodNotAllowed:
+      description: >-
+        The path exists, but not for this HTTP method. Generated by axum's
+        router itself rather than a handler; rewritten into the standard
+        error envelope by `json_error_envelope_middleware` (issue #256).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            method_not_allowed:
+              summary: Unsupported method for this path
+              value:
+                error: method not allowed
+                code: method_not_allowed
+
+    PayloadTooLarge:
+      description: >-
+        Request body exceeds the configured maximum (`MAX_BODY_BYTES`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            payload_too_large:
+              summary: Body exceeds MAX_BODY_BYTES
+              value:
+                error: request body exceeds the maximum allowed size
+                code: payload_too_large
+
+    RequestTimeout:
+      description: >-
+        The request did not complete within `REQUEST_TIMEOUT_SECS`.
+        Generated by `TimeoutLayer` rather than a handler; rewritten into the
+        standard error envelope by `json_error_envelope_middleware` (issue
+        #256).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            request_timeout:
+              summary: Handler exceeded REQUEST_TIMEOUT_SECS
+              value:
+                error: request timed out
+                code: request_timeout
 
     AdminUnauthorized:
       description: >-
@@ -898,7 +1080,7 @@ components:
 
     ListApiKeysResponse:
       type: object
-      required: [merchant_id, keys]
+      required: [merchant_id, keys, limit]
       properties:
         merchant_id:
           type: string
@@ -907,6 +1089,12 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/ApiKeySummary"
+        limit:
+          type: integer
+        next_cursor:
+          type: string
+          nullable: true
+          description: Pass as cursor on the next request to get the following page
 
     RevokeApiKeyResponse:
       type: object
@@ -1028,6 +1216,12 @@ components:
 
     ListPaymentsResponse:
       type: object
+      description: >-
+        One shape per pagination mode, chosen by the request. Keyset mode
+        (`cursor` set) returns `payments`, `limit` and `next_cursor`. Offset
+        mode (`cursor` absent) returns those plus `offset`, and `total` when
+        `include_total=true`. The modes cannot be combined: `cursor` together
+        with `offset` is `400 conflicting_pagination`.
       required: [payments, limit]
       properties:
         payments:
@@ -1046,7 +1240,9 @@ components:
           type: integer
         offset:
           type: integer
-          description: Present when using offset pagination
+          description: >-
+            Rows skipped. Offset pagination only; absent in keyset (cursor)
+            mode.
         next_cursor:
           type: string
           nullable: true
@@ -1123,7 +1319,7 @@ components:
 
     WebhookDelivery:
       type: object
-      required: [id, url, event, status, attempts, created_at]
+      required: [id, url, event, status, attempts, manual_attempts, created_at]
       properties:
         id:
           type: string
@@ -1142,6 +1338,15 @@ components:
           enum: [pending, delivered, failed]
         attempts:
           type: integer
+          description: >-
+            Automatic delivery attempts (inline dispatch + background redrive).
+            Capped by WEBHOOK_REDRIVE_MAX_ATTEMPTS.
+        manual_attempts:
+          type: integer
+          description: >-
+            Merchant-initiated redeliveries via POST .../redeliver. Does not
+            consume the automatic redrive budget and does not refresh
+            last_attempt / backoff.
         last_attempt:
           type: string
           format: date-time
@@ -1186,10 +1391,12 @@ components:
           description: >-
             Stable machine-readable error code for programmatic handling. Public
             values currently include unauthorized, internal_error,
-            invalid_request, unknown_field, unsupported_asset, invalid_amount,
+            invalid_request, unknown_field, unsupported_media_type,
+            payload_too_large, unsupported_asset, invalid_amount,
             amount_out_of_range, invalid_webhook_url, invalid_status,
-            invalid_cursor, payment_not_found, delivery_not_found,
-            rate_limit_exceeded, not_found, webhook_target_blocked,
+            invalid_cursor, invalid_limit, invalid_offset,
+            conflicting_pagination, payment_not_found,
+            delivery_not_found, rate_limit_exceeded, not_found, webhook_target_blocked,
             webhook_delivery_failed, idempotency_conflict, merchant_not_found,
             invalid_label, last_active_key, trustline_missing, and
             key_not_found.

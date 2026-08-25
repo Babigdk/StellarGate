@@ -25,7 +25,7 @@ fn make_config() -> Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),

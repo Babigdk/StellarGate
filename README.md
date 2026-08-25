@@ -443,10 +443,10 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 | `WEBHOOK_REDRIVE_INTERVAL_SECS` | Scan frequency | `30` |
 | `WEBHOOK_REDRIVE_CONCURRENCY` | Max redrive requests in flight | `4` |
 | `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left permanently `failed` | `8` |
-| `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. | `60` |
-| `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. `0` disables growth. | `30` |
-| `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `≥` the initial value. | `900` |
-| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. `0` disables. | `30` |
+| `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. Must be `1..=86,400`. | `60` |
+| `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. Must be `0..=86,400`; `0` disables growth. | `30` |
+| `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `1..=86,400` and `≥` the initial value. | `900` |
+| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. Must be `0..=86,400`; `0` disables. | `30` |
 
 The jitter is what actually decorrelates a batch. Rows that failed together
 share an `attempts` value and a near-identical `last_attempt`, so
@@ -567,6 +567,11 @@ GET  /v1/payments/:id
 POST /v1/merchants
 ```
 
+The bundled dashboard uses this same canonical prefix through one shared API
+base, so all of its authenticated requests track the current API version.
+Operational requests such as `/` and `/ready` remain unversioned as described
+below.
+
 Unversioned paths (`/payments`, `/merchants`) still work and serve the same
 data, so nothing breaks today. They respond with headers pointing at their
 replacement:
@@ -654,17 +659,47 @@ edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
 always taken the merchant from the API key, so a client that sent it believed
 it was choosing the tenant and was not.
 
+**Query strings are closed too.** The listing endpoints accept exactly the
+parameters documented for them, and anything else is rejected with `400`
+`unknown_parameter` naming the offending key:
+
+```bash
+curl "http://localhost:3000/v1/payments?stauts=completed" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+```json
+{
+  "error": "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`",
+  "code": "unknown_parameter"
+}
+```
+
+The cost of the old behaviour was the same as for bodies, and quieter: a
+discarded filter is an unfiltered page returned as `200 OK`, so
+`?stauts=completed` listed every payment including pending ones and a
+reconciliation script that filtered server-side read unpaid intents as paid.
+`?page` and `?per_page` are the other common shapes of this — plausible
+pagination names that this API has never used. Closing the parameter set also
+keeps it evolvable: while unknown parameters were ignored, adding a real `page`
+later would silently change the behaviour of requests that appeared to work.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
+| `unknown_parameter` | `400` | Query string contained a parameter the endpoint does not accept |
+| `invalid_query` | `400` | Query string could not be deserialized (e.g. a non-numeric `limit`) |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
+| `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
+| `conflicting_pagination` | `400` | `cursor` and `offset` were sent together |
+| `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
 | `merchant_not_found` | `404` | No merchant with that id |
 | `key_not_found` | `404` | No active key with that id for this merchant |
@@ -674,9 +709,19 @@ it was choosing the tenant and was not.
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
-| `idempotency_conflict` | `500` | Concurrent creates raced on one idempotency key |
+| `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
 | `not_found` | `404` | No matching route |
+| `method_not_allowed` | `405` | Path exists, but not for this HTTP method |
+| `request_timeout` | `408` | Request exceeded `REQUEST_TIMEOUT_SECS` |
 | `internal_error` | `500` | Unexpected server-side failure |
+
+`405`, `413`, and `408` are otherwise generated by axum and `tower_http`
+themselves — before this, they carried an empty body rather than the envelope
+above, so a client parsing the documented contract got a JSON decode failure
+instead of an error it could act on. A response-rewriting middleware
+(`json_error_envelope_middleware` in `src/api/mod.rs`) fills in the envelope
+for these three cases wherever nothing downstream has already answered with
+one.
 
 ---
 
@@ -730,7 +775,22 @@ curl -X POST http://localhost:3000/merchants/$MERCHANT_ID/keys \
 ### `GET /merchants/:id/keys`
 
 List a merchant's keys, including revoked ones so the history stays visible.
-Admin only.
+Admin only. Keyset (cursor) paginated with the same conventions as
+[`GET /payments`](#get-payments) — revoked keys are never deleted, so a
+merchant that rotates regularly accumulates rows without bound, and this
+endpoint used to return every one of them in a single unbounded response
+(issue #262).
+
+| Param | Default | Notes |
+|---|---|---|
+| `limit` | 20 (max 100) | Page size. Rejected with `400 invalid_limit` outside `1..=100`, not silently clamped. |
+| `cursor` | _(unset)_ | Opaque cursor from a previous response's `next_cursor`. Omit for the first page. |
+| `active` | _(unset — both)_ | `true` returns only usable keys, `false` only revoked ones. Omitted returns both. |
+
+```bash
+curl "http://localhost:3000/merchants/$MERCHANT_ID/keys?limit=20&active=true" \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
+```
 
 **`200 OK`**
 
@@ -747,7 +807,9 @@ Admin only.
       "revoked_at": null,
       "active": true
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": null
 }
 ```
 
@@ -757,6 +819,12 @@ deciding which to revoke. `last_used_at` is refreshed at most once a minute per
 key: it runs on every authenticated request, and SQLite takes a write lock per
 update, so touching it unconditionally would put a write in the path of every
 read.
+
+A full page (`keys.len() == limit`) mints `next_cursor` from its last row; pass
+it back as `cursor` to fetch the next page. A short page (or an empty one)
+returns `next_cursor: null`, meaning there is nothing more. `active=true` lets
+an operator looking for currently-usable keys skip straight past the revoked
+history instead of paging through it to find them.
 
 ---
 
@@ -904,12 +972,12 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | Param | Description | Default |
 |---|---|---|
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
-| `limit` | Page size, 1–100 | `20` |
-| `cursor` | Keyset cursor from a previous `next_cursor` | — |
-| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
+| `cursor` | Keyset cursor from a previous `next_cursor`. Mutually exclusive with `offset`. | — |
+| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. Mutually exclusive with `cursor`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
-**`200 OK`** — cursor mode (no `cursor` parameter on the first request)
+**`200 OK`** — cursor mode (`cursor` set)
 
 ```json
 {
@@ -919,7 +987,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 }
 ```
 
-**`200 OK`** — offset mode (no `cursor` parameter, `offset` set)
+**`200 OK`** — offset mode (no `cursor` parameter; `offset` set, or neither set)
 
 ```json
 {
@@ -934,6 +1002,16 @@ Both modes order rows identically (`created_at DESC`, then `id DESC` to break
 the whole-second `created_at` ties), so a `next_cursor` returned by an offset
 page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
 of either mode. Offset mode additionally returns `offset`.
+
+**Pick one mode per request.** Sending `cursor` and `offset` together is `400
+conflicting_pagination`. The two modes answer from different queries and return
+different bodies, so there is no reading of "both" that is not a guess: the
+request would be served from the cursor, `offset` silently discarded, and the
+`offset` field absent from the response. That matters most during the very
+migration the `next_cursor` above exists to encourage, which is when a client is
+most likely to still be sending its old `offset`. Presence is what counts, not
+the value, so `?cursor=...&offset=0` is rejected too. Drop `offset` from the
+request once you start passing `cursor`.
 
 > **`total` is opt-in (`?include_total=true`), not sent by default.** SQLite
 > has no cached row count, so computing `total` is a full `COUNT(*)` scan over
@@ -983,8 +1061,11 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | Query param | Description | Default |
 |---|---|---|
 | `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
-| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
+
+Any other query parameter is rejected with `400` `unknown_parameter` — see
+[Error Envelope](#error-envelope).
 
 `next_cursor` is `null` on the final page. To page through the history, start with a
 request that carries **no** `cursor`, then pass the previous response's `next_cursor`
@@ -1030,8 +1111,12 @@ look.
 | Query | Default | Notes |
 |---|---|---|
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
-| `limit` | `20` | 1–100 |
+| `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+Any other query parameter is rejected with `400` `unknown_parameter`. It matters
+most here, where `status` defaults to `failed`: a typo'd filter would otherwise
+answer with the dead-letter list and look entirely plausible.
 
 ```bash
 curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
@@ -1420,7 +1505,17 @@ compare it against. `stellargate_task_disabled` is what separates "switched off
 on purpose" from "not running", which `stellargate_task_running` alone reports
 identically.
 
-Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
+Structured logs (via `tracing`) carry a `request_id` field on every request span, matching the `x-request-id` response header returned to clients. Every log line emitted during a request — including internal errors (`AppError`), audit events, and auth denials — inherits `request_id` automatically from the span context. Operators can search logs directly using the request ID returned in response headers:
+
+```bash
+# Filter JSON logs by request ID quoted by a client:
+jq 'select(.request_id == "7f3a...")' /var/log/stellargate.log
+
+# Grep structured text logs by request ID:
+grep 'request_id=7f3a...' /var/log/stellargate.log
+```
+
+Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 
 Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=debug`.
 
@@ -1504,18 +1599,16 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 
-> [!IMPORTANT]
-> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
->
-> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+`db::migrate` is **the only schema definition in this repository.** There used to be a second, hand-synchronised one — a `migrations/` directory of numbered `.sql` files that nothing ever executed (no `sqlx::migrate!` call anywhere in the codebase) and that had silently drifted to the point of missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column: a database built from those files could not authenticate a request or record a settlement. It looked authoritative — numbered, in the conventional location — which made it actively misleading rather than merely unused, so it was removed rather than left as a second definition a future change could drift from again (issue #308). `tests/schema_snapshot_test.rs` now keeps `db::migrate` itself honest: it asserts a freshly migrated database matches the checked-in `tests/schema_snapshot.sql` exactly, so a schema change that isn't reflected there fails CI instead of drifting silently — the same failure mode the old `migrations/` directory had, closed by making the live schema self-verifying instead of hand-copied.
 
 **Changing the schema**
 
 1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
 2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
-3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
+3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately, and `tests/schema_snapshot_test.rs` will fail with the new schema's exact text, ready to paste into `tests/schema_snapshot.sql`.
+4. Review the snapshot diff like any other schema change, and update this section's tables/docs if you added something a reader would need to know about.
 
-Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
+Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 (adopting `sqlx::migrate!` with a recorded schema version) first rather than working around it — that is the bigger, separate change this snapshot test deliberately does not attempt to replace.
 
 ---
 
@@ -1542,6 +1635,7 @@ CI enforces all four on every pull request, plus a [`cargo audit`](https://githu
 | `tests/webhook_dispatch_tests.rs` | Signing, retries, redrive |
 | `tests/trustline_tests.rs` | Asset trustline checks |
 | `tests/db_shared_memory_tests.rs` | Proves the shared-cache in-memory SQLite fixture (below) is actually shared across pooled connections |
+| `tests/schema_snapshot_test.rs` | `db::migrate`'s output matches the checked-in `tests/schema_snapshot.sql` exactly |
 
 Integration tests run against an in-memory SQLite database and a [wiremock](https://github.com/LukeMathWalker/wiremock-rs) HTTP server — no network access or external services required.
 

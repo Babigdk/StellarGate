@@ -81,7 +81,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: String::new(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
             // A real-looking Stellar strkey so Config::validate_addresses passes.
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets,
@@ -351,6 +351,25 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
         paging_token: Some("1".into()),
         created_at: None,
     }
+}
+
+/// Production reconciliation must consume the same settlement decision as the
+/// pure Horizon verdict tests. Exact, underpaid, and exact-top-up outcomes are
+/// exercised by the tests above/below; this closes the remaining overpayment
+/// branch through `reconcile_payment` itself (issue #225).
+#[tokio::test]
+async fn reconcile_payment_uses_shared_decision_for_overpayment() {
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool.clone(), None);
+
+    let overpayment = payment_with("TX_OVERPAID", "12.5000000");
+    assert!(reconcile_payment(&state, &overpayment).await.unwrap());
+
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
+    assert_eq!(payment.status, "completed");
+    assert_eq!(payment.tx_hash.as_deref(), Some("TX_OVERPAID"));
+    assert_eq!(payment.paid_amount.as_deref(), Some("12.5"));
 }
 
 /// Re-processing any previously-seen transaction is a no-op regardless of the

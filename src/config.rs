@@ -2,6 +2,11 @@ use anyhow::Result;
 use ipnet::IpNet;
 use std::collections::HashSet;
 
+/// Longest accepted webhook-redrive timing window. A one-day ceiling keeps
+/// operator mistakes bounded and makes the SQL eligibility arithmetic stay
+/// comfortably inside SQLite's signed 64-bit integer range (issue #241).
+const MAX_WEBHOOK_REDRIVE_WINDOW_SECS: i64 = 86_400;
+
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerMode {
@@ -201,7 +206,9 @@ pub struct Config {
     pub port: u16,
     pub database_url: String,
     pub network: String,
-    pub horizon_url: String,
+    /// Parsed and validated once at boot so every Horizon request starts from
+    /// a typed URL rather than reparsing or trimming an arbitrary string.
+    pub horizon_url: reqwest::Url,
     pub gateway_public: String,
     /// Assets the gateway will accept, validated on POST /payments.
     /// Duplicate codes are rejected at boot (issue #222). Non-native entries
@@ -423,8 +430,10 @@ impl Config {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
         let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-        let horizon_url = std::env::var("STELLAR_HORIZON_URL")
-            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let horizon_url = Self::parse_horizon_url(
+            &std::env::var("STELLAR_HORIZON_URL")
+                .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+        )?;
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
@@ -568,6 +577,39 @@ impl Config {
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+
+    /// Parse and normalize the Horizon base URL during configuration loading.
+    /// Request-specific paths and queries are appended later with `Url`'s
+    /// segment and query-pair APIs, so a base query or fragment would be
+    /// ambiguous and is rejected here rather than silently overwritten.
+    fn parse_horizon_url(raw: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(raw).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: {e}. Expected an absolute HTTP(S) URL."
+            )
+        })?;
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: scheme must be http or https"
+            ));
+        }
+        if url.cannot_be_a_base() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: URL cannot be used as a base"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: base URL must not contain a query or fragment"
+            ));
+        }
+
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
+            .pop_if_empty();
+        Ok(url)
     }
 
     /// Reject configured Stellar addresses — the gateway account and any asset
@@ -744,6 +786,9 @@ impl Config {
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
+    /// - redrive timing values outside their documented one-day bounds → the
+    ///   eligibility expression can overflow or defer a row for an accidental,
+    ///   operationally useless interval
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -810,6 +855,50 @@ impl Config {
             ));
         }
 
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_grace_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_GRACE_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_grace_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS)
+            .contains(&self.webhook_redrive_backoff_initial_secs)
+        {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_backoff_max_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_max_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_jitter_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_JITTER_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_jitter_secs
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
         /* The redrive grace window has to clear the worst case a `dispatch()`
         call can take, or the worker starts a second delivery for a row whose
         first one is still in flight. Making the inline delay exponential
@@ -830,14 +919,6 @@ impl Config {
                 self.webhook_timeout_secs,
                 self.webhook_retry_delay_ms,
                 self.webhook_retry_max_delay_ms
-            ));
-        }
-
-        if self.webhook_redrive_jitter_secs < 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_JITTER_SECS must be >= 0 (got {}). \
-                 A negative jitter would pull deliveries forward past their backoff.",
-                self.webhook_redrive_jitter_secs
             ));
         }
 
@@ -862,16 +943,6 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
-            ));
-        }
-
-        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
-                 With the current settings the cap would override the starting delay and backoff \
-                 would never actually grow.",
-                self.webhook_redrive_backoff_max_secs,
-                self.webhook_redrive_backoff_initial_secs
             ));
         }
 
@@ -1095,7 +1166,7 @@ mod tests {
             port: 3000,
             database_url: "sqlite:test.db".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "GPUBLIC".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
@@ -1188,7 +1259,7 @@ mod tests {
             port: 3000,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "UNCONFIGURED".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: String::new(),
@@ -1594,6 +1665,52 @@ mod tests {
     }
 
     #[test]
+    fn invalid_horizon_url_fails_during_configuration() {
+        for invalid in [
+            "not a url",
+            "ftp://horizon.example",
+            "https://horizon.example?tenant=wrong",
+            "https://horizon.example/#fragment",
+        ] {
+            run_with_env(
+                &[
+                    ("STELLAR_NETWORK", Some("testnet")),
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    ("STELLAR_HORIZON_URL", Some(invalid)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(
+                        err.contains("STELLAR_HORIZON_URL"),
+                        "startup error must identify the invalid variable; got: {err}"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn horizon_url_is_parsed_and_normalized_during_configuration() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon.example/custom/base/"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(
+                    cfg.horizon_url.as_str(),
+                    "https://horizon.example/custom/base"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn startup_fails_when_accepted_assets_omits_a_non_native_issuer() {
         run_with_env(
             &[
@@ -1843,6 +1960,64 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_negative_redrive_backoff_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = -1;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_zero_redrive_backoff_max() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_redrive_values_above_one_day() {
+        for field in ["grace", "initial", "max", "jitter"] {
+            let mut cfg = timing_config();
+            match field {
+                "grace" => cfg.webhook_redrive_grace_secs = 86_401,
+                "initial" => {
+                    cfg.webhook_redrive_backoff_initial_secs = 86_401;
+                    cfg.webhook_redrive_backoff_max_secs = 86_401;
+                }
+                "max" => cfg.webhook_redrive_backoff_max_secs = 86_401,
+                "jitter" => cfg.webhook_redrive_jitter_secs = 86_401,
+                _ => unreachable!(),
+            }
+            let err = cfg.validate_timing().unwrap_err().to_string();
+            assert!(err.contains("WEBHOOK_REDRIVE"), "{field}: got {err}");
+        }
+    }
+
+    #[test]
+    fn timing_accepts_redrive_boundaries() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_grace_secs = 86_400;
+        cfg.webhook_redrive_backoff_initial_secs = 86_400;
+        cfg.webhook_redrive_backoff_max_secs = 86_400;
+        cfg.webhook_redrive_jitter_secs = 86_400;
+        assert!(cfg.validate_timing().is_ok());
+
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        assert!(
+            cfg.validate_timing().is_ok(),
+            "zero initial must continue to disable exponential growth"
+        );
+    }
+
+    #[test]
     fn timing_allows_backoff_max_equal_to_initial() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 30;
@@ -1854,8 +2029,29 @@ mod tests {
     fn timing_allows_zero_backoff_initial_to_disable_growth() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 0;
-        cfg.webhook_redrive_backoff_max_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 900;
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_out_of_range_redrive_timing() {
+        for (name, value) in [
+            ("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS", "-1"),
+            ("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_GRACE_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_JITTER_SECS", "86401"),
+        ] {
+            run_with_env(
+                &[
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    (name, Some(value)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains(name), "{name}: got {err}");
+                },
+            );
+        }
     }
 
     #[test]

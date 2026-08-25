@@ -73,7 +73,7 @@ mod tests {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: String::new(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),

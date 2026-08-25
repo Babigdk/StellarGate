@@ -32,7 +32,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         port: 0,
         database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: webhook_secret.into(),
@@ -813,5 +813,77 @@ async fn update_webhook_delivery_errors_when_row_is_missing() {
     assert!(
         err.to_string().contains("missing-id"),
         "error should name the missing id, got: {err}"
+    );
+}
+
+// ── Manual redelivery vs redrive budget (issue #235) ─────────────────────────
+
+/// Manual redeliveries used to share `attempts` with the redrive worker. After
+/// `WEBHOOK_REDRIVE_MAX_ATTEMPTS` merchant clicks the row dropped out of
+/// `list_redrivable_deliveries` forever — even though automatic recovery is
+/// exactly what the merchant was trying to restore.
+#[tokio::test]
+async fn manual_redeliveries_do_not_exhaust_the_automatic_redrive_budget() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_redrive_max_attempts = 8;
+    cfg.webhook_redrive_grace_secs = 0;
+    let state = setup_state(cfg).await;
+    let payment = create_test_payment(&state, "http://example.com/hook").await;
+
+    db::save_webhook_delivery(
+        &state.pool,
+        "manual-budget",
+        &payment.id,
+        "http://example.com/hook",
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    // Already used some of the automatic budget, but still under the cap.
+    db::update_webhook_delivery(&state.pool, "manual-budget", "failed", 3)
+        .await
+        .unwrap();
+
+    let before = db::get_webhook_delivery(&state.pool, "manual-budget")
+        .await
+        .unwrap()
+        .unwrap();
+    let last_attempt_before = before.last_attempt.clone();
+
+    // More manual redeliveries than the entire automatic budget.
+    for _ in 0..10 {
+        db::record_manual_redelivery(&state.pool, "manual-budget", "failed")
+            .await
+            .unwrap();
+    }
+
+    let after = db::get_webhook_delivery(&state.pool, "manual-budget")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.attempts, 3,
+        "manual redelivery must not increment the automatic attempts counter"
+    );
+    assert_eq!(after.manual_attempts, 10);
+    assert_eq!(
+        after.last_attempt, last_attempt_before,
+        "manual redelivery must not refresh last_attempt / backoff"
+    );
+
+    let candidates = db::list_redrivable_deliveries(
+        &state.pool,
+        state.config.webhook_redrive_max_attempts as i64,
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        candidates.iter().any(|d| d.id == "manual-budget"),
+        "delivery must remain redrivable after many manual redeliveries; got {candidates:?}"
     );
 }

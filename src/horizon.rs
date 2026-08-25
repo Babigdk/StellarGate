@@ -38,8 +38,9 @@
 //! and undocumented behaviour that Horizon's payments-for-account endpoint
 //! tends to surface only successful operations.
 //!
-//! The matching logic in [`verify`] is pure and unit-tested; the networked
-//! functions wrap it with I/O.
+//! The intent matching and settlement-decision logic used by [`verify`] and
+//! [`reconcile_payment`] are pure and unit-tested; the networked functions wrap
+//! them with I/O.
 
 use crate::supervise::TaskExit;
 use crate::{db, money, webhook, AppState};
@@ -49,11 +50,68 @@ use std::sync::Arc;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Key under which the last fully-processed Horizon paging token is stored in
 /// the `kv_state` table, so polling resumes from it across restarts.
 const PAYMENT_CURSOR_KEY: &str = "horizon_payment_cursor";
+
+/// The three payment-request shapes used by the reconciler. Keeping the query
+/// layout here makes every caller go through `Url`'s encoding API while
+/// preserving the parameters each Horizon endpoint already receives.
+#[derive(Debug, Clone, Copy)]
+enum PaymentsRequest<'a> {
+    Poll { cursor: &'a str, limit: u32 },
+    Baseline { cursor: Option<&'a str>, limit: u32 },
+    Stream { cursor: &'a str },
+}
+
+fn horizon_account_url(base: &reqwest::Url, account: &str) -> anyhow::Result<reqwest::Url> {
+    let mut url = base.clone();
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
+        .pop_if_empty()
+        .extend(["accounts", account]);
+    Ok(url)
+}
+
+fn horizon_payments_url(
+    base: &reqwest::Url,
+    account: &str,
+    request: PaymentsRequest<'_>,
+) -> anyhow::Result<reqwest::Url> {
+    let mut url = horizon_account_url(base, account)?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
+        .push("payments");
+
+    match request {
+        PaymentsRequest::Poll { cursor, limit } => {
+            let limit = limit.to_string();
+            url.query_pairs_mut()
+                .append_pair("order", "asc")
+                .append_pair("cursor", cursor)
+                .append_pair("limit", &limit)
+                .append_pair("join", "transactions");
+        }
+        PaymentsRequest::Baseline { cursor, limit } => {
+            let limit = limit.to_string();
+            let mut pairs = url.query_pairs_mut();
+            pairs
+                .append_pair("order", "desc")
+                .append_pair("limit", &limit);
+            if let Some(cursor) = cursor {
+                pairs.append_pair("cursor", cursor);
+            }
+        }
+        PaymentsRequest::Stream { cursor } => {
+            url.query_pairs_mut()
+                .append_pair("cursor", cursor)
+                .append_pair("join", "transactions");
+        }
+    }
+    Ok(url)
+}
 
 /// A single payment operation as returned by Horizon, with the embedded
 /// transaction (requested via `join=transactions`) so we can read its memo.
@@ -152,6 +210,79 @@ pub enum Verdict {
     },
 }
 
+impl Verdict {
+    fn tx_hash(&self) -> &str {
+        match self {
+            Self::Completed { tx_hash, .. }
+            | Self::Overpaid { tx_hash, .. }
+            | Self::Underpaid { tx_hash, .. } => tx_hash,
+        }
+    }
+
+    fn paid_amount(&self) -> &str {
+        match self {
+            Self::Completed { paid_amount, .. }
+            | Self::Overpaid { paid_amount, .. }
+            | Self::Underpaid { paid_amount, .. } => paid_amount,
+        }
+    }
+}
+
+/// Pure result consumed by production reconciliation after the authoritative
+/// processed-transaction ledger has been re-summed. Keeping the verdict and
+/// its persistence/webhook metadata together prevents those outcomes from
+/// drifting into separate amount comparisons (issue #225).
+#[derive(Debug, PartialEq, Eq)]
+struct SettlementDecision {
+    verdict: Verdict,
+    status: &'static str,
+    event: &'static str,
+    delta: Option<String>,
+}
+
+impl SettlementDecision {
+    fn from_totals(total_stroops: i64, expected_stroops: i64, tx_hash: &str) -> Self {
+        let paid_amount = money::stroops_to_string(total_stroops);
+
+        use std::cmp::Ordering;
+        match total_stroops.cmp(&expected_stroops) {
+            Ordering::Equal => Self {
+                verdict: Verdict::Completed {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "completed",
+                event: "payment.completed",
+                delta: None,
+            },
+            Ordering::Greater => Self {
+                verdict: Verdict::Overpaid {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "completed",
+                event: "payment.overpaid",
+                delta: Some(money::stroops_to_string(total_stroops - expected_stroops)),
+            },
+            Ordering::Less => Self {
+                verdict: Verdict::Underpaid {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "underpaid",
+                event: "payment.underpaid",
+                delta: Some(money::stroops_to_string(expected_stroops - total_stroops)),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntentMatch {
+    new_stroops: i64,
+    expected_stroops: i64,
+}
+
 impl HorizonPayment {
     /// The transaction's memo, but only when Horizon reports it as `memo_type:
     /// "text"`.
@@ -195,20 +326,10 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
     Some((OffsetDateTime::now_utc() - then).whole_seconds())
 }
 
-/// Decide whether a Horizon payment satisfies a pending intent.
-///
-/// `already_paid_stroops` is the cumulative amount already received for this
-/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
-///
-/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset — including a credit payment whose issuer does not match the
-/// issuer stored on the intent). When it matches, returns the verdict for the
-/// cumulative total.
-pub fn verify(
-    payment: &db::Payment,
-    hp: &HorizonPayment,
-    already_paid_stroops: i64,
-) -> Option<Verdict> {
+/// Return the parsed amounts when a Horizon payment belongs to this intent.
+/// Unrelated, unsuccessful, wrong-asset, or malformed records return `None` and
+/// must not enter the authoritative processed-transaction ledger.
+fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
     if hp.kind != "payment" {
         return None;
     }
@@ -243,28 +364,31 @@ pub fn verify(
         return None;
     }
 
-    let raw_amount = hp.amount.as_deref()?;
-    let new_paid = money::parse_stroops(raw_amount)?;
-    let expected = money::parse_stroops(&payment.amount)?;
-    let total_paid = already_paid_stroops + new_paid;
-    let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
-    let paid_amount = money::stroops_to_string(total_paid);
+    Some(IntentMatch {
+        new_stroops: money::parse_stroops(hp.amount.as_deref()?)?,
+        expected_stroops: money::parse_stroops(&payment.amount)?,
+    })
+}
 
-    use std::cmp::Ordering;
-    match total_paid.cmp(&expected) {
-        Ordering::Equal => Some(Verdict::Completed {
-            tx_hash,
-            paid_amount,
-        }),
-        Ordering::Greater => Some(Verdict::Overpaid {
-            tx_hash,
-            paid_amount,
-        }),
-        Ordering::Less => Some(Verdict::Underpaid {
-            tx_hash,
-            paid_amount,
-        }),
-    }
+/// Decide whether a Horizon payment satisfies a pending intent.
+///
+/// `already_paid_stroops` is the cumulative amount already received for this
+/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
+///
+/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
+/// or asset — including a credit payment whose issuer does not match the
+/// issuer stored on the intent). When it matches, returns the same pure
+/// settlement verdict that production reconciliation consumes after recording.
+pub fn verify(
+    payment: &db::Payment,
+    hp: &HorizonPayment,
+    already_paid_stroops: i64,
+) -> Option<Verdict> {
+    let matched = matches_intent(payment, hp)?;
+    let total_paid = already_paid_stroops + matched.new_stroops;
+    let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
+
+    Some(SettlementDecision::from_totals(total_paid, matched.expected_stroops, &tx_hash).verdict)
 }
 
 /// A Horizon HTTP failure, distinguishing throttling (`429 Too Many Requests`
@@ -278,6 +402,10 @@ pub fn verify(
 pub struct HorizonHttpError {
     pub status: reqwest::StatusCode,
     pub retry_after: Option<Duration>,
+    /// Cursor used by the failed request, when that endpoint had one. This is
+    /// carried only for bounded repeated-4xx classification; it is never used
+    /// to change retry or payment-detection semantics.
+    pub cursor: Option<String>,
     body: String,
 }
 
@@ -298,6 +426,35 @@ impl HorizonHttpError {
             reqwest::StatusCode::TOO_MANY_REQUESTS | reqwest::StatusCode::SERVICE_UNAVAILABLE
         )
     }
+
+    /// A cursor-specific client error worth tracking across retries. `429` is
+    /// deliberately excluded: the existing rate-limit path already classifies
+    /// and alerts on it, and it does not imply that a particular cursor is bad.
+    fn is_cursor_client_error(&self) -> bool {
+        self.status.is_client_error() && !self.is_rate_limited() && self.cursor.is_some()
+    }
+}
+
+/// Preserve Horizon's status, retry header, body, and request cursor instead of
+/// collapsing a non-2xx response into an opaque `reqwest::Error`.
+async fn horizon_success(
+    resp: reqwest::Response,
+    cursor: Option<&str>,
+) -> anyhow::Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+
+    let retry_after = parse_retry_after(resp.headers());
+    let body = resp.text().await.unwrap_or_default();
+    Err(HorizonHttpError {
+        status,
+        retry_after,
+        cursor: cursor.map(str::to_owned),
+        body,
+    }
+    .into())
 }
 
 /// Parse `Retry-After` as delta-seconds (RFC 9110) — the form every rate
@@ -322,37 +479,23 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 /// failure (issue #313).
 pub async fn fetch_recent_payments(
     client: &reqwest::Client,
-    horizon_url: &str,
+    horizon_url: &reqwest::Url,
     account: &str,
     cursor: &str,
     limit: u32,
 ) -> anyhow::Result<Vec<HorizonPayment>> {
-    let url = format!(
-        "{}/accounts/{}/payments?order=asc&cursor={}&limit={}&join=transactions",
-        horizon_url.trim_end_matches('/'),
+    let url = horizon_payments_url(
+        horizon_url,
         account,
-        cursor,
-        limit
-    );
+        PaymentsRequest::Poll { cursor, limit },
+    )?;
     let resp = client
-        .get(&url)
+        .get(url)
         .header("Accept", "application/json")
         .send()
         .await?;
 
-    let status = resp.status();
-    if !status.is_success() {
-        let retry_after = parse_retry_after(resp.headers());
-        let body = resp.text().await.unwrap_or_default();
-        return Err(HorizonHttpError {
-            status,
-            retry_after,
-            body,
-        }
-        .into());
-    }
-
-    let page: PaymentsPage = resp.json().await?;
+    let page: PaymentsPage = horizon_success(resp, Some(cursor)).await?.json().await?;
     Ok(page.embedded.records)
 }
 
@@ -383,7 +526,10 @@ pub fn missing_trustlines<'a>(
 /// purely so its one fallible sequence (request, status check, decode) has a
 /// single `?`-propagated exit for the caller to attribute to
 /// `record_check_failure`.
-async fn fetch_account(state: &Arc<AppState>, url: &str) -> anyhow::Result<AccountResponse> {
+async fn fetch_account(
+    state: &Arc<AppState>,
+    url: reqwest::Url,
+) -> anyhow::Result<AccountResponse> {
     Ok(state
         .http
         .get(url)
@@ -419,12 +565,8 @@ async fn fetch_account(state: &Arc<AppState>, url: &str) -> anyhow::Result<Accou
 /// Returns the list of accepted asset codes that are missing a trustline
 /// (empty when all are present).
 pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<String>> {
-    let url = format!(
-        "{}/accounts/{}",
-        state.config.horizon_url.trim_end_matches('/'),
-        state.config.gateway_public,
-    );
-    let account = match fetch_account(state, &url).await {
+    let url = horizon_account_url(&state.config.horizon_url, &state.config.gateway_public)?;
+    let account = match fetch_account(state, url).await {
         Ok(account) => account,
         Err(e) => {
             state.trustline_metrics.record_check_failure();
@@ -561,25 +703,22 @@ async fn starting_cursor(state: &Arc<AppState>) -> anyhow::Result<String> {
     let mut pages = 0usize;
 
     let token = loop {
-        let url = format!(
-            "{}/accounts/{}/payments?order=desc&limit={}{}",
-            state.config.horizon_url.trim_end_matches('/'),
-            state.config.gateway_public,
-            state.config.horizon_page_limit,
-            next_cursor
-                .as_ref()
-                .map(|c| format!("&cursor={c}"))
-                .unwrap_or_default(),
-        );
-        let page: PaymentsPage = state
+        let request_cursor = next_cursor.as_deref();
+        let url = horizon_payments_url(
+            &state.config.horizon_url,
+            &state.config.gateway_public,
+            PaymentsRequest::Baseline {
+                cursor: request_cursor,
+                limit: state.config.horizon_page_limit,
+            },
+        )?;
+        let resp = state
             .http
-            .get(&url)
+            .get(url)
             .header("Accept", "application/json")
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let page: PaymentsPage = horizon_success(resp, request_cursor).await?.json().await?;
         pages += 1;
 
         let Some(oldest) = page.embedded.records.last() else {
@@ -741,73 +880,60 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
 
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
 
-    /* The authoritative received-amount ledger is the SUM over every
-    transaction already recorded for this intent — not the single most-recent
-    `tx_hash`. Read it before recording this transaction so `verify` sees the
-    prior total. */
-    let already_paid_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
-
     /* Gate on a real, matching, on-chain payment before recording anything, so
-    unrelated traffic never pollutes the ledger. `verify` returns `None` for
-    anything that does not satisfy this intent (wrong type/destination/memo/
-    asset, or an unparseable amount). */
-    if verify(&payment, hp, already_paid_stroops).is_none() {
-        return Ok(false);
-    }
+    unrelated traffic never pollutes the ledger. The matcher returns `None`
+    for anything that does not satisfy this intent (wrong type/destination/
+    memo/asset, or an unparseable amount). */
+    let matched = match matches_intent(&payment, hp) {
+        Some(matched) => matched,
+        None => return Ok(false),
+    };
 
     /* Record this transaction idempotently. If it was already credited — seen
     on an earlier poll cycle, redelivered over the stream, or racing a
     concurrent reconciler — the insert is a no-op and we must not settle again.
     This makes re-processing any past transaction a no-op regardless of the
     order records arrive in (issue #119). */
-    let new_stroops = hp
-        .amount
-        .as_deref()
-        .and_then(money::parse_stroops)
-        .unwrap_or(0);
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
         return Ok(false);
     }
 
     /* Re-sum over the recorded set (now including this transaction) so the
     persisted `paid_amount` always reflects every processed transaction. */
     let total_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
-    let expected_stroops = money::parse_stroops(&payment.amount).unwrap_or(0);
-    let paid_amount = money::stroops_to_string(total_stroops);
+    let decision =
+        SettlementDecision::from_totals(total_stroops, matched.expected_stroops, hp_hash);
 
-    use std::cmp::Ordering;
-    let (status, event, delta) = match total_stroops.cmp(&expected_stroops) {
-        Ordering::Equal => ("completed", "payment.completed", None),
-        Ordering::Greater => {
-            let excess = money::stroops_to_string(total_stroops - expected_stroops);
+    match &decision.verdict {
+        Verdict::Completed { .. } => {}
+        Verdict::Overpaid { .. } => {
+            let excess = decision.delta.as_deref().unwrap_or_default();
             info!(
                 payment_id = %payment.id,
                 excess = %excess,
                 "overpayment — intent completed, excess should be refunded"
             );
-            ("completed", "payment.overpaid", Some(excess))
         }
-        Ordering::Less => {
-            let remaining = money::stroops_to_string(expected_stroops - total_stroops);
+        Verdict::Underpaid { .. } => {
+            let remaining = decision.delta.as_deref().unwrap_or_default();
             warn!(
                 payment_id = %payment.id,
                 expected = %payment.amount,
-                paid = %paid_amount,
+                paid = %decision.verdict.paid_amount(),
                 remaining = %remaining,
                 "underpayment — intent remains open for a top-up"
             );
-            ("underpaid", "payment.underpaid", Some(remaining))
         }
-    };
+    }
 
     let did_settle = settle(
         state,
         &payment,
-        status,
-        hp_hash,
-        &paid_amount,
-        event,
-        delta.as_deref(),
+        decision.status,
+        decision.verdict.tx_hash(),
+        decision.verdict.paid_amount(),
+        decision.event,
+        decision.delta.as_deref(),
     )
     .await;
     Ok(did_settle)
@@ -882,6 +1008,75 @@ async fn settle(
 const POLL_BACKOFF_BASE: Duration = Duration::from_secs(1);
 const POLL_BACKOFF_MAX: Duration = Duration::from_secs(120);
 
+/// Three consecutive non-rate-limit 4xx responses for the same cursor form one
+/// alert incident. One response is ordinary retry noise; a cursor change,
+/// success, 429, 5xx, or transport error breaks the streak. The incident emits
+/// once at the threshold and ordinary per-attempt diagnostics continue.
+const REPEATED_CURSOR_4XX_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Default)]
+struct RepeatedCursor4xx {
+    cursor: Option<String>,
+    consecutive: u32,
+    alerted: bool,
+}
+
+impl RepeatedCursor4xx {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(&mut self, error: Option<&HorizonHttpError>) -> bool {
+        let Some(error) = error.filter(|error| error.is_cursor_client_error()) else {
+            self.reset();
+            return false;
+        };
+        let Some(cursor) = error.cursor.as_deref() else {
+            self.reset();
+            return false;
+        };
+
+        if self.cursor.as_deref() == Some(cursor) {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            self.cursor = Some(cursor.to_owned());
+            self.consecutive = 1;
+            self.alerted = false;
+        }
+
+        if self.consecutive >= REPEATED_CURSOR_4XX_THRESHOLD && !self.alerted {
+            self.alerted = true;
+            return true;
+        }
+        false
+    }
+}
+
+fn record_repeated_cursor_4xx(
+    tracker: &mut RepeatedCursor4xx,
+    horizon_error: Option<&HorizonHttpError>,
+    metrics: &crate::metrics::HorizonMetrics,
+    component: &'static str,
+) -> bool {
+    if !tracker.observe(horizon_error) {
+        return false;
+    }
+
+    let Some(error) = horizon_error else {
+        return false;
+    };
+    metrics.record_repeated_cursor_4xx();
+    error!(
+        alert = "horizon_repeated_cursor_4xx",
+        component,
+        status = %error.status,
+        cursor = %error.cursor.as_deref().unwrap_or(""),
+        consecutive_failures = tracker.consecutive,
+        "same Horizon cursor produced repeated client errors; payment detection may be stalled"
+    );
+    true
+}
+
 /// Choose how long to wait before the poller's next attempt, given this
 /// cycle's outcome (issue #313).
 ///
@@ -924,6 +1119,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
 
     let mut consecutive_failures: u32 = 0;
     let mut next_delay = interval;
+    let mut repeated_cursor_4xx = RepeatedCursor4xx::default();
 
     loop {
         tokio::select! {
@@ -942,6 +1138,7 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
                     info!(settled = n, "poll cycle settled payments");
                 }
                 state.horizon_metrics.record_success();
+                repeated_cursor_4xx.reset();
                 consecutive_failures = 0;
                 next_delay = interval;
             }
@@ -956,6 +1153,13 @@ pub async fn run_poller(state: Arc<AppState>, mut shutdown: watch::Receiver<bool
                 } else {
                     state.horizon_metrics.record_error();
                 }
+
+                record_repeated_cursor_4xx(
+                    &mut repeated_cursor_4xx,
+                    horizon_err,
+                    &state.horizon_metrics,
+                    "poller",
+                );
 
                 next_delay = next_poll_delay(consecutive_failures, retry_after);
                 warn!(
@@ -1045,6 +1249,7 @@ pub async fn run_stream_listener(
     let mut cursor = "now".to_string();
     let idle_timeout = Duration::from_secs(state.config.stream_idle_timeout_secs);
     let mut first_connection = true;
+    let mut repeated_cursor_4xx = RepeatedCursor4xx::default();
 
     loop {
         if !first_connection {
@@ -1061,8 +1266,19 @@ pub async fn run_stream_listener(
         tokio::select! {
             result = stream_once(&state, &client, &mut cursor, idle_timeout) => {
                 match result {
-                    Ok(()) => debug!("Horizon stream closed by server; reconnecting"),
-                    Err(e) => warn!(error = %e, "Horizon stream dropped; reconnecting"),
+                    Ok(()) => {
+                        repeated_cursor_4xx.reset();
+                        debug!("Horizon stream closed by server; reconnecting");
+                    }
+                    Err(e) => {
+                        record_repeated_cursor_4xx(
+                            &mut repeated_cursor_4xx,
+                            e.downcast_ref::<HorizonHttpError>(),
+                            &state.horizon_metrics,
+                            "stream",
+                        );
+                        warn!(error = %e, "Horizon stream dropped; reconnecting");
+                    }
                 }
             }
             _ = shutdown.changed() => {
@@ -1106,19 +1322,18 @@ async fn stream_once(
     cursor: &mut String,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
-    let url = format!(
-        "{}/accounts/{}/payments?cursor={}&join=transactions",
-        state.config.horizon_url.trim_end_matches('/'),
-        state.config.gateway_public,
-        cursor,
-    );
+    let url = horizon_payments_url(
+        &state.config.horizon_url,
+        &state.config.gateway_public,
+        PaymentsRequest::Stream { cursor },
+    )?;
 
     let resp = client
-        .get(&url)
+        .get(url)
         .header("Accept", "text/event-stream")
         .send()
-        .await?
-        .error_for_status()?;
+        .await?;
+    let resp = horizon_success(resp, Some(cursor)).await?;
 
     let mut stream = resp.bytes_stream();
     /* Accumulate raw bytes (not lossily-decoded str) so multibyte characters
@@ -1244,6 +1459,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn payment_urls_percent_encode_opaque_cursors_and_account_segments() {
+        let base = reqwest::Url::parse("https://horizon.example/custom/base/").unwrap();
+        let account = "GACCOUNT/child?role=admin#fragment +%";
+        let cursor = "opaque&limit=1#+% \t";
+        let url =
+            horizon_payments_url(&base, account, PaymentsRequest::Poll { cursor, limit: 200 })
+                .unwrap();
+
+        assert_eq!(
+            url.path(),
+            "/custom/base/accounts/GACCOUNT%2Fchild%3Frole=admin%23fragment%20+%25/payments"
+        );
+        assert_eq!(
+            url.query(),
+            Some("order=asc&cursor=opaque%26limit%3D1%23%2B%25+%09&limit=200&join=transactions")
+        );
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("order".into(), "asc".into()),
+                ("cursor".into(), cursor.into()),
+                ("limit".into(), "200".into()),
+                ("join".into(), "transactions".into()),
+            ],
+            "reserved cursor characters must remain one decoded query value"
+        );
+
+        for request in [
+            PaymentsRequest::Baseline {
+                cursor: Some(cursor),
+                limit: 200,
+            },
+            PaymentsRequest::Stream { cursor },
+        ] {
+            let url = horizon_payments_url(&base, account, request).unwrap();
+            let cursor_values: Vec<_> = url
+                .query_pairs()
+                .filter_map(|(key, value)| (key == "cursor").then_some(value.into_owned()))
+                .collect();
+            assert_eq!(
+                cursor_values,
+                vec![cursor.to_string()],
+                "every affected request shape must preserve the opaque cursor as one value"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_payment_request_shapes_preserve_existing_semantics() {
+        let base = reqwest::Url::parse("https://horizon.example/").unwrap();
+        let account = "GACCOUNT";
+
+        let poll = horizon_payments_url(
+            &base,
+            account,
+            PaymentsRequest::Poll {
+                cursor: "123456789",
+                limit: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            poll.as_str(),
+            "https://horizon.example/accounts/GACCOUNT/payments?order=asc&cursor=123456789&limit=200&join=transactions"
+        );
+
+        let baseline = horizon_payments_url(
+            &base,
+            account,
+            PaymentsRequest::Baseline {
+                cursor: Some("123456789"),
+                limit: 200,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            baseline.as_str(),
+            "https://horizon.example/accounts/GACCOUNT/payments?order=desc&limit=200&cursor=123456789"
+        );
+
+        let stream = horizon_payments_url(
+            &base,
+            account,
+            PaymentsRequest::Stream {
+                cursor: "123456789",
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            stream.as_str(),
+            "https://horizon.example/accounts/GACCOUNT/payments?cursor=123456789&join=transactions"
+        );
+    }
+
     fn test_assets() -> Vec<crate::config::AcceptedAsset> {
         vec![
             crate::config::AcceptedAsset {
@@ -1330,6 +1640,45 @@ mod tests {
                 paid_amount: "6".into(),
             })
         );
+    }
+
+    #[test]
+    fn settlement_decision_from_totals_drives_production_metadata() {
+        let exact = SettlementDecision::from_totals(100_000_000, 100_000_000, "TX_EXACT");
+        assert_eq!(
+            exact.verdict,
+            Verdict::Completed {
+                tx_hash: "TX_EXACT".into(),
+                paid_amount: "10".into(),
+            }
+        );
+        assert_eq!(exact.status, "completed");
+        assert_eq!(exact.event, "payment.completed");
+        assert_eq!(exact.delta, None);
+
+        let overpaid = SettlementDecision::from_totals(125_000_000, 100_000_000, "TX_OVERPAID");
+        assert_eq!(
+            overpaid.verdict,
+            Verdict::Overpaid {
+                tx_hash: "TX_OVERPAID".into(),
+                paid_amount: "12.5".into(),
+            }
+        );
+        assert_eq!(overpaid.status, "completed");
+        assert_eq!(overpaid.event, "payment.overpaid");
+        assert_eq!(overpaid.delta.as_deref(), Some("2.5"));
+
+        let underpaid = SettlementDecision::from_totals(99_999_999, 100_000_000, "TX_UNDERPAID");
+        assert_eq!(
+            underpaid.verdict,
+            Verdict::Underpaid {
+                tx_hash: "TX_UNDERPAID".into(),
+                paid_amount: "9.9999999".into(),
+            }
+        );
+        assert_eq!(underpaid.status, "underpaid");
+        assert_eq!(underpaid.event, "payment.underpaid");
+        assert_eq!(underpaid.delta.as_deref(), Some("0.0000001"));
     }
 
     #[test]
@@ -1681,6 +2030,7 @@ mod tests {
             let err = HorizonHttpError {
                 status,
                 retry_after: None,
+                cursor: None,
                 body: String::new(),
             };
             assert!(err.is_rate_limited(), "{status} must be rate_limited");
@@ -1692,9 +2042,99 @@ mod tests {
         let err = HorizonHttpError {
             status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
             retry_after: None,
+            cursor: None,
             body: String::new(),
         };
         assert!(!err.is_rate_limited());
+    }
+
+    fn cursor_error(status: reqwest::StatusCode, cursor: &str) -> HorizonHttpError {
+        HorizonHttpError {
+            status,
+            retry_after: None,
+            cursor: Some(cursor.to_owned()),
+            body: String::new(),
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn third_same_cursor_4xx_emits_one_distinct_alert_and_metric() {
+        let error = cursor_error(reqwest::StatusCode::BAD_REQUEST, "opaque&cursor");
+        let metrics = crate::metrics::HorizonMetrics::new();
+        let mut tracker = RepeatedCursor4xx::default();
+
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&error),
+            &metrics,
+            "test"
+        ));
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&error),
+            &metrics,
+            "test"
+        ));
+        assert_eq!(metrics.repeated_cursor_4xx(), 0);
+
+        assert!(record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&error),
+            &metrics,
+            "test"
+        ));
+        assert_eq!(metrics.repeated_cursor_4xx(), 1);
+        assert!(logs_contain("horizon_repeated_cursor_4xx"));
+
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&error),
+            &metrics,
+            "test"
+        ));
+        assert_eq!(
+            metrics.repeated_cursor_4xx(),
+            1,
+            "one unchanged streak must create only one alert incident"
+        );
+    }
+
+    #[test]
+    fn single_changed_or_rate_limited_cursor_does_not_alert() {
+        let bad_a = cursor_error(reqwest::StatusCode::BAD_REQUEST, "cursor-a");
+        let bad_b = cursor_error(reqwest::StatusCode::BAD_REQUEST, "cursor-b");
+        let rate_limited = cursor_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "cursor-b");
+        let metrics = crate::metrics::HorizonMetrics::new();
+        let mut tracker = RepeatedCursor4xx::default();
+
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&bad_a),
+            &metrics,
+            "test"
+        ));
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&bad_b),
+            &metrics,
+            "test"
+        ));
+        assert!(!record_repeated_cursor_4xx(
+            &mut tracker,
+            Some(&bad_b),
+            &metrics,
+            "test"
+        ));
+        for _ in 0..REPEATED_CURSOR_4XX_THRESHOLD {
+            assert!(!record_repeated_cursor_4xx(
+                &mut tracker,
+                Some(&rate_limited),
+                &metrics,
+                "test"
+            ));
+        }
+        assert_eq!(metrics.repeated_cursor_4xx(), 0);
     }
 
     /// A `Retry-After` from Horizon is honored exactly, not folded into or
