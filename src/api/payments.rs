@@ -17,6 +17,7 @@ pub struct AppError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after_secs: Option<u64>,
 }
 
 impl AppError {
@@ -25,6 +26,7 @@ impl AppError {
             status,
             code,
             message: message.into(),
+            retry_after_secs: None,
         }
     }
 
@@ -43,15 +45,33 @@ impl AppError {
     pub fn service_unavailable(code: &'static str, message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
     }
+
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, code, message)
+    }
+
+    /// Attaches a `Retry-After` header, in delta-seconds, to the response.
+    pub fn with_retry_after(mut self, secs: u64) -> Self {
+        self.retry_after_secs = Some(secs);
+        self
+    }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
+        let mut response = (
             self.status,
             Json(json!({ "error": self.message, "code": self.code })),
         )
-            .into_response()
+            .into_response();
+        if let Some(secs) = self.retry_after_secs {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
@@ -452,19 +472,30 @@ pub async fn create(
     if let Some(key) = idempotency_key {
         let canonical_id = db::save_idempotency_key(&state.pool, &merchant_id, key, &id).await?;
         if canonical_id != id {
-            /* Lost the race — the winner is about to create its payment. Wait
-            for it with a short retry loop and then return that payment. */
-            for _ in 0..50 {
+            /* Lost the race — the winner is about to create its payment,
+            typically within a few ms (a single local INSERT). Give it a
+            short, bounded chance to land before telling the client to come
+            back: a busy-wait that holds a connection and a pool slot is not
+            an acceptable price for closing a race window this narrow. */
+            const IDEMPOTENCY_POLL_ATTEMPTS: u32 = 5;
+            const IDEMPOTENCY_POLL_INTERVAL: std::time::Duration =
+                std::time::Duration::from_millis(10);
+
+            for _ in 0..IDEMPOTENCY_POLL_ATTEMPTS {
                 if let Some(payment) = db::get_payment(&state.pool, &canonical_id).await? {
                     return Ok((StatusCode::OK, Json(to_json(&payment))));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(IDEMPOTENCY_POLL_INTERVAL).await;
             }
-            return Err(AppError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
+            /* Not a server error — the winner just hasn't committed yet.
+            409 tells the client this is a transient, retryable conflict
+            rather than an outage; Retry-After gives it a cheap, concrete
+            backoff instead of a busy-wait on our side. */
+            return Err(AppError::conflict(
                 "idempotency_conflict",
                 "concurrent request conflict, please retry",
-            ));
+            )
+            .with_retry_after(1));
         }
     }
 
