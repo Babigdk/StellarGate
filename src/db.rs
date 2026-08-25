@@ -1080,6 +1080,19 @@ const DELIVERY_COLUMNS: &str = "id, payment_id, url, payload, event_type, status
 /// statement, so each pass admits a different random subset and a batch that
 /// failed together spreads over several intervals instead of moving as one
 /// block. Pass `0` to disable.
+fn redrive_backoff_exponent_cap(initial_secs: i64, max_secs: i64) -> i64 {
+    if initial_secs <= 0 || max_secs <= initial_secs {
+        return 0;
+    }
+
+    // Smallest exponent e for which initial * 2^e reaches the configured cap.
+    // The SQL query substitutes `max_secs` at and beyond this exponent, so it
+    // only multiplies while the product is strictly below max and cannot
+    // overflow. Casts are safe after the positive guards above.
+    let ratio = (max_secs as u64).div_ceil(initial_secs as u64);
+    (u64::BITS - (ratio - 1).leading_zeros()) as i64
+}
+
 pub async fn list_redrivable_deliveries(
     pool: &Db,
     max_attempts: i64,
@@ -1088,6 +1101,8 @@ pub async fn list_redrivable_deliveries(
     backoff_max_secs: i64,
     jitter_secs: i64,
 ) -> Result<Vec<WebhookDelivery>> {
+    let exponent_cap = redrive_backoff_exponent_cap(backoff_initial_secs, backoff_max_secs);
+
     /* `ABS(RANDOM()) % (n+1)` yields [0, n]. Guarded on `jitter_secs > 0`:
     `% 1` is a constant 0, and a zero modulus is a runtime error in SQLite. */
     let rows = sqlx::query(&format!(
@@ -1096,9 +1111,13 @@ pub async fn list_redrivable_deliveries(
          WHERE status IN ('pending', 'failed')
            AND attempts < ?
            AND datetime(COALESCE(last_attempt, created_at), '+' || (
-                 CASE WHEN attempts = 0 THEN ?
-                      ELSE MAX(?, MIN(? * (1 << MIN(attempts - 1, 32)), ?))
-                 END
+                  CASE WHEN attempts = 0 THEN ?
+                       ELSE MAX(?, CASE
+                              WHEN ? <= 0 THEN 0
+                              WHEN attempts - 1 >= ? THEN ?
+                              ELSE ? * (1 << (attempts - 1))
+                            END)
+                  END
                  + CASE WHEN ? > 0 THEN ABS(RANDOM()) % (? + 1) ELSE 0 END
                ) || ' seconds') <= datetime('now')
          ORDER BY created_at ASC",
@@ -1107,7 +1126,9 @@ pub async fn list_redrivable_deliveries(
     .bind(grace_secs)
     .bind(grace_secs)
     .bind(backoff_initial_secs)
+    .bind(exponent_cap)
     .bind(backoff_max_secs)
+    .bind(backoff_initial_secs)
     .bind(jitter_secs)
     .bind(jitter_secs)
     .fetch_all(pool)
@@ -2788,6 +2809,75 @@ mod tests {
                 .is_empty(),
             "grace_secs must floor eligibility even when backoff computes to 0"
         );
+    }
+
+    #[tokio::test]
+    async fn list_redrivable_deliveries_caps_attempt_33_at_the_configured_max() {
+        let pool = memory_db().await;
+        create_payment(&pool, new_payment("p1", "MEMOR33", 3600))
+            .await
+            .unwrap();
+        save_webhook_delivery(
+            &pool,
+            "many-failures",
+            "p1",
+            "http://x",
+            "{}",
+            "payment.completed",
+        )
+        .await
+        .unwrap();
+        update_webhook_delivery(&pool, "many-failures", "failed", 33)
+            .await
+            .unwrap();
+
+        // At attempt 33, the uncapped factor is 2^32. With the accepted
+        // one-day extreme, the row must use the 86,400-second cap without
+        // evaluating an overflowing initial * factor product.
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86399 seconds')
+              WHERE id = 'many-failures'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+                .await
+                .unwrap()
+                .is_empty(),
+            "attempt 33 must remain ineligible until the configured cap elapses"
+        );
+
+        sqlx::query(
+            "UPDATE webhook_deliveries
+                SET last_attempt = strftime('%Y-%m-%dT%H:%M:%SZ','now','-86401 seconds')
+              WHERE id = 'many-failures'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            list_redrivable_deliveries(&pool, 34, 0, 86_400, 86_400, 0)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "attempt 33 must become eligible immediately after the cap"
+        );
+    }
+
+    #[test]
+    fn redrive_backoff_exponent_cap_avoids_extreme_products() {
+        assert_eq!(redrive_backoff_exponent_cap(0, 86_400), 0);
+        assert_eq!(redrive_backoff_exponent_cap(86_400, 86_400), 0);
+        assert_eq!(redrive_backoff_exponent_cap(1, 86_400), 17);
+
+        // Even callers that bypass Config cannot make the SQL multiply two
+        // values whose product would exceed SQLite's signed integer range.
+        assert_eq!(redrive_backoff_exponent_cap(1, i64::MAX), 63);
+        assert_eq!(redrive_backoff_exponent_cap(i64::MAX / 2, i64::MAX), 2);
     }
 
     // ── file_sizes / sqlite_path (issue: missing DB metrics) ────────────────

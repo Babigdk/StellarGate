@@ -2,6 +2,11 @@ use anyhow::Result;
 use ipnet::IpNet;
 use std::collections::HashSet;
 
+/// Longest accepted webhook-redrive timing window. A one-day ceiling keeps
+/// operator mistakes bounded and makes the SQL eligibility arithmetic stay
+/// comfortably inside SQLite's signed 64-bit integer range (issue #241).
+const MAX_WEBHOOK_REDRIVE_WINDOW_SECS: i64 = 86_400;
+
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerMode {
@@ -781,6 +786,9 @@ impl Config {
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
+    /// - redrive timing values outside their documented one-day bounds → the
+    ///   eligibility expression can overflow or defer a row for an accidental,
+    ///   operationally useless interval
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -847,6 +855,50 @@ impl Config {
             ));
         }
 
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_grace_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_GRACE_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_grace_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS)
+            .contains(&self.webhook_redrive_backoff_initial_secs)
+        {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_backoff_max_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_max_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_jitter_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_JITTER_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_jitter_secs
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
         /* The redrive grace window has to clear the worst case a `dispatch()`
         call can take, or the worker starts a second delivery for a row whose
         first one is still in flight. Making the inline delay exponential
@@ -867,14 +919,6 @@ impl Config {
                 self.webhook_timeout_secs,
                 self.webhook_retry_delay_ms,
                 self.webhook_retry_max_delay_ms
-            ));
-        }
-
-        if self.webhook_redrive_jitter_secs < 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_JITTER_SECS must be >= 0 (got {}). \
-                 A negative jitter would pull deliveries forward past their backoff.",
-                self.webhook_redrive_jitter_secs
             ));
         }
 
@@ -899,16 +943,6 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
-            ));
-        }
-
-        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
-                 With the current settings the cap would override the starting delay and backoff \
-                 would never actually grow.",
-                self.webhook_redrive_backoff_max_secs,
-                self.webhook_redrive_backoff_initial_secs
             ));
         }
 
@@ -1926,6 +1960,64 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_negative_redrive_backoff_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = -1;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_zero_redrive_backoff_max() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_redrive_values_above_one_day() {
+        for field in ["grace", "initial", "max", "jitter"] {
+            let mut cfg = timing_config();
+            match field {
+                "grace" => cfg.webhook_redrive_grace_secs = 86_401,
+                "initial" => {
+                    cfg.webhook_redrive_backoff_initial_secs = 86_401;
+                    cfg.webhook_redrive_backoff_max_secs = 86_401;
+                }
+                "max" => cfg.webhook_redrive_backoff_max_secs = 86_401,
+                "jitter" => cfg.webhook_redrive_jitter_secs = 86_401,
+                _ => unreachable!(),
+            }
+            let err = cfg.validate_timing().unwrap_err().to_string();
+            assert!(err.contains("WEBHOOK_REDRIVE"), "{field}: got {err}");
+        }
+    }
+
+    #[test]
+    fn timing_accepts_redrive_boundaries() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_grace_secs = 86_400;
+        cfg.webhook_redrive_backoff_initial_secs = 86_400;
+        cfg.webhook_redrive_backoff_max_secs = 86_400;
+        cfg.webhook_redrive_jitter_secs = 86_400;
+        assert!(cfg.validate_timing().is_ok());
+
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        assert!(
+            cfg.validate_timing().is_ok(),
+            "zero initial must continue to disable exponential growth"
+        );
+    }
+
+    #[test]
     fn timing_allows_backoff_max_equal_to_initial() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 30;
@@ -1937,8 +2029,29 @@ mod tests {
     fn timing_allows_zero_backoff_initial_to_disable_growth() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 0;
-        cfg.webhook_redrive_backoff_max_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 900;
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_out_of_range_redrive_timing() {
+        for (name, value) in [
+            ("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS", "-1"),
+            ("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_GRACE_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_JITTER_SECS", "86401"),
+        ] {
+            run_with_env(
+                &[
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    (name, Some(value)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains(name), "{name}: got {err}");
+                },
+            );
+        }
     }
 
     #[test]
