@@ -353,6 +353,25 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
     }
 }
 
+/// Production reconciliation must consume the same settlement decision as the
+/// pure Horizon verdict tests. Exact, underpaid, and exact-top-up outcomes are
+/// exercised by the tests above/below; this closes the remaining overpayment
+/// branch through `reconcile_payment` itself (issue #225).
+#[tokio::test]
+async fn reconcile_payment_uses_shared_decision_for_overpayment() {
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool.clone(), None);
+
+    let overpayment = payment_with("TX_OVERPAID", "12.5000000");
+    assert!(reconcile_payment(&state, &overpayment).await.unwrap());
+
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
+    assert_eq!(payment.status, "completed");
+    assert_eq!(payment.tx_hash.as_deref(), Some("TX_OVERPAID"));
+    assert_eq!(payment.paid_amount.as_deref(), Some("12.5"));
+}
+
 /// Re-processing any previously-seen transaction is a no-op regardless of the
 /// order records arrive in — the cumulative ledger is the SUM over the
 /// `processed_transactions` set, not the single most-recent `tx_hash`

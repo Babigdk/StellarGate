@@ -38,8 +38,9 @@
 //! and undocumented behaviour that Horizon's payments-for-account endpoint
 //! tends to surface only successful operations.
 //!
-//! The matching logic in [`verify`] is pure and unit-tested; the networked
-//! functions wrap it with I/O.
+//! The intent matching and settlement-decision logic used by [`verify`] and
+//! [`reconcile_payment`] are pure and unit-tested; the networked functions wrap
+//! them with I/O.
 
 use crate::supervise::TaskExit;
 use crate::{db, money, webhook, AppState};
@@ -209,6 +210,79 @@ pub enum Verdict {
     },
 }
 
+impl Verdict {
+    fn tx_hash(&self) -> &str {
+        match self {
+            Self::Completed { tx_hash, .. }
+            | Self::Overpaid { tx_hash, .. }
+            | Self::Underpaid { tx_hash, .. } => tx_hash,
+        }
+    }
+
+    fn paid_amount(&self) -> &str {
+        match self {
+            Self::Completed { paid_amount, .. }
+            | Self::Overpaid { paid_amount, .. }
+            | Self::Underpaid { paid_amount, .. } => paid_amount,
+        }
+    }
+}
+
+/// Pure result consumed by production reconciliation after the authoritative
+/// processed-transaction ledger has been re-summed. Keeping the verdict and
+/// its persistence/webhook metadata together prevents those outcomes from
+/// drifting into separate amount comparisons (issue #225).
+#[derive(Debug, PartialEq, Eq)]
+struct SettlementDecision {
+    verdict: Verdict,
+    status: &'static str,
+    event: &'static str,
+    delta: Option<String>,
+}
+
+impl SettlementDecision {
+    fn from_totals(total_stroops: i64, expected_stroops: i64, tx_hash: &str) -> Self {
+        let paid_amount = money::stroops_to_string(total_stroops);
+
+        use std::cmp::Ordering;
+        match total_stroops.cmp(&expected_stroops) {
+            Ordering::Equal => Self {
+                verdict: Verdict::Completed {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "completed",
+                event: "payment.completed",
+                delta: None,
+            },
+            Ordering::Greater => Self {
+                verdict: Verdict::Overpaid {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "completed",
+                event: "payment.overpaid",
+                delta: Some(money::stroops_to_string(total_stroops - expected_stroops)),
+            },
+            Ordering::Less => Self {
+                verdict: Verdict::Underpaid {
+                    tx_hash: tx_hash.into(),
+                    paid_amount,
+                },
+                status: "underpaid",
+                event: "payment.underpaid",
+                delta: Some(money::stroops_to_string(expected_stroops - total_stroops)),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntentMatch {
+    new_stroops: i64,
+    expected_stroops: i64,
+}
+
 impl HorizonPayment {
     /// The transaction's memo, but only when Horizon reports it as `memo_type:
     /// "text"`.
@@ -252,20 +326,10 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
     Some((OffsetDateTime::now_utc() - then).whole_seconds())
 }
 
-/// Decide whether a Horizon payment satisfies a pending intent.
-///
-/// `already_paid_stroops` is the cumulative amount already received for this
-/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
-///
-/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
-/// or asset — including a credit payment whose issuer does not match the
-/// issuer stored on the intent). When it matches, returns the verdict for the
-/// cumulative total.
-pub fn verify(
-    payment: &db::Payment,
-    hp: &HorizonPayment,
-    already_paid_stroops: i64,
-) -> Option<Verdict> {
+/// Return the parsed amounts when a Horizon payment belongs to this intent.
+/// Unrelated, unsuccessful, wrong-asset, or malformed records return `None` and
+/// must not enter the authoritative processed-transaction ledger.
+fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
     if hp.kind != "payment" {
         return None;
     }
@@ -300,28 +364,31 @@ pub fn verify(
         return None;
     }
 
-    let raw_amount = hp.amount.as_deref()?;
-    let new_paid = money::parse_stroops(raw_amount)?;
-    let expected = money::parse_stroops(&payment.amount)?;
-    let total_paid = already_paid_stroops + new_paid;
-    let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
-    let paid_amount = money::stroops_to_string(total_paid);
+    Some(IntentMatch {
+        new_stroops: money::parse_stroops(hp.amount.as_deref()?)?,
+        expected_stroops: money::parse_stroops(&payment.amount)?,
+    })
+}
 
-    use std::cmp::Ordering;
-    match total_paid.cmp(&expected) {
-        Ordering::Equal => Some(Verdict::Completed {
-            tx_hash,
-            paid_amount,
-        }),
-        Ordering::Greater => Some(Verdict::Overpaid {
-            tx_hash,
-            paid_amount,
-        }),
-        Ordering::Less => Some(Verdict::Underpaid {
-            tx_hash,
-            paid_amount,
-        }),
-    }
+/// Decide whether a Horizon payment satisfies a pending intent.
+///
+/// `already_paid_stroops` is the cumulative amount already received for this
+/// intent (0 for a fresh `pending` payment, non-zero for an `underpaid` one).
+///
+/// Returns `None` when the payment is unrelated (wrong type, destination, memo,
+/// or asset — including a credit payment whose issuer does not match the
+/// issuer stored on the intent). When it matches, returns the same pure
+/// settlement verdict that production reconciliation consumes after recording.
+pub fn verify(
+    payment: &db::Payment,
+    hp: &HorizonPayment,
+    already_paid_stroops: i64,
+) -> Option<Verdict> {
+    let matched = matches_intent(payment, hp)?;
+    let total_paid = already_paid_stroops + matched.new_stroops;
+    let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
+
+    Some(SettlementDecision::from_totals(total_paid, matched.expected_stroops, &tx_hash).verdict)
 }
 
 /// A Horizon HTTP failure, distinguishing throttling (`429 Too Many Requests`
@@ -813,73 +880,60 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
 
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
 
-    /* The authoritative received-amount ledger is the SUM over every
-    transaction already recorded for this intent — not the single most-recent
-    `tx_hash`. Read it before recording this transaction so `verify` sees the
-    prior total. */
-    let already_paid_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
-
     /* Gate on a real, matching, on-chain payment before recording anything, so
-    unrelated traffic never pollutes the ledger. `verify` returns `None` for
-    anything that does not satisfy this intent (wrong type/destination/memo/
-    asset, or an unparseable amount). */
-    if verify(&payment, hp, already_paid_stroops).is_none() {
-        return Ok(false);
-    }
+    unrelated traffic never pollutes the ledger. The matcher returns `None`
+    for anything that does not satisfy this intent (wrong type/destination/
+    memo/asset, or an unparseable amount). */
+    let matched = match matches_intent(&payment, hp) {
+        Some(matched) => matched,
+        None => return Ok(false),
+    };
 
     /* Record this transaction idempotently. If it was already credited — seen
     on an earlier poll cycle, redelivered over the stream, or racing a
     concurrent reconciler — the insert is a no-op and we must not settle again.
     This makes re-processing any past transaction a no-op regardless of the
     order records arrive in (issue #119). */
-    let new_stroops = hp
-        .amount
-        .as_deref()
-        .and_then(money::parse_stroops)
-        .unwrap_or(0);
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
         return Ok(false);
     }
 
     /* Re-sum over the recorded set (now including this transaction) so the
     persisted `paid_amount` always reflects every processed transaction. */
     let total_stroops = db::sum_processed_stroops(&state.pool, &payment.id).await?;
-    let expected_stroops = money::parse_stroops(&payment.amount).unwrap_or(0);
-    let paid_amount = money::stroops_to_string(total_stroops);
+    let decision =
+        SettlementDecision::from_totals(total_stroops, matched.expected_stroops, hp_hash);
 
-    use std::cmp::Ordering;
-    let (status, event, delta) = match total_stroops.cmp(&expected_stroops) {
-        Ordering::Equal => ("completed", "payment.completed", None),
-        Ordering::Greater => {
-            let excess = money::stroops_to_string(total_stroops - expected_stroops);
+    match &decision.verdict {
+        Verdict::Completed { .. } => {}
+        Verdict::Overpaid { .. } => {
+            let excess = decision.delta.as_deref().unwrap_or_default();
             info!(
                 payment_id = %payment.id,
                 excess = %excess,
                 "overpayment — intent completed, excess should be refunded"
             );
-            ("completed", "payment.overpaid", Some(excess))
         }
-        Ordering::Less => {
-            let remaining = money::stroops_to_string(expected_stroops - total_stroops);
+        Verdict::Underpaid { .. } => {
+            let remaining = decision.delta.as_deref().unwrap_or_default();
             warn!(
                 payment_id = %payment.id,
                 expected = %payment.amount,
-                paid = %paid_amount,
+                paid = %decision.verdict.paid_amount(),
                 remaining = %remaining,
                 "underpayment — intent remains open for a top-up"
             );
-            ("underpaid", "payment.underpaid", Some(remaining))
         }
-    };
+    }
 
     let did_settle = settle(
         state,
         &payment,
-        status,
-        hp_hash,
-        &paid_amount,
-        event,
-        delta.as_deref(),
+        decision.status,
+        decision.verdict.tx_hash(),
+        decision.verdict.paid_amount(),
+        decision.event,
+        decision.delta.as_deref(),
     )
     .await;
     Ok(did_settle)
@@ -1586,6 +1640,45 @@ mod tests {
                 paid_amount: "6".into(),
             })
         );
+    }
+
+    #[test]
+    fn settlement_decision_from_totals_drives_production_metadata() {
+        let exact = SettlementDecision::from_totals(100_000_000, 100_000_000, "TX_EXACT");
+        assert_eq!(
+            exact.verdict,
+            Verdict::Completed {
+                tx_hash: "TX_EXACT".into(),
+                paid_amount: "10".into(),
+            }
+        );
+        assert_eq!(exact.status, "completed");
+        assert_eq!(exact.event, "payment.completed");
+        assert_eq!(exact.delta, None);
+
+        let overpaid = SettlementDecision::from_totals(125_000_000, 100_000_000, "TX_OVERPAID");
+        assert_eq!(
+            overpaid.verdict,
+            Verdict::Overpaid {
+                tx_hash: "TX_OVERPAID".into(),
+                paid_amount: "12.5".into(),
+            }
+        );
+        assert_eq!(overpaid.status, "completed");
+        assert_eq!(overpaid.event, "payment.overpaid");
+        assert_eq!(overpaid.delta.as_deref(), Some("2.5"));
+
+        let underpaid = SettlementDecision::from_totals(99_999_999, 100_000_000, "TX_UNDERPAID");
+        assert_eq!(
+            underpaid.verdict,
+            Verdict::Underpaid {
+                tx_hash: "TX_UNDERPAID".into(),
+                paid_amount: "9.9999999".into(),
+            }
+        );
+        assert_eq!(underpaid.status, "underpaid");
+        assert_eq!(underpaid.event, "payment.underpaid");
+        assert_eq!(underpaid.delta.as_deref(), Some("0.0000001"));
     }
 
     #[test]
