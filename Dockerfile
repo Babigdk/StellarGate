@@ -17,10 +17,8 @@ RUN cargo build --release --locked
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
 
-# `curl` is required by the healthcheck in docker-compose.yml; without it the
-# container reports unhealthy even while serving traffic normally.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -r -u 1001 -U stellargate \
@@ -34,5 +32,11 @@ USER stellargate
 ENV DATABASE_URL=sqlite:///data/stellargate.db
 
 EXPOSE 3000
+
+# The binary checks its own health (`stellargate healthcheck [path]`), so the
+# runtime image needs no HTTP client of its own. Compose files can override
+# `test:` to point at a different path (e.g. `/ready`) or timing.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/usr/local/bin/stellargate", "healthcheck", "health"]
 
 CMD ["/usr/local/bin/stellargate"]
