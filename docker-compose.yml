@@ -35,7 +35,8 @@ services:
     healthcheck:
       # /health is exempt from the per-IP rate limiter (see DEPLOYMENT.md), so
       # a traffic spike can never turn this into a 429 and restart the container.
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      # The binary checks its own health, so no HTTP client is needed in the image.
+      test: ["CMD", "/usr/local/bin/stellargate", "healthcheck", "health"]
       interval: 30s
       timeout: 10s
       retries: 3
