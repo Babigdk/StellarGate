@@ -59,6 +59,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subsection, with a migration note for existing `full`-payload receivers
   (issue #306).
 
+- **A tagged release now publishes deployable artifacts.** Previously nothing
+  did — CI built and tested every push and PR but produced nothing
+  installable, so the only way to deploy was cloning the repo onto the
+  production VM and building from source there (`docker-compose.yml`'s
+  `build: .`), which is slow on the target 1-OCPU host, non-reproducible
+  across hosts/times without `--locked` everywhere, gives no way to roll back
+  short of checking out an older commit and rebuilding, and ships with no
+  checksums, SBOM, or signature. A new `.github/workflows/release.yml`,
+  triggered on `v*` tags, now builds and pushes a multi-arch image to
+  `ghcr.io/stellargatelabs/stellargate`, cross-compiles `x86_64`/`aarch64`
+  release binaries with SHA-256 checksums, generates a CycloneDX SBOM, and
+  attests build provenance for all of it via GitHub's OIDC-backed
+  attestation. `deploy/docker-compose.prod.yml` now runs that published image
+  (pinned by the new `STELLARGATE_VERSION` in `deploy/stellargate.env`)
+  instead of building on the host; the root `docker-compose.yml` keeps
+  `build: .` for local development. Documented in a new "Release artifacts"
+  section of DEPLOYMENT.md, and "Upgrades and rollback" is now a version bump
+  and restart rather than a `git checkout` and rebuild.
+
 ### Fixed
 
 - **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive

@@ -1,0 +1,171 @@
+name: Release
+
+# Tagging a version is the only thing that publishes deployable artifacts.
+# CI (ci.yml) builds and tests every push/PR but produces nothing installable
+# — see DEPLOYMENT.md's "Upgrades and rollback" for how a tag here becomes a
+# running deployment.
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+
+      # libsqlite3-sys builds its bundled SQLite from C source via the `cc`
+      # crate, so cross-compiling only needs a cross gcc + linker — no target
+      # sysroot package or `cross`/Docker required.
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml's MSRV pin, kept explicit here (as
+          # ci.yml's test matrix does) since release artifacts must be
+          # reproducible regardless of which toolchain a runner defaults to.
+          toolchain: "1.88"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="stellargate-${version}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${name}.tar.gz" stellargate
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute image name and version
+        id: vars
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+
+      # GitHub-native, Sigstore-backed attestation over GitHub's OIDC identity
+      # — no cosign key material to generate, store, or rotate. Verifiable
+      # with: gh attestation verify --owner <org> oci://<image>@<digest>
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.vars.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/stellargate.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/stellargate.cdx.json
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: [binaries, image, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "binaries-*"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true
