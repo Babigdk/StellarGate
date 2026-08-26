@@ -10,6 +10,7 @@ VPS, home server, or Raspberry Pi.
 - [Before you deploy](#before-you-deploy)
 - [Provision the VM](#provision-the-vm)
 - [Deploy](#deploy)
+- [Release artifacts](#release-artifacts)
 - [Provisioning a merchant](#provisioning-a-merchant)
 - [Operating](#operating)
 - [Upgrades and rollback](#upgrades-and-rollback)
@@ -130,7 +131,9 @@ newgrp docker   # or log out and back in
 cd ~/StellarGate
 cp deploy/stellargate.env.example deploy/stellargate.env
 chmod 600 deploy/stellargate.env
-nano deploy/stellargate.env        # domain, email, Stellar account, secrets
+nano deploy/stellargate.env        # domain, email, Stellar account, secrets,
+                                    # and STELLARGATE_VERSION (a released tag —
+                                    # see https://github.com/StellarGateLabs/StellarGate/releases)
 
 # 3. Point your domain's A record at the VM's public IP, and confirm:
 dig +short your-domain.com         # must return the VM IP before starting
@@ -162,14 +165,47 @@ cheap, come from a trusted orchestrator, and exist specifically to stay
 answerable under stress, so they're exempt from the limiter entirely rather
 than sharing a bucket with merchant API traffic.
 
-The first build compiles the whole dependency tree and takes several minutes on
-a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
+`app` runs a published, signed image (`ghcr.io/stellargatelabs/stellargate`)
+rather than compiling on the VM — the first start pulls that image (a couple
+of minutes on a 1-OCPU shape's network link) instead of running a full release
+build on the host serving live payments. See [Release artifacts](#release-artifacts)
+and [Upgrades and rollback](#upgrades-and-rollback).
 
 ### What is exposed
 
 Only Caddy binds to the host, on 80/443. The gateway itself is reachable solely
 over the internal Compose network, so there is no way to reach the API over
 plaintext by hitting the VM's IP directly.
+
+---
+
+## Release artifacts
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which is the only
+thing that produces deployable artifacts — CI (`ci.yml`) builds and tests every
+push and PR but publishes nothing. That workflow:
+
+- Builds and pushes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+  `ghcr.io/stellargatelabs/stellargate`, tagged with both the version and the
+  commit SHA.
+- Cross-compiles release binaries for `x86_64-unknown-linux-gnu` and
+  `aarch64-unknown-linux-gnu`, each packaged as a `.tar.gz` with a `.sha256`
+  checksum file, attached to the GitHub Release.
+- Generates a CycloneDX SBOM (via `syft`) from `Cargo.lock`, also attached to
+  the release.
+- Attests build provenance for the image and both binaries using GitHub's
+  OIDC-backed attestation (no cosign keys to manage). Verify with:
+
+  ```bash
+  gh attestation verify oci://ghcr.io/stellargatelabs/stellargate:vX.Y.Z \
+    --owner StellarGateLabs
+  gh attestation verify stellargate-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+    --owner StellarGateLabs
+  ```
+
+`docker-compose.yml` at the repo root (local/dev) still builds from source
+with `build: .` — only `deploy/docker-compose.prod.yml` runs the published
+image, via `STELLARGATE_VERSION` in `deploy/stellargate.env`.
 
 ---
 
@@ -324,17 +360,28 @@ every boot, `CREATE TABLE IF NOT EXISTS` and column-presence checks make
 re-running them a no-op once applied. See "Database Migrations" in the
 README for how this is kept honest against drift.
 
+Deploying and rolling back both mean pointing `STELLARGATE_VERSION` at a tag
+and restarting — no rebuild on the host, and no downtime beyond a container
+restart:
+
 ```bash
 cd ~/StellarGate
-git pull
-sudo systemctl restart stellargate     # rebuilds and restarts
+nano deploy/stellargate.env    # set STELLARGATE_VERSION=vX.Y.Z
+sudo systemctl restart stellargate    # pulls that tag's image and restarts
 ```
 
-To roll back to a previous commit:
+To roll back, set `STELLARGATE_VERSION` back to the previous tag and restart
+the same way. See [Release artifacts](#release-artifacts) for what each tag
+publishes and how to verify it before deploying.
+
+`git pull` is still worth running occasionally — a release can change
+`deploy/docker-compose.prod.yml`, the `Caddyfile`, or `stellargate.env.example`
+alongside the image, and only `git pull` picks up those files:
 
 ```bash
-git checkout <previous-sha>
-sudo systemctl restart stellargate
+git fetch --tags
+git diff <previous-tag> <new-tag> -- deploy/    # see what changed before restarting
+git pull
 ```
 
 > **Rolling back across a migration does not undo it.** Migrations here are
