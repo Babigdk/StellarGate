@@ -16,6 +16,22 @@ Amount reconciled (completed/overpaid/underpaid)
 Webhook dispatched with signed payload
 ```
 
+## Payload detail
+
+`WEBHOOK_PAYLOAD_DETAIL` controls how much of the payload below you actually
+receive, and **defaults to `minimal`, not `full`**. Every example in this
+document shows the `full` payload (`WEBHOOK_PAYLOAD_DETAIL=full`) — the
+previously-default, richer shape — for completeness; under the default
+`minimal` setting, only `event`, `payment_id`, `status`, and `updated_at` are
+sent. `merchant_id`, `tx_hash`, `amount`, `paid_amount`, `asset`,
+`asset_issuer`, and `delta` are `full`-only. See the README's "Webhooks" →
+"Payload detail" section and [SECURITY.md](SECURITY.md#webhook-payload-exposure)
+for why: HMAC signing proves authenticity, not confidentiality, and this
+service cannot guarantee your endpoint is reached over an encrypted
+connection on every network. If your integration needs the omitted fields,
+either set `WEBHOOK_PAYLOAD_DETAIL=full` or call `GET /v1/payments/:id` with
+your API key.
+
 ## Event Types
 
 StellarGate fires exactly one event when a payment settles, determined by comparing received amount to requested amount:

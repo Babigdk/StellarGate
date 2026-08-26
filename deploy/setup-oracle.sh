@@ -114,8 +114,8 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=${APP_DIR}
-ExecStart=/usr/bin/docker compose -f deploy/docker-compose.prod.yml up -d --build
-ExecStop=/usr/bin/docker compose -f deploy/docker-compose.prod.yml down
+ExecStart=/usr/bin/docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml up -d --pull always
+ExecStop=/usr/bin/docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml down
 TimeoutStartSec=0
 User=${USER}
 Group=docker
@@ -137,6 +137,8 @@ cat <<EOF
        \$EDITOR $APP_DIR/deploy/stellargate.env
 
        Generate both secrets with:  openssl rand -hex 32
+       Set STELLARGATE_VERSION to a released tag from:
+         https://github.com/StellarGateLabs/StellarGate/releases
 
     2. Point your domain's A record at this host:
          $(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo "<this VM's public IP>")
@@ -146,7 +148,7 @@ cat <<EOF
 
     4. curl https://<your-domain>/health
 
-  Logs:    docker compose -f deploy/docker-compose.prod.yml logs -f
+  Logs:    docker compose --env-file deploy/stellargate.env -f deploy/docker-compose.prod.yml logs -f
   Status:  systemctl status stellargate
 
 EOF

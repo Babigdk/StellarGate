@@ -12,7 +12,9 @@ use stellargate::{
     api,
     config::{Config, ListenerMode},
     db, expiry, horizon,
-    metrics::{AuthMetrics, HorizonMetrics, WebhookMetrics},
+    metrics::{
+        AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
+    },
     retention, supervise, webhook, AppState, TaskHealth,
 };
 use tokio::sync::watch;
@@ -26,15 +28,21 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long shutdown waits for background tasks to drain before forcing exit.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
+    // `docker healthcheck` invokes the running binary itself (`stellargate
+    // healthcheck [path]`) rather than shelling out to curl, so the runtime
+    // image doesn't need a general-purpose HTTP client (issue #400).
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("healthcheck") {
+        return run_healthcheck(args.next()).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
 
@@ -67,7 +75,10 @@ async fn main() -> Result<()> {
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
         horizon_metrics: HorizonMetrics::new(),
+        trustline_metrics: TrustlineMetrics::new(),
         task_health: TaskHealth::new(),
+        http_metrics: HttpMetrics::new(),
+        payment_metrics: PaymentMetrics::new(),
         config: cfg,
     });
 
@@ -85,6 +96,7 @@ async fn main() -> Result<()> {
     idle by design ("the listener stays idle until this is set"). */
     if state.config.gateway_configured() {
         health.require("poller");
+        health.require("trustline_checker");
         if state.config.listener_mode == ListenerMode::Stream {
             health.require("stream");
         }
@@ -131,10 +143,23 @@ async fn main() -> Result<()> {
             webhook::run_redrive_worker(state.clone(), rx.clone())
         })
     };
+    let trustline_checker = {
+        let state = state.clone();
+        let rx = shutdown_rx.clone();
+        supervise::supervise(
+            health.clone(),
+            "trustline_checker",
+            shutdown_rx.clone(),
+            move || horizon::run_trustline_checker(state.clone(), rx.clone()),
+        )
+    };
 
     let addr = format!("0.0.0.0:{}", state.config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
+
+    // Captured before `state` is moved into `api::router` below.
+    let shutdown_grace = Duration::from_secs(state.config.shutdown_grace_secs);
 
     axum::serve(
         listener,
@@ -149,13 +174,14 @@ async fn main() -> Result<()> {
         join_task(sweeper, &health, "sweeper").await;
         join_task(redrive, &health, "redrive").await;
         join_task(retention, &health, "retention").await;
+        join_task(trustline_checker, &health, "trustline_checker").await;
         if let Some(handle) = stream {
             join_task(handle, &health, "stream").await;
         }
     };
-    if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
+    if tokio::time::timeout(shutdown_grace, drain).await.is_err() {
         info!(
-            timeout_secs = SHUTDOWN_GRACE.as_secs(),
+            timeout_secs = shutdown_grace.as_secs(),
             "background tasks did not drain in time; forcing exit"
         );
     }
@@ -196,6 +222,27 @@ async fn open_pool(cfg: &Config) -> Result<db::Db> {
         .max_connections(cfg.db_pool_max_connections)
         .connect_with(opts)
         .await?)
+}
+
+/// `stellargate healthcheck [path]`: probe this same container's own HTTP
+/// server and exit 0/1, so `HEALTHCHECK` in the Dockerfile doesn't need
+/// `curl` (or any other general-purpose HTTP client) in the runtime image.
+/// Reads `PORT` directly rather than going through `Config::from_env`, since
+/// a probe shouldn't fail on unrelated config validation.
+async fn run_healthcheck(path: Option<String>) -> Result<()> {
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let path = path.unwrap_or_else(|| "health".to_string());
+    let url = format!("http://127.0.0.1:{port}/{}", path.trim_start_matches('/'));
+
+    let healthy = reqwest::get(&url)
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false);
+
+    std::process::exit(if healthy { 0 } else { 1 });
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {

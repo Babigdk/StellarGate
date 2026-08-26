@@ -27,6 +27,7 @@ pub async fn sweep_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
     let expired = db::expire_overdue(&state.pool, state.config.expiry_batch_size).await?;
     for payment in &expired {
         info!(payment_id = %payment.id, "payment intent expired");
+        state.payment_metrics.record_expired();
         webhook::dispatch(state, payment, EXPIRED_EVENT, None).await;
     }
     Ok(expired.len())
@@ -72,7 +73,7 @@ mod tests {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: String::new(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "a-very-long-and-secure-webhook-signing-secret-32-chars".into(),
@@ -80,6 +81,7 @@ mod tests {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
+            webhook_payload_detail: crate::config::WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -104,7 +106,19 @@ mod tests {
             webhook_allow_private_targets: webhook_url_allowed,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -126,6 +140,9 @@ mod tests {
             webhook_metrics: crate::metrics::WebhookMetrics::new(),
             auth_metrics: crate::metrics::AuthMetrics::new(),
             horizon_metrics: crate::metrics::HorizonMetrics::new(),
+            trustline_metrics: crate::metrics::TrustlineMetrics::new(),
+            http_metrics: crate::metrics::HttpMetrics::new(),
+            payment_metrics: crate::metrics::PaymentMetrics::new(),
             task_health: crate::TaskHealth::new(),
         }
     }

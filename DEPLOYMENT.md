@@ -10,6 +10,7 @@ VPS, home server, or Raspberry Pi.
 - [Before you deploy](#before-you-deploy)
 - [Provision the VM](#provision-the-vm)
 - [Deploy](#deploy)
+- [Release artifacts](#release-artifacts)
 - [Provisioning a merchant](#provisioning-a-merchant)
 - [Operating](#operating)
 - [Upgrades and rollback](#upgrades-and-rollback)
@@ -130,7 +131,9 @@ newgrp docker   # or log out and back in
 cd ~/StellarGate
 cp deploy/stellargate.env.example deploy/stellargate.env
 chmod 600 deploy/stellargate.env
-nano deploy/stellargate.env        # domain, email, Stellar account, secrets
+nano deploy/stellargate.env        # domain, email, Stellar account, secrets,
+                                    # and STELLARGATE_VERSION (a released tag —
+                                    # see https://github.com/StellarGateLabs/StellarGate/releases)
 
 # 3. Point your domain's A record at the VM's public IP, and confirm:
 dig +short your-domain.com         # must return the VM IP before starting
@@ -151,14 +154,58 @@ poller that died at startup surfaces as `payment detection stalled` instead of
 leaving the probe green (issue #315). `/health` fails when an expected
 background task is no longer running, naming the dead task in its `reason`.
 
-The first build compiles the whole dependency tree and takes several minutes on
-a 1-OCPU shape. Subsequent deploys reuse the Docker layer cache.
+**`/health`, `/ready` and `/metrics` are never rate-limited.** They used to
+share the same per-IP "default" bucket as ordinary GET traffic, which meant a
+traffic spike that tripped the limiter also handed the orchestrator's own
+probe a `429`. `curl -f` treats a `429` as a failed check, and after
+`retries: 3` the container gets marked unhealthy and restarted — right when it
+is least able to absorb that, since restarting this service means the poller
+re-baselines and the redrive worker runs a full pass on start. Probes are
+cheap, come from a trusted orchestrator, and exist specifically to stay
+answerable under stress, so they're exempt from the limiter entirely rather
+than sharing a bucket with merchant API traffic.
+
+`app` runs a published, signed image (`ghcr.io/stellargatelabs/stellargate`)
+rather than compiling on the VM — the first start pulls that image (a couple
+of minutes on a 1-OCPU shape's network link) instead of running a full release
+build on the host serving live payments. See [Release artifacts](#release-artifacts)
+and [Upgrades and rollback](#upgrades-and-rollback).
 
 ### What is exposed
 
 Only Caddy binds to the host, on 80/443. The gateway itself is reachable solely
 over the internal Compose network, so there is no way to reach the API over
 plaintext by hitting the VM's IP directly.
+
+---
+
+## Release artifacts
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`, which is the only
+thing that produces deployable artifacts — CI (`ci.yml`) builds and tests every
+push and PR but publishes nothing. That workflow:
+
+- Builds and pushes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+  `ghcr.io/stellargatelabs/stellargate`, tagged with both the version and the
+  commit SHA.
+- Cross-compiles release binaries for `x86_64-unknown-linux-gnu` and
+  `aarch64-unknown-linux-gnu`, each packaged as a `.tar.gz` with a `.sha256`
+  checksum file, attached to the GitHub Release.
+- Generates a CycloneDX SBOM (via `syft`) from `Cargo.lock`, also attached to
+  the release.
+- Attests build provenance for the image and both binaries using GitHub's
+  OIDC-backed attestation (no cosign keys to manage). Verify with:
+
+  ```bash
+  gh attestation verify oci://ghcr.io/stellargatelabs/stellargate:vX.Y.Z \
+    --owner StellarGateLabs
+  gh attestation verify stellargate-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+    --owner StellarGateLabs
+  ```
+
+`docker-compose.yml` at the repo root (local/dev) still builds from source
+with `build: .` — only `deploy/docker-compose.prod.yml` runs the published
+image, via `STELLARGATE_VERSION` in `deploy/stellargate.env`.
 
 ---
 
@@ -240,28 +287,101 @@ outcomes, retries, delivery latency, and auth success/failure.
 no reason to serve the sign-in page to the whole internet. Restrict it in the
 `Caddyfile` by source IP, or put it behind basic auth, if only your team uses it.
 
-**Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app).
-Uncapped container logs filling the boot volume is a slow and surprising way to
-take a service down.
+**Log growth.** Both containers cap their JSON logs (10 MB × 5 for the app,
+10 MB × 3 for Caddy). Uncapped container logs filling the boot volume is a
+slow and surprising way to take a service down — the same disk holds
+`stellargate_data`, so a full disk stops SQLite writes and, with them,
+payment processing.
+
+**Resource limits.** Both containers in `deploy/docker-compose.prod.yml` set
+`deploy.resources.limits` and `reservations` (Compose's non-Swarm CLI honors
+these directly; no `docker stack deploy` needed):
+
+| Service | CPU limit | Memory limit | Memory reservation |
+|---|---|---|---|
+| `app` | 1.5 | 1 GB | 256 MB |
+| `caddy` | 0.5 | 256 MB | 64 MB |
+
+Sizing assumptions:
+
+- The baseline shape from [Provision the VM](#provision-the-vm) is 1 OCPU /
+  6 GB (Ampere Altra — a full core, not a fractional vCPU). `app`'s 1.5 CPU
+  limit and 1 GB memory limit leave room for a Horizon catch-up poll cycle to
+  burst without starving Caddy or the host OS, while still being well under
+  the 6 GB total on the recommended shape.
+- `caddy` only terminates TLS and proxies to one backend; 0.5 CPU / 256 MB is
+  generous headroom for that job, not a measured ceiling.
+- The 256 MB / 64 MB memory **reservations** are soft guarantees, not caps —
+  they keep the host scheduler from starving either container under memory
+  pressure, without preventing either from using more, up to its limit, when
+  the host has room.
+- Without a memory limit, a leak or an unusually large Horizon backlog in
+  either container competes for the whole host's memory, and the Linux OOM
+  killer's choice of victim is not guaranteed to be the process that caused
+  the pressure — it can just as easily kill `caddy`, taking down the only
+  thing the internet can reach while the real problem continues in `app`.
+- If you deploy on the smaller `VM.Standard.E2.1.Micro` shape (1 vCPU / 1 GB)
+  mentioned above, lower these limits accordingly — the defaults here assume
+  the recommended Ampere shape and will not both fit comfortably on 1 GB of
+  total host memory alongside the OS.
+
+The root `docker-compose.yml` (the local quickstart) sets the same
+`stop_grace_period` and log rotation, plus a generous `2.0` CPU / `1G`
+memory limit — a laptop guardrail against a runaway container, not a tuned
+production ceiling. Rely on `deploy/docker-compose.prod.yml`'s numbers above
+for actual capacity planning.
+
+**Shutdown grace.** On `SIGTERM`, StellarGate stops accepting new requests and
+waits up to `SHUTDOWN_GRACE_SECS` (default 30) for the poller, sweeper,
+redrive worker, retention worker, trustline checker, and stream listener to
+drain before forcing exit. That budget is only meaningful if the orchestrator
+sending the signal waits at least as long before escalating to `SIGKILL`:
+
+- **Kubernetes** — `terminationGracePeriodSeconds` also defaults to 30. Left
+  at the default on both sides, the pod can be force-killed at the same
+  instant `SHUTDOWN_GRACE_SECS` expires, cutting a still-draining task off
+  mid-work. Set `terminationGracePeriodSeconds` a few seconds *above*
+  `SHUTDOWN_GRACE_SECS`, not equal to it.
+- **Docker / Docker Compose** (used by `deploy/docker-compose.prod.yml`) —
+  `stop_grace_period` defaults to 10s, well under `SHUTDOWN_GRACE_SECS`'s
+  default of 30. Without raising it, `docker compose down` or a `restart:
+  unless-stopped` cycle sends `SIGKILL` long before the app's own drain
+  window closes. Set `stop_grace_period` on the `app` service to match (add a
+  few seconds of margin, e.g. `35s` for the default `SHUTDOWN_GRACE_SECS=30`).
 
 ---
 
 ## Upgrades and rollback
 
-Migrations in `migrations/` run automatically at startup and are recorded in
-`_sqlx_migrations`, so each runs exactly once.
+There is no `migrations/` directory and no `_sqlx_migrations` tracking table.
+Schema changes are hand-written, idempotent Rust statements in `db::migrate`
+(`src/db.rs`), applied automatically at startup — every statement runs on
+every boot, `CREATE TABLE IF NOT EXISTS` and column-presence checks make
+re-running them a no-op once applied. See "Database Migrations" in the
+README for how this is kept honest against drift.
+
+Deploying and rolling back both mean pointing `STELLARGATE_VERSION` at a tag
+and restarting — no rebuild on the host, and no downtime beyond a container
+restart:
 
 ```bash
 cd ~/StellarGate
-git pull
-sudo systemctl restart stellargate     # rebuilds and restarts
+nano deploy/stellargate.env    # set STELLARGATE_VERSION=vX.Y.Z
+sudo systemctl restart stellargate    # pulls that tag's image and restarts
 ```
 
-To roll back to a previous commit:
+To roll back, set `STELLARGATE_VERSION` back to the previous tag and restart
+the same way. See [Release artifacts](#release-artifacts) for what each tag
+publishes and how to verify it before deploying.
+
+`git pull` is still worth running occasionally — a release can change
+`deploy/docker-compose.prod.yml`, the `Caddyfile`, or `stellargate.env.example`
+alongside the image, and only `git pull` picks up those files:
 
 ```bash
-git checkout <previous-sha>
-sudo systemctl restart stellargate
+git fetch --tags
+git diff <previous-tag> <new-tag> -- deploy/    # see what changed before restarting
+git pull
 ```
 
 > **Rolling back across a migration does not undo it.** Migrations here are

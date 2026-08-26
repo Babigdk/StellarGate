@@ -33,6 +33,7 @@ use stellargate::{
     horizon::{reconcile_payment, HorizonPayment, TransactionRef},
     AppState,
 };
+use uuid::Uuid;
 use wiremock::{
     matchers::{method, path},
     Mock, MockServer, ResponseTemplate,
@@ -41,14 +42,25 @@ use wiremock::{
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a minimal in-memory SQLite pool with migrations applied.
+///
+/// The pool is deliberately multi-connection (`max_connections(5)`) because
+/// these tests exist to prove the single-settlement guarantee under
+/// *concurrent* reconciliation (issue #78) — that only means something if
+/// concurrent tasks can genuinely land on different pooled connections. A
+/// bare `sqlite::memory:` DSN gives each connection its own private,
+/// unrelated database, so two "concurrent" writers could each own a private
+/// copy of the row and the guarantee this suite exists to test would never
+/// actually be exercised (issue #309). `cache=shared` (plus a unique name per
+/// call, so parallel test binaries don't collide, and `min_connections(1)` to
+/// keep the shared database alive for the pool's lifetime) makes every
+/// connection in the pool talk to the same database, which is what makes
+/// "concurrent" here mean what it says.
 async fn memory_pool() -> db::Db {
+    let dsn = format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4());
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect_with(
-            SqliteConnectOptions::from_str("sqlite::memory:")
-                .unwrap()
-                .create_if_missing(true),
-        )
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&dsn).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -69,7 +81,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             port: 0,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: String::new(),
+            horizon_url: "https://horizon.invalid".parse().unwrap(),
             // A real-looking Stellar strkey so Config::validate_addresses passes.
             gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
             accepted_assets,
@@ -78,6 +90,7 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_retry_delay_ms: 0,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into(), "http".into()],
+            webhook_payload_detail: stellargate::config::WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -102,13 +115,28 @@ fn make_state(pool: db::Db, _webhook_url: Option<String>) -> Arc<AppState> {
             webhook_allow_private_targets: true,
             admin_provisioning_secret: String::new(),
             request_timeout_secs: 30,
+            stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
+            max_payment_amount: Default::default(),
+            min_payment_amount: Default::default(),
+            max_body_bytes: 256 * 1024,
+            rate_limiter_max_keys: 10_000,
+            rate_limiter_idle_ttl_secs: 60,
+            pagination_default_limit: 20,
+            pagination_max_limit: 100,
+            shutdown_grace_secs: 30,
+            horizon_page_limit: 200,
+            db_prune_batch_size: 500,
+            retention_max_rows_per_cycle: 50_000,
         },
         http: reqwest::Client::new(),
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     })
 }
@@ -323,6 +351,25 @@ fn payment_with(tx_hash: &str, amount: &str) -> HorizonPayment {
         paging_token: Some("1".into()),
         created_at: None,
     }
+}
+
+/// Production reconciliation must consume the same settlement decision as the
+/// pure Horizon verdict tests. Exact, underpaid, and exact-top-up outcomes are
+/// exercised by the tests above/below; this closes the remaining overpayment
+/// branch through `reconcile_payment` itself (issue #225).
+#[tokio::test]
+async fn reconcile_payment_uses_shared_decision_for_overpayment() {
+    let pool = memory_pool().await;
+    let payment_id = seed_pending_payment(&pool, None).await;
+    let state = make_state(pool.clone(), None);
+
+    let overpayment = payment_with("TX_OVERPAID", "12.5000000");
+    assert!(reconcile_payment(&state, &overpayment).await.unwrap());
+
+    let payment = db::get_payment(&pool, &payment_id).await.unwrap().unwrap();
+    assert_eq!(payment.status, "completed");
+    assert_eq!(payment.tx_hash.as_deref(), Some("TX_OVERPAID"));
+    assert_eq!(payment.paid_amount.as_deref(), Some("12.5"));
 }
 
 /// Re-processing any previously-seen transaction is a no-op regardless of the

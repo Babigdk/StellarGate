@@ -1,20 +1,37 @@
 # Production stack for a single always-on host (Oracle Cloud Always Free VM).
 #
-#   docker compose -f deploy/docker-compose.prod.yml up -d --build
+#   docker compose --env-file deploy/stellargate.env \
+#     -f deploy/docker-compose.prod.yml up -d --pull always
 #
 # Caddy terminates TLS and proxies to the gateway, which is NOT published on a
 # host port — it is reachable only over the internal compose network. That way
 # the only thing exposed to the internet is Caddy on 80/443, and there is no
 # way to reach the API over plaintext HTTP by hitting the VM's IP directly.
+#
+# `app` runs a published, signed image rather than building on this host — see
+# "Upgrades and rollback" in DEPLOYMENT.md. For local development, the plain
+# `docker-compose.yml` at the repo root still builds from source.
 
 name: stellargate
 
 services:
   app:
-    build:
-      context: ..
-      dockerfile: Dockerfile
+    image: ghcr.io/stellargatelabs/stellargate:${STELLARGATE_VERSION:?Set STELLARGATE_VERSION in deploy/stellargate.env to a released tag, e.g. v1.2.3 — see https://github.com/StellarGateLabs/StellarGate/releases}
     restart: unless-stopped
+    # Compose's own default (10s) is shorter than the app's own
+    # SHUTDOWN_GRACE_SECS drain budget (default 30s) — see "Shutdown grace"
+    # in DEPLOYMENT.md. Raised here so the app is never SIGKILLed mid-drain.
+    stop_grace_period: 35s
+    # Sized for the baseline VM shape (1 OCPU / 6 GB, see "Provision the VM"
+    # below) with headroom for a Horizon catch-up poll. See "Resource limits"
+    # in DEPLOYMENT.md for the full rationale.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+        reservations:
+          memory: 256M
     # Deliberately no `ports:` — see the note above. Caddy reaches this over
     # the compose network as http://app:3000.
     expose:
@@ -28,8 +45,11 @@ services:
       - stellargate_data:/data
     healthcheck:
       # /ready, not /health: this reports unhealthy when the database or
-      # Horizon is unreachable, which is what actually matters.
-      test: ["CMD", "curl", "-fsS", "http://localhost:3000/ready"]
+      # Horizon is unreachable, which is what actually matters. It's also
+      # exempt from the per-IP rate limiter (see DEPLOYMENT.md), so a traffic
+      # spike can never turn this into a 429 and get the container restarted.
+      # The binary checks its own health, so no HTTP client is needed in the image.
+      test: ["CMD", "/usr/local/bin/stellargate", "healthcheck", "ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -47,6 +67,15 @@ services:
     restart: unless-stopped
     depends_on:
       - app
+    # A TLS-terminating reverse proxy in front of one backend needs far less
+    # than the app — see "Resource limits" in DEPLOYMENT.md.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          memory: 64M
     ports:
       - "80:80"
       - "443:443"

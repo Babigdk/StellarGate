@@ -9,6 +9,192 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Unknown query parameters on the listing endpoints are now rejected
+  instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
+  `GET /payments/webhooks` deserialized the parameters they knew and discarded
+  everything else, so a typo returned `200 OK` with an unfiltered first page:
+  `?stauts=completed` listed every payment including pending ones, and a
+  merchant reconciliation script that filtered server-side would read unpaid
+  intents as paid (issue #352). All three parameter sets are now closed, and
+  an unrecognised key is a `400` `unknown_parameter` naming it — the same
+  treatment request bodies already got via `unknown_field` (issue #329). A
+  malformed *value* (`?limit=abc`) now also returns the standard JSON error
+  envelope under `invalid_query`, where it previously produced axum's
+  plaintext `400`. **Breaking for any client currently sending a stray
+  parameter**, which is the point: it was never being applied.
+
+- **Manual webhook redelivery no longer consumes the automatic redrive
+  budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
+  increment the same `attempts` counter the background redrive worker
+  compares against `WEBHOOK_REDRIVE_MAX_ATTEMPTS`, and refreshed
+  `last_attempt` on every click — so a merchant recovering a delivery could
+  permanently disable automatic retries for it (issue #235). Manual
+  redeliveries now bump a separate `manual_attempts` column and leave
+  `attempts` / `last_attempt` alone; listings expose both counts.
+
+### Added
+
+- **Log rotation and resource limits on both compose stacks.** Neither
+  `docker-compose.yml` nor `deploy/docker-compose.prod.yml` capped container
+  memory or CPU, and the quickstart file had no log rotation at all — an
+  unbounded `json-file` log driver grows until the disk holding
+  `stellargate_data` fills up, which stops SQLite writes and, with them,
+  payment processing. Both files now set `logging.options` (10 MB × 5) and
+  `deploy.resources.limits`/`reservations` sized against the baseline Oracle
+  Always Free shape (1 OCPU / 6 GB); the quickstart file also gained the
+  `stop_grace_period: 35s` that `deploy/docker-compose.prod.yml` already had.
+  Sizing rationale is in a new "Resource limits" section of DEPLOYMENT.md.
+- **Deployment-tunable limits that were compile-time constants.** Request
+  body size, rate-limiter capacity/TTL, list-endpoint pagination bounds,
+  shutdown grace period, the Horizon poller's page size, and the retention
+  worker's batch size and per-cycle cap were all `const`s baked into the
+  binary, even though each is a deployment-shaped decision (proxy fanout
+  behind the rate limiter, an orchestrator's termination grace period, a
+  Horizon poll cycle's duration) rather than a design invariant. They are now
+  `Config` fields — `MAX_BODY_BYTES`, `RATE_LIMITER_MAX_KEYS`,
+  `RATE_LIMITER_IDLE_TTL_SECS`, `PAGINATION_DEFAULT_LIMIT`,
+  `PAGINATION_MAX_LIMIT`, `SHUTDOWN_GRACE_SECS`, `HORIZON_PAGE_LIMIT`,
+  `DB_PRUNE_BATCH_SIZE`, `RETENTION_MAX_ROWS_PER_CYCLE` — validated at boot,
+  documented in `.env.example`, with the previous constants kept as their
+  defaults so behaviour is unchanged out of the box. `SHUTDOWN_GRACE_SECS`'s
+  relationship to an orchestrator's own termination grace period (Kubernetes'
+  `terminationGracePeriodSeconds`, Docker's `stop_grace_period`) is documented
+  in a new "Shutdown grace" section of DEPLOYMENT.md, and
+  `deploy/docker-compose.prod.yml` now sets `stop_grace_period` to clear the
+  app's default drain budget instead of undercutting it (issue #279).
+- **Audit events for every state-changing operation.** Authentication
+  outcomes and key issuance/revocation were already logged with
+  `merchant_id`/`source_ip`, but payment creation, webhook redelivery
+  (single and bulk), and merchant provisioning logged nothing — and
+  provisioning, the one action that mints a credential, logged only its
+  *failures*. Each now emits a structured `tracing` event carrying a stable
+  `audit = true` marker plus `action`, `actor` (`merchant`/`admin`),
+  `merchant_id`, `source_ip`, `request_id`, `outcome`, and the affected
+  resource id, documented in a new "Audit events" section of the README.
+  `client_ip_key` (the fail-closed IP attribution already used for rate
+  limiting and auth logs) is now reusable from any handler via
+  `client_ip_key_from_parts`, so every audit event uses the same source
+  attribution as everything else (issue #305).
+- **Webhook payload minimisation, and a startup warning for plaintext
+  delivery.** `build_payload` put `merchant_id` and full financial detail
+  (`amount`, `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, `delta`) in
+  every webhook body. HMAC signing proves authenticity, not confidentiality,
+  and on any network other than `public`, `ALLOWED_WEBHOOK_SCHEMES` may still
+  permit plain `http` — so that detail could transit in cleartext, and
+  `merchant_id` in particular adds nothing for the legitimate recipient
+  (it's *their* id) while making an intercepted payload immediately
+  attributable. `WEBHOOK_PAYLOAD_DETAIL` (default `minimal`) now sends only
+  `event`, `payment_id`, `status`, and `updated_at`; the full payload is
+  available by setting it to `full`, and a receiver that needs the omitted
+  fields can call `GET /v1/payments/:id` with its API key instead. Separately,
+  boot now logs a `warn` whenever `ALLOWED_WEBHOOK_SCHEMES` includes `http`,
+  on every network, not just when it would be unsafe — so enabling plaintext
+  delivery is never a silent choice. Documented in a new "Webhook Payload
+  Exposure" section of SECURITY.md and the README's "Payload detail"
+  subsection, with a migration note for existing `full`-payload receivers
+  (issue #306).
+
+- **A tagged release now publishes deployable artifacts.** Previously nothing
+  did — CI built and tested every push and PR but produced nothing
+  installable, so the only way to deploy was cloning the repo onto the
+  production VM and building from source there (`docker-compose.yml`'s
+  `build: .`), which is slow on the target 1-OCPU host, non-reproducible
+  across hosts/times without `--locked` everywhere, gives no way to roll back
+  short of checking out an older commit and rebuilding, and ships with no
+  checksums, SBOM, or signature. A new `.github/workflows/release.yml`,
+  triggered on `v*` tags, now builds and pushes a multi-arch image to
+  `ghcr.io/stellargatelabs/stellargate`, cross-compiles `x86_64`/`aarch64`
+  release binaries with SHA-256 checksums, generates a CycloneDX SBOM, and
+  attests build provenance for all of it via GitHub's OIDC-backed
+  attestation. `deploy/docker-compose.prod.yml` now runs that published image
+  (pinned by the new `STELLARGATE_VERSION` in `deploy/stellargate.env`)
+  instead of building on the host; the root `docker-compose.yml` keeps
+  `build: .` for local development. Documented in a new "Release artifacts"
+  section of DEPLOYMENT.md, and "Upgrades and rollback" is now a version bump
+  and restart rather than a `git checkout` and rebuild.
+
+### Fixed
+
+- **`GET /payments` no longer discards `offset` when a `cursor` is also
+  supplied.** The handler branched on the presence of `cursor`: the keyset
+  path read `cursor` and `limit` and never looked at `offset`, so a request
+  carrying both was answered from the cursor with the offset dropped and no
+  indication that it had been. The response shapes differ too, so the caller
+  also silently lost the `offset` field it was reading. This landed hardest on
+  the migration the endpoint itself encourages, since the offset branch
+  returns a `next_cursor` specifically to invite a move to keyset paging, and
+  a client following that hint naturally sends both for a request or two.
+  Sending both is now `400 conflicting_pagination`, decided on presence rather
+  than value so an old `offset=0` alongside a new cursor is rejected too, and
+  the two modes with their distinct response shapes are documented side by
+  side in the README and modelled in `openapi.yaml` (issue #259).
+
+- **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive
+  limit the system can apply.** `Config::validate_timing` rejects
+  `POLL_INTERVAL_SECS=0`, `PAYMENT_TTL_SECS=0`, `WEBHOOK_RETRY_ATTEMPTS=0`,
+  `WEBHOOK_RETRY_DELAY_MS=0`, and `REQUEST_TIMEOUT_SECS=0` at boot, but
+  `RATE_LIMIT_REQUESTS_PER_SEC=0` was missed — it passed validation and was
+  then silently clamped up to `1` request/sec by `RateLimitState::new`. An
+  operator setting `0` almost always means "disable rate limiting" or "I
+  haven't configured this yet"; either way they got the tightest possible
+  limit instead, with no warning at boot, which looks like an outage. Boot
+  now refuses `RATE_LIMIT_REQUESTS_PER_SEC=0` with the same explanatory style
+  as its siblings, and the `.max(1)` clamp is gone — the effective per-IP
+  rate now always equals the configured one (issue #276).
+
+- **An SSRF-blocked webhook delivery was retried by the redrive worker
+  forever, double-counting the failure metric on every pass.** Both
+  `dispatch()` and `redrive_one()` correctly marked a delivery blocked by the
+  SSRF guard `status = "failed"`, but left `attempts` at its prior value
+  (usually `0`). `list_redrivable_deliveries` selects on `status IN
+  ('pending', 'failed') AND attempts < max_attempts`, so `status = "failed"`
+  alone never removed the row from consideration — only `attempts` reaching
+  the redrive cap does. The background worker picked the same blocked
+  delivery back up on every subsequent pass, re-ran the (still-blocked) SSRF
+  check, and incremented `stellargate_webhook_deliveries_total{outcome
+  ="failed"}` again each time, forever. Both blocked branches now record
+  `attempts` at the configured redrive cap, which is what actually makes the
+  row terminal. New tests in `tests/webhook_dispatch_tests.rs` pin the
+  invariant directly — a second `redrive_once` pass past the grace window
+  attempts nothing, and a blocked `dispatch()` delivery never appears in
+  `list_redrivable_deliveries` at all — rather than asserting specific column
+  values, so they survive a future change of representation.
+
+- **Test pools now use a genuinely shared in-memory SQLite database.** Every
+  test suite built its pool from the DSN `sqlite::memory:` while allowing
+  more than one pooled connection (the default). A bare `sqlite::memory:`
+  DSN gives each connection its own **private** database, so which data a
+  query saw depended on which pooled connection it happened to get — the
+  suite passed by connection-reuse luck, not by construction.
+  `tests/concurrency_tests.rs` was the sharpest instance: it exists to prove
+  the single-settlement guarantee under *concurrent* reconciliation (issue
+  #78), which only means something if concurrent tasks can land on genuinely
+  different pooled connections talking to the *same* database. Every test
+  pool now connects with `sqlite:file:<random-name>?mode=memory&cache=shared`
+  plus `min_connections(1)` (so the shared database survives for the pool's
+  lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
+  fixture is genuinely shared and that the old bare-DSN form is not, so the
+  footgun can't be silently reintroduced (issue #309).
+
+- **Removed the stale `migrations/` directory; the live schema now verifies
+  itself.** The schema existed twice: as hand-written DDL inside
+  `db::migrate` (the only one that ever ran) and as SQL files in
+  `migrations/`, which nothing in the codebase read. The files had already
+  drifted — missing `merchants`, `api_keys`, `processed_transactions`, and
+  `webhook_deliveries.event_type` — so a database built from them could not
+  authenticate a request or record a settlement. They looked authoritative
+  (numbered, in the conventional location), which made a contributor or
+  reviewer trusting them actively misled rather than merely working from an
+  incomplete reference. `migrations/` is now deleted, and a new
+  `tests/schema_snapshot_test.rs` asserts a freshly migrated database matches
+  a checked-in `tests/schema_snapshot.sql` exactly, so a schema change that
+  isn't reflected there fails CI instead of drifting silently — the same
+  failure mode the old directory had, closed by making `db::migrate` itself
+  self-verifying instead of hand-copied. `CONTRIBUTING.md`, `DEPLOYMENT.md`,
+  and `SECURITY.md` no longer reference `migrations/`; `DEPLOYMENT.md` in
+  particular had claimed migrations were "recorded in `_sqlx_migrations`",
+  a table that has never existed in this codebase (issue #308).
+
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
   `verify()` treated that shape as native XLM — a customer could settle a USDC

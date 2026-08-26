@@ -10,20 +10,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stellargate::{
-    config::{AcceptedAsset, Config, ListenerMode},
+    config::{AcceptedAsset, Config, ListenerMode, WebhookPayloadDetail},
     db,
     horizon::{self, HorizonPayment, TransactionRef},
     webhook, AppState,
 };
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database rather than
+/// each getting its own private one, which a bare `sqlite::memory:` DSN
+/// would do with this pool's default multi-connection size (issue #309).
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
 
 fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
     Config {
         port: 0,
-        database_url: "sqlite::memory:".into(),
+        database_url: shared_memory_dsn(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".parse().unwrap(),
         gateway_public: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into(),
         accepted_assets: AcceptedAsset::default_list(),
         webhook_secret: webhook_secret.into(),
@@ -31,6 +40,7 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         webhook_retry_delay_ms: 0,
         webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
+        webhook_payload_detail: WebhookPayloadDetail::Minimal,
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
         webhook_redrive_concurrency: 4,
@@ -56,17 +66,28 @@ fn make_config(webhook_secret: &str, retry_attempts: u32) -> Config {
         db_busy_timeout_ms: 5000,
         admin_provisioning_secret: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
+        max_payment_amount: Default::default(),
+        min_payment_amount: Default::default(),
+        max_body_bytes: 256 * 1024,
+        rate_limiter_max_keys: 10_000,
+        rate_limiter_idle_ttl_secs: 60,
+        pagination_default_limit: 20,
+        pagination_max_limit: 100,
+        shutdown_grace_secs: 30,
+        horizon_page_limit: 200,
+        db_prune_batch_size: 500,
+        retention_max_rows_per_cycle: 50_000,
     }
 }
 
 async fn setup_state(cfg: Config) -> AppState {
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -78,6 +99,9 @@ async fn setup_state(cfg: Config) -> AppState {
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
         horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }
 }
@@ -400,7 +424,12 @@ async fn pending_delivery_is_redriven_after_restart() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "stuck-delivery",
@@ -454,7 +483,12 @@ async fn failed_delivery_below_max_attempts_is_retried_by_redrive() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "exhausted-delivery",
@@ -503,7 +537,12 @@ async fn redrive_skips_deliveries_still_within_grace_window() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "fresh-delivery",
@@ -546,7 +585,12 @@ async fn redrive_marks_delivery_failed_after_exhausting_max_attempts() {
     let webhook_url = format!("{}/hook", server.uri());
     let payment = create_test_payment(&state, &webhook_url).await;
 
-    let payload = webhook::build_payload(&payment, "payment.completed", None);
+    let payload = webhook::build_payload(
+        &payment,
+        "payment.completed",
+        None,
+        WebhookPayloadDetail::Full,
+    );
     db::save_webhook_delivery(
         &state.pool,
         "last-chance-delivery",
@@ -633,5 +677,213 @@ async fn ssrf_blocked_redrive_is_counted_as_a_terminal_failure() {
         state.webhook_metrics.failed(),
         1,
         "an SSRF-blocked redrive is terminal and must be counted"
+    );
+}
+
+/// The invariant this whole suite exists to pin: every delivery eventually
+/// reaches a terminal state. An SSRF-blocked delivery is rejected by an error
+/// return rather than an HTTP response, which is a different shape from every
+/// other test here — and it is exactly the shape that let it slip through
+/// without ever reaching that invariant. `redrive_once` is called *twice*,
+/// past the grace/backoff window each time, and the second pass must attempt
+/// nothing: if a blocked delivery were still eligible, the worker would retry
+/// it forever, and the failure metric would climb once per tick instead of
+/// once ever.
+#[tokio::test]
+async fn ssrf_blocked_redrive_is_never_retried_again() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_allow_private_targets = false;
+    cfg.webhook_redrive_grace_secs = 0;
+    cfg.webhook_redrive_backoff_initial_secs = 0;
+    cfg.webhook_redrive_backoff_max_secs = 0;
+    let state = setup_state(cfg).await;
+
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    db::save_webhook_delivery(
+        &state.pool,
+        "blocked-delivery",
+        &payment.id,
+        "http://127.0.0.1:1/hook",
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+
+    let state = Arc::new(state);
+    assert_eq!(
+        webhook::redrive_once(&state).await,
+        1,
+        "the blocked delivery is attempted once"
+    );
+    assert_eq!(
+        webhook::redrive_once(&state).await,
+        0,
+        "a delivery blocked by the SSRF guard must reach a terminal state, \
+         not remain redrivable forever"
+    );
+
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "the terminal failure must be counted exactly once, not once per \
+         redrive pass"
+    );
+}
+
+/// Same invariant, checked directly against the query the redrive worker
+/// actually uses rather than by running the worker twice — so this survives
+/// even if `redrive_once`'s own bookkeeping changes shape. A delivery that
+/// `dispatch()` gave up on because of the SSRF guard must never come back as
+/// a redrive candidate, no matter how long the grace/backoff window is left
+/// to elapse.
+#[tokio::test]
+async fn ssrf_blocked_dispatch_is_never_a_redrive_candidate() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_allow_private_targets = false;
+    let state = setup_state(cfg).await;
+
+    let payment = create_test_payment(&state, "http://127.0.0.1:1/hook").await;
+    webhook::dispatch(&state, &payment, "payment.completed", None).await;
+
+    let candidates = db::list_redrivable_deliveries(
+        &state.pool,
+        state.config.webhook_redrive_max_attempts as i64,
+        // Zero grace/backoff: if the row were still eligible in principle,
+        // nothing here would hide it.
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        candidates.is_empty(),
+        "an SSRF-blocked dispatch must never become a redrive candidate, \
+         got {candidates:?}"
+    );
+}
+
+// ── Delivery-row precondition (issue #234) ───────────────────────────────────
+
+/// If the delivery row cannot be inserted, `dispatch` must not POST. Otherwise
+/// the merchant receives a signed event that never appears in
+/// `GET /payments/:id/webhooks`, cannot be redelivered, and whose later status
+/// updates silently affect zero rows.
+#[tokio::test]
+async fn dispatch_does_not_send_when_delivery_row_cannot_be_recorded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/hook"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let cfg = make_config("secret", 3);
+    let state = setup_state(cfg).await;
+    let payment = create_test_payment(&state, &format!("{}/hook", server.uri())).await;
+
+    // Force `save_webhook_delivery` to fail without mocking the HTTP stack.
+    sqlx::query("DROP TABLE webhook_deliveries")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    webhook::dispatch(&state, &payment, "payment.completed", None).await;
+
+    assert_eq!(
+        state.webhook_metrics.failed(),
+        1,
+        "a save failure must increment stellargate_webhook_deliveries_total{{outcome=\"failed\"}}"
+    );
+    // MockServer.expect(0) fails the test if any request arrived.
+}
+
+#[tokio::test]
+async fn update_webhook_delivery_errors_when_row_is_missing() {
+    let cfg = make_config("secret", 3);
+    let state = setup_state(cfg).await;
+
+    let err = db::update_webhook_delivery(&state.pool, "missing-id", "failed", 1)
+        .await
+        .expect_err("updating a nonexistent delivery must be an error, not a silent no-op");
+    assert!(
+        err.to_string().contains("missing-id"),
+        "error should name the missing id, got: {err}"
+    );
+}
+
+// ── Manual redelivery vs redrive budget (issue #235) ─────────────────────────
+
+/// Manual redeliveries used to share `attempts` with the redrive worker. After
+/// `WEBHOOK_REDRIVE_MAX_ATTEMPTS` merchant clicks the row dropped out of
+/// `list_redrivable_deliveries` forever — even though automatic recovery is
+/// exactly what the merchant was trying to restore.
+#[tokio::test]
+async fn manual_redeliveries_do_not_exhaust_the_automatic_redrive_budget() {
+    let mut cfg = make_config("secret", 3);
+    cfg.webhook_redrive_max_attempts = 8;
+    cfg.webhook_redrive_grace_secs = 0;
+    let state = setup_state(cfg).await;
+    let payment = create_test_payment(&state, "http://example.com/hook").await;
+
+    db::save_webhook_delivery(
+        &state.pool,
+        "manual-budget",
+        &payment.id,
+        "http://example.com/hook",
+        r#"{"event":"payment.completed"}"#,
+        "payment.completed",
+    )
+    .await
+    .unwrap();
+    // Already used some of the automatic budget, but still under the cap.
+    db::update_webhook_delivery(&state.pool, "manual-budget", "failed", 3)
+        .await
+        .unwrap();
+
+    let before = db::get_webhook_delivery(&state.pool, "manual-budget")
+        .await
+        .unwrap()
+        .unwrap();
+    let last_attempt_before = before.last_attempt.clone();
+
+    // More manual redeliveries than the entire automatic budget.
+    for _ in 0..10 {
+        db::record_manual_redelivery(&state.pool, "manual-budget", "failed")
+            .await
+            .unwrap();
+    }
+
+    let after = db::get_webhook_delivery(&state.pool, "manual-budget")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.attempts, 3,
+        "manual redelivery must not increment the automatic attempts counter"
+    );
+    assert_eq!(after.manual_attempts, 10);
+    assert_eq!(
+        after.last_attempt, last_attempt_before,
+        "manual redelivery must not refresh last_attempt / backoff"
+    );
+
+    let candidates = db::list_redrivable_deliveries(
+        &state.pool,
+        state.config.webhook_redrive_max_attempts as i64,
+        0,
+        0,
+        0,
+        0,
+    )
+    .await
+    .unwrap();
+    assert!(
+        candidates.iter().any(|d| d.id == "manual-budget"),
+        "delivery must remain redrivable after many manual redeliveries; got {candidates:?}"
     );
 }
